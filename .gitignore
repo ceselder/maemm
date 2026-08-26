@@ -1,0 +1,31 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# data / weights / artifacts (never commit — big + often private)
+data/
+checkpoints/
+ckpts/
+*.pt
+*.f32
+*.f16
+*.npy
+*.npz
+*.safetensors
+*.parquet
+
+# logs / runs
+wandb/
+logs/
+*.log
+nohup.out
+
+# secrets — NEVER commit
+.env
+*.key
+*token*
+*_secret*
