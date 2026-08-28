@@ -32,6 +32,7 @@ os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")  # pickle for ap
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -156,7 +157,7 @@ def _distinct_fraction(input_ids, attention_mask):
 
 
 @torch.no_grad()
-def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
+def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False, return_act=False):
     """Score standalone generations through the clean base model.
 
     With fluency gates enabled, capture the layer-READ_LAYER residual during the full fluency
@@ -164,6 +165,7 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
     previous full fluency pass plus a redundant early-exit reward pass.
     """
     r = torch.zeros(len(texts))
+    meanact = torch.zeros(len(texts), D_MODEL)
     logp = torch.full((len(texts),), -20.0) if with_fluency else None
     dis = torch.zeros(len(texts)) if with_fluency else None
     valid = [i for i, t in enumerate(texts) if t.strip()]
@@ -198,6 +200,12 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
             best = proj.masked_fill(~keep, torch.finfo(proj.dtype).min).max(1).values
             has = keep.any(1)
             r[idxs] = torch.where(has, best, 0).cpu()
+            _filled = proj.masked_fill(~keep, torch.finfo(proj.dtype).min)
+            _pstar = _filled.argmax(1)                       # peak (max-activation) token per rollout
+            _tt = torch.arange(h.shape[1], device=h.device)
+            _pmask = keep & (_tt.unsqueeze(0) <= _pstar.unsqueeze(1))   # kept tokens up to & incl peak (excl after)
+            _msum = (h * _pmask.unsqueeze(-1)).sum(1); _mcnt = _pmask.sum(1, keepdim=True).clamp(min=1)
+            meanact[idxs] = (_msum / _mcnt).float().cpu()
             if with_fluency and logits.shape[1]:
                 targets = enc["input_ids"][:, 1:]
                 token_lp = -F.cross_entropy(
@@ -212,6 +220,8 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
                 dis[idxs] = _distinct_fraction(enc["input_ids"], mask).cpu()
     finally:
         tok.padding_side = prev
+    if return_act:
+        return (r, logp, dis, meanact) if with_fluency else (r, meanact)
     return (r, logp, dis) if with_fluency else r
 
 
@@ -351,6 +361,28 @@ def fluency(texts, actor, tok, device, a):
     return logp, dis
 
 
+def _ddp_sync_grads(params, total_tok):
+    """All-reduce the trainable (LoRA) grads across ranks — ONE flat CPU buffer over gloo (NCCL
+    deadlocks on this box; gloo is fine because only the small LoRA grads move). Token-weighted
+    average: each rank's grad is (sum of its token grads)/local_tok, so
+    Σ_r grad_r·tok_r / Σ_r tok_r == EXACTLY the single-GPU gradient over the union batch (with
+    equal per-rank token counts this reduces to the plain average). The trailing buffer slot
+    carries local_tok so a single collective yields both the weighted sum and the global count."""
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return
+    flat = torch.cat([g.detach().reshape(-1).float() for g in grads]
+                     + [torch.ones(1, device=grads[0].device)]).cpu()
+    flat.mul_(float(total_tok))                    # token-weight this rank's contribution
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)    # gloo: CPU tensor, no NCCL anywhere
+    flat.div_(flat[-1].item())                     # /= global completion-token count
+    off = 0
+    for g in grads:
+        n = g.numel()
+        g.copy_(flat[off : off + n].view_as(g))    # copy_ handles cpu->cuda + dtype cast
+        off += n
+
+
 def update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_rep, a, device):
     """ONE Dr. GRPO optimizer update. loss = Σ_tokens −min(ratio·A, clip(ratio)·A)·mask / TOTAL
     completion tokens in batch (GLOBAL constant normalizer — no per-sequence mean, no /std, no KL).
@@ -398,8 +430,10 @@ def update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_re
         loss_sum += loss.item()
         clipped_tok += int((((ratio < lo) | (ratio > hi)) & m).sum())
         ratio_sum += float((ratio.detach() * m).sum())
-    gn = float(torch.nn.utils.clip_grad_norm_(
-        [p for p in actor.parameters() if p.requires_grad], a.max_grad_norm))
+    params = [p for p in actor.parameters() if p.requires_grad]
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        _ddp_sync_grads(params, total_tok)  # after this, grads (hence clip + step) match on all ranks
+    gn = float(torch.nn.utils.clip_grad_norm_(params, a.max_grad_norm))
     if math.isfinite(gn):
         opt.step()
     else:  # stepping Adam on nan/inf grads corrupts moments AND weights
@@ -433,6 +467,8 @@ def main():
     ap.add_argument("--gate-penalty", type=float, default=cfg.gate_penalty)
     ap.add_argument("--len-penalty-start", type=int, default=cfg.len_penalty_start)
     ap.add_argument("--len-penalty-per-tok", type=float, default=cfg.len_penalty_per_tok)
+    ap.add_argument("--div-coef", type=float, default=0.0,
+                    help="within-group activation-orthogonal diversity bonus (0=off)")
     ap.add_argument("--no-gates", action="store_true", help="disable fluency/distinct/len shaping")
     ap.add_argument("--entropy-coef", type=float, default=cfg.entropy_coef,
                     help="β for maximize r + β·H(π): direct diversity pressure (Bo-N depends on it)")
@@ -503,7 +539,19 @@ def main():
     assert a.temperature == 1.0, "sampling temp must be 1.0 so behavior == the T=1 policy old_logp measures"
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
-    device = "cuda:0"  # HF actor lives here; vLLM TP shares all GPUs at gpu_memory_utilization
+    # ---- data-parallel over groups (torchrun sets WORLD_SIZE/RANK/LOCAL_RANK). Launch with
+    # DDP_BACKEND=gloo on this box: NCCL deadlocks at the first collective (ranks spin 100% CPU,
+    # 0% GPU — see SL/pretrain.py, fixed the same way). world=1 (no torchrun): every DDP branch
+    # below is skipped and behavior is identical to the original single-GPU script. ----
+    world = int(os.environ.get("WORLD_SIZE", 1)); rank = int(os.environ.get("RANK", 0))
+    local = int(os.environ.get("LOCAL_RANK", 0)); is_main = rank == 0
+    if world > 1:
+        assert a.groups_per_step % world == 0, (
+            f"groups_per_step ({a.groups_per_step}) must divide by world ({world}): each rank "
+            f"takes a contiguous slice of WHOLE groups so Dr.GRPO advantages stay intra-rank")
+        dist.init_process_group(os.environ.get("DDP_BACKEND", "nccl"))
+        torch.cuda.set_device(local)
+    device = f"cuda:{local}"  # HF actor lives here; world=1 -> "cuda:0" exactly as before
 
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
@@ -551,13 +599,15 @@ def main():
             base = [recs[s].get("corpus_max_proj") for s in starts]
             if all(b is not None for b in base):
                 eval_base = torch.tensor(base, dtype=torch.float32)
-        print(f"[eval] reserved rows [0, {eval_rows}) = {a.n_eval_dirs} eval-only dirs "
-              f"(corpus baseline: {'yes' if eval_base is not None else 'no'})", flush=True)
+        if is_main:
+            print(f"[eval] reserved rows [0, {eval_rows}) = {a.n_eval_dirs} eval-only dirs "
+                  f"(corpus baseline: {'yes' if eval_base is not None else 'no'})", flush=True)
     tgt_texts = None
     if a.firsttok_coef > 0:
         tgt_texts = [json.loads(l).get("target_text", "") for l in open(f"{a.data_dir}/records.jsonl")]
-        print(f"[firsttok] loaded {len(tgt_texts)} target texts (first-{a.firsttok_k}-tok anchor, "
-              f"coef {a.firsttok_coef})", flush=True)
+        if is_main:
+            print(f"[firsttok] loaded {len(tgt_texts)} target texts (first-{a.firsttok_k}-tok anchor, "
+                  f"coef {a.firsttok_coef})", flush=True)
     assert a.direction_source == "random" or n_vecs - eval_rows >= a.groups_per_step
 
     # ---- actor (HF + LoRA, cuda:0). NO gradient checkpointing EVER: recompute happens after the
@@ -577,17 +627,19 @@ def main():
         assert a.init_adapter, "--kl-coef needs --init-adapter (reference = base + init-LoRA)"
         actor.load_adapter(a.init_adapter, adapter_name="ref")  # loaded frozen (not trainable)
         actor.set_adapter("default")                            # keep the trainable adapter active
-        print(f"[kl] ref=init adapter loaded; kl_coef={a.kl_coef} cap={a.kl_cap} nats/tok", flush=True)
+        if is_main:
+            print(f"[kl] ref=init adapter loaded; kl_coef={a.kl_coef} cap={a.kl_cap} nats/tok", flush=True)
 
     # ---- HF-generate rollouts: the LoRA actor IS the rollout engine (no vLLM). ----
     llm = None
-    print(f"[hf-rollout] actor ready | {n_vecs} directions | prompt {p_len} toks, marker @{marker} "
-          f"| rollout_chunk {a.rollout_chunk}", flush=True)
+    if is_main:
+        print(f"[hf-rollout] actor ready | {n_vecs} directions | prompt {p_len} toks, marker @{marker} "
+              f"| rollout_chunk {a.rollout_chunk} | world {world}", flush=True)
 
     # ---- held-out SAE zero-shot eval setup (features NEVER RL'd on — a pure cross-basis
     # generalization probe; mirrors SL/eval_sae.py so numbers track the pretrain cross-uplift curve) ----
     sae_obj = sae_dirs = sae_feats = sae_dataset_max = None
-    if a.sae_eval_every > 0:
+    if a.sae_eval_every > 0 and is_main:  # in-loop evals are rank-0-only under DDP
         from mxf.sae import load_max_acts, load_sae
         assert a.sae_split, "--sae-eval-every set but --sae-split (split.json with 'eval' ids) missing"
         sae_obj = load_sae(path=a.sae_path, device=device, dtype=torch.float32)
@@ -599,14 +651,16 @@ def main():
         print(f"[sae-eval] {len(sae_feats)} held-out SAE feats every {a.sae_eval_every} steps; "
               f"baseline median {sae_dataset_max.median().item():.1f}", flush=True)
 
-    if not a.no_wandb:
+    if not a.no_wandb and is_main:
         wandb.init(project="maxact-fast", name=a.run_name, config=vars(a))
-    os.makedirs(a.save_dir, exist_ok=True)
-    B, G = a.groups_per_step, a.group_size
+    if is_main:
+        os.makedirs(a.save_dir, exist_ok=True)
+    B, G = a.groups_per_step, a.group_size   # B = GLOBAL groups/step (same meaning as world=1)
+    Bl = B // world                          # groups THIS rank rolls out / scores / backprops
 
     for step in range(a.total_steps):
         ev = {}
-        if eval_dirs is not None and step % a.eval_every == 0:
+        if eval_dirs is not None and is_main and step % a.eval_every == 0:
             te = time.time()
             ev, ev_texts = greedy_eval(llm, prompt_ids, marker, eval_dirs, eval_base, actor, tok, device, a)
             ev["time/eval_s"] = time.time() - te
@@ -626,27 +680,40 @@ def main():
                      f"norm {sev[f'eval/sae_bo{a.sae_eval_bo}_norm_act']:.3f}" if a.sae_eval_bo > 1 else "")
                   + f" | {sev_texts[0][:60]!r}", flush=True)
         t0 = time.time()
-        # B distinct vec_idx past the eval reservation (sorted: memmap-friendly)
+        # B distinct vec_idx past the eval reservation (sorted: memmap-friendly). Under DDP every
+        # rank draws the SAME B directions (identical seed -> identical rng stream), then takes its
+        # contiguous slice of Bl WHOLE groups — group membership never crosses a rank boundary, so
+        # the Dr.GRPO advantage (r - group_mean) stays intra-rank and exact.
+        idx = None
         if a.direction_source == "random":                     # fresh isotropic unit dirs each step
             dirs = torch.nn.functional.normalize(torch.randn(B, D_MODEL, dtype=torch.float32), dim=-1)
         else:
             idx = eval_rows + np.sort(rng.choice(n_vecs - eval_rows, size=B, replace=False))
             dirs = torch.nn.functional.normalize(
                 torch.from_numpy(np.asarray(bank[idx], dtype=np.float32)), dim=-1)
+        if world > 1:
+            dirs = dirs[rank * Bl : (rank + 1) * Bl]
+            if idx is not None:
+                idx = idx[rank * Bl : (rank + 1) * Bl]
         texts, gen_ids, old_lps = rollout(actor, submodule, tok, prompt_ids, marker, dirs, a, device)
         t_roll = time.time() - t0
         dirs_rep = dirs.repeat_interleave(G, 0).to(device)  # [B*G, d] rollout i's group direction
 
         use_fluency = a.fluency_floor is not None or a.distinct_floor is not None
-        scored = score(texts, dirs_rep, actor, tok, device, a, with_fluency=use_fluency)
-        if use_fluency:
+        scored = score(texts, dirs_rep, actor, tok, device, a, with_fluency=use_fluency, return_act=(a.div_coef > 0))
+        meanact = None
+        if use_fluency and a.div_coef > 0:
+            r, flu, dis, meanact = scored
+        elif use_fluency:
             r, flu, dis = scored
+        elif a.div_coef > 0:
+            r, meanact = scored
         else:
             r = scored
         r = r * a.reward_scale                       # cosine runs: ~1000x to match proj magnitude
         raw_r, gate_frac = r.clone(), 1.0
         if use_fluency:
-            gate = torch.ones(B * G, dtype=torch.bool)
+            gate = torch.ones(Bl * G, dtype=torch.bool)
             if a.fluency_floor is not None:
                 gate &= flu >= a.fluency_floor
             if a.distinct_floor is not None:
@@ -668,6 +735,17 @@ def main():
             over = torch.tensor([max(0, len(g) - a.len_penalty_start) for g in gen_ids],
                                 dtype=torch.float32)
             r = r - a.len_penalty_per_tok * over
+        div_mean = 0.0
+        if a.div_coef > 0 and meanact is not None:
+            ma = meanact.to(device).view(Bl, G, D_MODEL)
+            vhat = dirs.to(device)
+            dots = torch.einsum("bgd,bd->bg", ma, vhat)
+            perp = F.normalize(ma - dots.unsqueeze(-1) * vhat.unsqueeze(1), dim=-1)
+            sim = torch.einsum("bgd,bhd->bgh", perp, perp)
+            div = (1.0 - (sim.sum(2) - 1.0) / max(G - 1, 1)).flatten().cpu()
+            _gmask = gate.float() if use_fluency else torch.ones_like(div)
+            r = r + a.div_coef * div * _gmask
+            div_mean = div.mean().item()
         ftok_mean = 0.0
         if a.firsttok_coef > 0 and tgt_texts is not None:
             # per-group (=direction) target first-k token-id sets; rollout i's group is i//G.
@@ -675,16 +753,16 @@ def main():
             tgt_sets = [frozenset(tok.encode(tgt_texts[j], add_special_tokens=False)[: a.firsttok_k])
                         for j in idx]
             ftok = torch.tensor([len(set(gen_ids[i]) & tgt_sets[i // G]) / max(len(tgt_sets[i // G]), 1)
-                                 for i in range(B * G)], dtype=torch.float32)
+                                 for i in range(Bl * G)], dtype=torch.float32)
             r = r + a.firsttok_coef * ftok
             ftok_mean = ftok.mean().item()
-        adv = (r.view(B, G) - r.view(B, G).mean(1, keepdim=True)).flatten().detach()  # NO /std
+        adv = (r.view(Bl, G) - r.view(Bl, G).mean(1, keepdim=True)).flatten().detach()  # NO /std
 
         # pad the batch — prompt is shared, so p_len is constant across rows
         L = p_len + max(len(g) for g in gen_ids)
-        ids = torch.full((B * G, L), tok.pad_token_id, dtype=torch.long)
-        attn = torch.zeros((B * G, L), dtype=torch.long)
-        old_lp = torch.zeros((B * G, L - p_len))
+        ids = torch.full((Bl * G, L), tok.pad_token_id, dtype=torch.long)
+        attn = torch.zeros((Bl * G, L), dtype=torch.long)
+        old_lp = torch.zeros((Bl * G, L - p_len))
         pt = torch.tensor(prompt_ids, dtype=torch.long)
         for i, (g, lp) in enumerate(zip(gen_ids, old_lps)):
             ids[i, :p_len] = pt
@@ -692,12 +770,31 @@ def main():
             attn[i, : p_len + len(g)] = 1
             old_lp[i, : len(g)] = lp
         stats = update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_rep, a, device)
+        if os.environ.get("RL_DDP_CHECK"):  # per-rank LoRA weight checksum — MUST match across ranks
+            with torch.no_grad():
+                cs = torch.stack([p.detach().float().norm()
+                                  for p in actor.parameters() if p.requires_grad]).norm().item()
+            print(f"[ddp-check] rank {rank} step {step} lora_l2 {cs:.10f}", flush=True)
 
         sync_s = 0.0  # no-op: the HF actor IS the rollout engine (no vLLM to sync)
         secs = time.time() - t0
         n_gen = float(sum(len(g) for g in gen_ids))
-        log = {"reward/mean": raw_r.mean().item(), "reward/std": raw_r.std().item(),
-               "reward/max": raw_r.max().item(), "reward/shaped_mean": r.mean().item(),
+        if world > 1:  # aggregate reward stats over ALL ranks so the logged numbers mean the
+            gath = [torch.zeros_like(raw_r) for _ in range(world)]  # same thing as a world=1 run
+            dist.all_gather(gath, raw_r)
+            raw_r_all = torch.cat(gath)
+            gath = [torch.zeros_like(r) for _ in range(world)]
+            dist.all_gather(gath, r)
+            r_all = torch.cat(gath)
+            aux = torch.tensor([n_gen, gate_frac, div_mean, ftok_mean], dtype=torch.float64)
+            dist.all_reduce(aux)                  # SUM; equal rollout counts/rank -> mean of per-
+            n_gen = float(aux[0])                 # rank means is exact for the fraction metrics
+            gate_frac, div_mean, ftok_mean = (aux[1:] / world).tolist()
+        else:
+            raw_r_all, r_all = raw_r, r
+        log = {"reward/mean": raw_r_all.mean().item(), "reward/std": raw_r_all.std().item(),
+               "reward/max": raw_r_all.max().item(), "reward/shaped_mean": r_all.mean().item(),
+               "reward/div_mean": div_mean,
                "reward/firsttok_mean": ftok_mean,
                "reward/gate_frac": gate_frac, "ratio/clipfrac": stats["clipfrac"],
                "policy/entropy": stats["entropy"], "policy/kl_to_init": stats["kl"],
@@ -707,17 +804,22 @@ def main():
                "rollout/len_mean": n_gen / (B * G), "tokens_per_sec": n_gen / secs,
                "time/rollout_s": t_roll, "time/sync_s": sync_s, "time/step_s": secs}
         log.update(ev)
-        print(f"step {step:05d} | r {log['reward/mean']:.2f} (max {log['reward/max']:.1f}) | "
-              f"gate {gate_frac:.0%} | ratio {log['ratio/mean']:.3f} clip {log['ratio/clipfrac']:.2%} | len {log['rollout/len_mean']:.0f} "
-              f"| {log['tokens_per_sec']:.0f} tok/s | {secs:.0f}s", flush=True)
-        if step % 10 == 0:
-            print(f"  sample r={raw_r[0]:.2f}: {texts[0][:110]!r}", flush=True)
-        if not a.no_wandb:
-            wandb.log(log, step=step)
-        if a.save_every and step and step % a.save_every == 0:
-            actor.save_pretrained(f"{a.save_dir}/step_{step}")
-    actor.save_pretrained(f"{a.save_dir}/final")
-    print("RL_DONE", flush=True)
+        if is_main:
+            print(f"step {step:05d} | r {log['reward/mean']:.2f} (max {log['reward/max']:.1f}) | "
+                  f"gate {gate_frac:.0%} | ratio {log['ratio/mean']:.3f} clip {log['ratio/clipfrac']:.2%} | len {log['rollout/len_mean']:.0f} "
+                  f"| {log['tokens_per_sec']:.0f} tok/s | {secs:.0f}s", flush=True)
+            if step % 10 == 0:
+                print(f"  sample r={raw_r[0]:.2f}: {texts[0][:110]!r}", flush=True)
+            if not a.no_wandb:
+                wandb.log(log, step=step)
+            if a.save_every and step and step % a.save_every == 0:
+                actor.save_pretrained(f"{a.save_dir}/step_{step}")
+    if is_main:
+        actor.save_pretrained(f"{a.save_dir}/final")
+        print("RL_DONE", flush=True)
+    if world > 1:
+        dist.barrier()  # non-zero ranks wait for rank 0's final save before tearing down
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
