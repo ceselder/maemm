@@ -51,8 +51,12 @@ train/pretrain.py                  match-activation SFT (LoRA; single- or multi-
 train/rl.py                        Dr. GRPO RL from the SFT init (single-GPU, or data-parallel via torchrun)
 train/rl_ddp.sh                    gloo-DDP data-parallel RL launcher (see "Scaling & infra")
 modal_rl.py                        Modal app: the same RL run on a single 8xB200 container
-eval/eval_universal.py             held-out eval: per-family cosine, SAE norm_act / rank-1 / %unverbalized,
-                                   + a random-direction control
+MAEMMBench/                        THE EVAL SUITE — every eval, documented (see MAEMMBench/README.md):
+                                   held-out family cosine + mean_all, SAE norm_act / rank-1 / %unverbalized
+                                   (+ a random-direction control), ctx-bucket + in-distribution families,
+                                   the per-checkpoint Modal eval daemon, the datamix-ablation analysis
+eval/autointerp_detection.py       autointerp DETECTION eval: Opus-5 judge predicts feature firing from
+                                   MAEMM rollouts as the description, vs a max-act-example baseline
 scripts/vllm_smoke.py              vLLM + vllm_lens steering smoke test (the fast-rollout path)
 patches/                           the (already-applied) diversity-bonus + gate-mask patches, for reference
 ```
@@ -86,8 +90,8 @@ NPROC=4 CUDA_VISIBLE_DEVICES=0,1,2,3 bash train/rl_ddp.sh \
   --div-coef 2000 --kl-coef 0.03 --groups-per-step 32 --group-size 16 \
   --total-steps 400 --save-dir ckpts/rl
 
-# 5) eval (held-out families + %unverbalized SAE)
-python eval/eval_universal.py --adapter ckpts/rl/final \
+# 5) eval (held-out families + %unverbalized SAE — full suite docs in MAEMMBench/README.md)
+python MAEMMBench/eval_universal.py --adapter ckpts/rl/final \
   --sae-path <ae.pt> --maxacts-path <max_acts.pt> --heldout-pool data/pool_heldout
 ```
 
