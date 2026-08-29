@@ -28,9 +28,9 @@ SAE [`ceselder/qwen36-27b-sae-l42`](https://huggingface.co/ceselder/qwen36-27b-s
 | 5 | Context-bucket families | [`build_ctx_eval.py`](build_ctx_eval.py) → eval 1 | held-out long-ctx acts, bucketed by token position | `eval/realact_{early,mid,long}/cos` | **live** |
 | 6 | In-distribution held-out families | [`build_indist_eval.py`](build_indist_eval.py) → eval 1 | tail slice of the actual RL training pool | `eval/indist_{realact,probe,long}/cos` | **live** |
 | 7 | Per-checkpoint eval daemon | [`modal_eval.py`](modal_eval.py) | every saved RL checkpoint | all of 1+2+5+6 → wandb, keyed by `ckpt_step` | **live** |
-| 8 | Autointerp detection (Opus-5 judge) | [`../eval/autointerp_detection.py`](../eval/autointerp_detection.py) | rollouts as feature *descriptions* vs corpus spans | detection AUC per (arm, N-rollouts), diversity curve | **implemented**, first results pending |
+| 8 | Autointerp detection (Opus-5 judge) | [`../eval/autointerp_detection.py`](../eval/autointerp_detection.py) | rollouts as feature *descriptions* vs corpus spans | detection AUC per (arm, N-rollouts), diversity curve; marginal-value + hard-negative variants | **done** — first results in §8 |
 | 9 | WorkspaceBench | (external: `camilablank/workspace-bench`) | frozen 700-item baseline banks, 7 tasks | concept-naming score vs J-lens, Opus-5 judge | **planned** (researched, see below) |
-| 10 | Snippet-locality | — | — | — | **planned** (spec TBD) |
+| 10 | Snippet-locality | [`snippet_locality.py`](snippet_locality.py) | autointerp testbed rollouts + real max-act examples | per-token profile locality (`peak_share`, `win3/5_share`, `gini`, `spread_half`), paired maemm-vs-real | **done** — see §10 |
 | 11 | Datamix-ablation analysis | [`analysis/`](analysis/) | eval-1/2 outputs across training mixes | plots + JSON | **analysis** (done) |
 
 ---
@@ -315,7 +315,16 @@ python eval/autointerp_detection.py judge --testbed testbed.json --state batch_s
 python eval/autointerp_detection.py score --state batch_state.json --out results.json
 ```
 
-**Observed numbers.** Implemented; first judge batch pending — no numbers yet.
+**Observed numbers** (2026-08-29, 64 held-out features, best adapter; full report:
+`reports/view/autointerp-detection-eval`): maemm AUC 0.870→0.894 (N=1→8; paired diversity gain
++0.024 ±0.010), examples baseline 0.886→0.957. Failure tail = inversion failure (r=0.77 between
+rollout fire-rate and AUC; AUC 0.976 on the 45/64 features where ≥half the rollouts fire).
+Two follow-up variants (same testbed): **marginal** — appended to a fixed top-4-real-example
+description, rollouts add ~nothing vs random negatives (+0.003 ±0.006; 40/64 features at
+ceiling); **hardneg** — against mined embedding-NN negatives (topically close, verified
+non-firing) the marginal lift emerges at +0.022 ±0.009, and both description types degrade
+similarly (random→embnn: −0.059 rollouts / −0.062 examples), i.e. the judge isn't just
+topic-matching.
 
 ---
 
@@ -341,12 +350,46 @@ author for apples-to-apples numbers.
 
 ---
 
-## 10. Snippet-locality eval — planned
+## 10. Snippet-locality eval
 
-Planned; **spec TBD**. Intended question: is the direction evoked *locally* (at specific rollout
-tokens) rather than diffusely smeared over the whole rollout — i.e. does the peak-token scoring
-reflect genuine localized evocation? Will be specced against the peak-token statistics the
-scorer already exposes. Nothing implemented yet.
+**Code:** [`snippet_locality.py`](snippet_locality.py) + the GPU-stage launcher
+[`../modal_snippet_locality.py`](../modal_snippet_locality.py).
+
+**What it measures.** Within a MAEMM rollout, does the target SAE feature fire on a LOCALIZED
+short snippet, or is the activation smeared across the whole text — and are rollouts as
+localized as the feature's own max-activating corpus examples? A good max-act example fires on
+a crisp interpretable snippet; this eval checks the inverter reproduces that property, i.e.
+that the peak-token scoring used across MAEMMBench reflects genuine localized evocation.
+
+**Input.** The autointerp testbed (`testbed_v2.json`): per held-out feature, the 9 MAEMM
+rollouts (greedy + 8 temp) and the 8 real top max-act corpus examples. Per text: clean-base
+L42 per-token ReLU activation profile of the target feature under the exact shared read path
+(BOS-sink skip, right-pad mask, 10×-median norm filter).
+
+**Metrics** (per text; aggregated over FIRING texts only, peak > fire threshold, with firing
+fraction per arm reported): `peak_share` (peak / total positive mass), `win3_share` /
+`win5_share` (best contiguous 3/5-token window's mass fraction — the most length-robust,
+read these first), `gini` (profile concentration), `spread_half` (#tokens ≥ 50% of peak).
+Headline = **paired per-feature maemm-vs-real diff with 95% CI**, plus cross-links of
+per-feature rollout locality to the §8 autointerp AUC and rollout fire-rate. Length caveat:
+rollouts (≤64 new tokens) are ~2× longer than the 32-token max-act windows; `peak_share` and
+`gini` are length-sensitive, the fixed-k window shares much less so.
+
+**How to run:**
+```bash
+MODAL_PROFILE=<profile> modal run modal_snippet_locality.py      # GPU -> locality.json
+python MAEMMBench/snippet_locality.py score --locality locality.json \
+    --autointerp-results results.json --testbed testbed_v2.json --out locality_results.json
+```
+
+**Observed numbers** (2026-08-29, 64 held-out features, best adapter; full report:
+`reports/view/snippet-locality`): rollouts are MUCH less localized than real examples on every
+metric — win5 mass 0.31 vs 0.69 (paired −0.38 ±0.03; crop-32 length control −0.31 ±0.02),
+peak_share 0.16 vs 0.38, spread 11.7 vs 3.3 tokens — while firing at *higher* peaks (19.3 vs
+15.9 mean peak act). And the hypothesis INVERTS: more-localized rollouts predict *worse*
+inversion and detection (r(win5, fire-rate) = −0.90, r(win5, autointerp AUC) = −0.77) — a
+smeared profile means the whole rollout is on-concept; a localized rollout profile is a
+symptom of marginal firing, not interpretability.
 
 ---
 

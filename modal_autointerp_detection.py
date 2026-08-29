@@ -73,6 +73,43 @@ def build(adapter: str = "ceselder/qwen36-27b-maemm-inverter",
     print(f"[modal] committed {out} to maemm-data", flush=True)
 
 
+@app.function(
+    image=image,
+    gpu="B200",
+    volumes={"/data": vol},
+    secrets=[modal.Secret.from_name("maemm-hf")],
+    timeout=2 * 3600,
+)
+def augment(testbed: str = "/data/eval_autointerp/testbed.json",
+            out: str = "/data/eval_autointerp/testbed_v2.json",
+            mine_pool: int = 8192, mine_skip_docs: int = 102_000, seed: int = 0):
+    """Hard-negatives mining pass (no adapter, no generation): near-miss + embedding-NN pools
+    appended to the existing testbed verbatim. See eval/autointerp_detection.py cmd_augment."""
+    import os
+    import sys
+
+    os.environ["HF_HOME"] = "/data/hf_cache"     # base cached; corpus + bge-small need online
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    sys.path[:0] = ["/pmx/helpers", "/pmx/eval"]
+
+    import autointerp_detection as AD
+
+    a = AD.build_parser().parse_args([
+        "augment", "--testbed", testbed, "--out", out, "--mine-pool", str(mine_pool),
+        "--mine-skip-docs", str(mine_skip_docs), "--seed", str(seed),
+    ])
+    a.fn(a)
+    vol.commit()
+    print(f"[modal] committed {out} to maemm-data", flush=True)
+
+
 @app.local_entrypoint()
 def main(n_features: int = 64):
     build.remote(n_features=n_features)
+
+
+@app.local_entrypoint()
+def run_augment(mine_pool: int = 8192):
+    augment.remote(mine_pool=mine_pool)

@@ -253,6 +253,161 @@ def cmd_build(a):
 
 
 # ===============================================================================================
+# stage 1b: augment (GPU) — mine HARD negatives into an existing testbed (judge-comparability-
+# preserving: features, positives, rollouts and the random-negative pool are reused VERBATIM)
+# ===============================================================================================
+
+def cmd_augment(a):
+    """Two hard-negative pools per feature, mined from a FURTHER-disjoint corpus slice:
+      negatives_nearmiss  highest clean-base peak act still safely below fire
+                          (act in [--nearmiss-lo, --nearmiss-hi-frac * fire)), top-n_neg by act
+      negatives_embnn     nearest to the feature's description examples in a small text-embedding
+                          space (BGE CLS+L2, MINING ONLY — the metric stays the Opus judge) among
+                          non-firing candidates (act < neg_max_act)
+    The original random pool is kept as negatives_random (and legacy key `negatives`)."""
+    import torch
+    import torch.nn.functional as TF
+    from datasets import load_dataset
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+    from mxf.config import MODEL, READ_LAYER
+    from mxf.inject import read_resid
+    from mxf.sae import load_sae
+
+    dev = a.device
+    rng = np.random.default_rng(a.seed + 7)   # fresh stream — original testbed is NOT rebuilt
+    tb = json.load(open(a.testbed))
+    cfg = tb["config"]
+    feats = [r["feature"] for r in tb["features"]]
+    L, n_neg, fire, nma = cfg["ctx_len"], cfg["n_neg"], cfg["fire"], cfg["neg_max_act"]
+    lo_band, hi_band = a.nearmiss_lo, a.nearmiss_hi_frac * fire
+    # doc-range disjointness from the original random pool (which consumed ~neg_pool docs
+    # starting at corpus_skip_docs) => span-level disjointness
+    assert a.mine_skip_docs >= cfg["corpus_skip_docs"] + cfg["neg_pool"] + 500, \
+        "mine slice overlaps the original random-negatives doc range"
+
+    def norm_key(t):
+        return " ".join(t.lower().split())
+
+    reserved = set()   # candidate spans may not collide with any judged text
+    for r in tb["features"]:
+        for k in ("desc_examples", "positives", "negatives"):
+            for e in r[k]:
+                reserved.add(norm_key(e["text"]))
+
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    ds = load_dataset(cfg["corpus"], split=cfg["corpus_split"],
+                      streaming=True).skip(a.mine_skip_docs)
+    pool_ids, pool_texts, seen_pool = [], [], set()
+    for doc in ds:
+        text = doc.get("content") or doc.get("text")
+        if not text:
+            continue
+        ids = tok(text, add_special_tokens=False)["input_ids"]
+        if len(ids) < L:
+            continue
+        s = int(rng.integers(0, len(ids) - L + 1))
+        w = ids[s:s + L]
+        t = tok.decode(w, skip_special_tokens=True).strip()
+        k = norm_key(t)
+        if not t or k in reserved or k in seen_pool:
+            continue
+        seen_pool.add(k)
+        pool_ids.append(w)
+        pool_texts.append(t)
+        if len(pool_ids) >= a.mine_pool:
+            break
+    print(f"[augment] candidate pool {len(pool_ids)} windows "
+          f"(docs skipped {a.mine_skip_docs}; reserved-text collisions filtered)", flush=True)
+
+    # ---- clean-base peak acts of every eval feature on every candidate (same recipe as build)
+    t0 = time.time()
+    base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16,
+                                                attn_implementation="sdpa", device_map={"": dev})
+    base.eval()
+    sae = load_sae(path=a.sae_path or cfg["sae_path"], device=dev, dtype=torch.float32)
+    bos = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
+    acts = np.zeros((len(pool_ids), len(feats)), dtype=np.float32)
+    with torch.no_grad():
+        for s in range(0, len(pool_ids), 64):
+            win = torch.tensor(pool_ids[s:s + 64], device=dev)
+            inp = torch.cat([torch.full((win.shape[0], 1), bos, device=dev, dtype=win.dtype),
+                             win], 1)
+            h, _ = read_resid(base, READ_LAYER,
+                              {"input_ids": inp, "attention_mask": torch.ones_like(inp)},
+                              pool="all")
+            acts[s:s + 64] = sae.encode_features(h[:, 1:], feats).amax(1).float().cpu().numpy()
+    del base
+    torch.cuda.empty_cache()
+    print(f"[augment] pool acts done ({time.time() - t0:.0f}s) | "
+          f"frac(act<{nma})={float((acts < nma).mean()):.4f} "
+          f"frac(in nearmiss band)={float(((acts >= lo_band) & (acts < hi_band)).mean()):.4f}",
+          flush=True)
+
+    # ---- small text embedder, mining only (BGE convention: CLS pooling + L2 normalize)
+    etok = AutoTokenizer.from_pretrained(a.embed_model)
+    emb_model = AutoModel.from_pretrained(a.embed_model).to(dev).eval()
+
+    @torch.no_grad()
+    def embed(texts, bs=256):
+        out = []
+        for s in range(0, len(texts), bs):
+            enc = etok(texts[s:s + bs], padding=True, truncation=True, max_length=128,
+                       return_tensors="pt").to(dev)
+            h = emb_model(**enc).last_hidden_state[:, 0]
+            out.append(TF.normalize(h, dim=-1).cpu())
+        return torch.cat(out).numpy().astype(np.float64)
+
+    cand_emb = embed(pool_texts)
+
+    shortfalls = []
+    for fi, r in enumerate(tb["features"]):
+        av = acts[:, fi]
+        # near-miss: activates the feature, safely below firing
+        band = np.where((av >= lo_band) & (av < hi_band))[0]
+        nm = band[np.argsort(-av[band], kind="stable")][:n_neg]
+        if len(nm) < n_neg:
+            shortfalls.append((r["feature"], "nearmiss", int(len(nm))))
+        r["negatives_nearmiss"] = [{"text": pool_texts[i], "act": float(av[i])} for i in nm]
+        # embedding-NN: topically closest non-firing candidates to the desc-example centroid
+        de = embed([e["text"] for e in r["desc_examples"]])
+        c = de.mean(0)
+        c /= np.linalg.norm(c)
+        cos = cand_emb @ c
+        ok = np.where(av < nma)[0]
+        en = ok[np.argsort(-cos[ok], kind="stable")][:n_neg]
+        if len(en) < n_neg:
+            shortfalls.append((r["feature"], "embnn", int(len(en))))
+        r["negatives_embnn"] = [{"text": pool_texts[i], "act": float(av[i]),
+                                 "desc_cos": float(cos[i])} for i in en]
+        r["negatives_random"] = r["negatives"]        # explicit alias, kept verbatim
+
+    # ---- sanity guards
+    for r in tb["features"]:
+        assert all(e["act"] < fire for e in r["negatives_nearmiss"]), "near-miss span fires!"
+        assert all(e["act"] < nma for e in r["negatives_embnn"]), "embnn span not near-zero!"
+        judged = {norm_key(e["text"]) for k in ("positives", "negatives") for e in r[k]}
+        for k in ("negatives_nearmiss", "negatives_embnn"):
+            assert not judged & {norm_key(e["text"]) for e in r[k]}, f"{k} overlaps test set"
+    nm_sizes = [len(r["negatives_nearmiss"]) for r in tb["features"]]
+    en_sizes = [len(r["negatives_embnn"]) for r in tb["features"]]
+    nm_act = float(np.mean([e["act"] for r in tb["features"] for e in r["negatives_nearmiss"]]))
+    en_cos = float(np.mean([e["desc_cos"] for r in tb["features"] for e in r["negatives_embnn"]]))
+    print(f"[augment] pool sizes: nearmiss min/med {min(nm_sizes)}/{int(np.median(nm_sizes))} "
+          f"(mean act {nm_act:.3f}) | embnn min/med {min(en_sizes)}/{int(np.median(en_sizes))} "
+          f"(mean desc-cos {en_cos:.3f}) | shortfalls: {shortfalls or 'none'}", flush=True)
+
+    tb["config"].update({"mine_pool": len(pool_ids), "mine_skip_docs": a.mine_skip_docs,
+                         "nearmiss_band": [lo_band, hi_band], "mine_embed_model": a.embed_model,
+                         "augment_seed": a.seed + 7, "hardneg_shortfalls": shortfalls})
+    os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+    json.dump(tb, open(a.out, "w"), indent=1)
+    print(f"AUGMENT_DONE {a.out}", flush=True)
+
+
+# ===============================================================================================
 # stage 2: judge — submit one Anthropic Message Batch (opus-5), save state
 # ===============================================================================================
 
@@ -264,22 +419,64 @@ def _variants(rec, n_list):
         yield "examples", N, [e["text"] for e in rec["desc_examples"][:N]]
 
 
+def _variants_marginal(rec, n_list, n_base):
+    """MARGINAL mode: does APPENDING N rollouts to a fixed base of top-n_base real max-act
+    examples add detection value? base{n_base} (N=0) = the reference; base{n_base}roll_N =
+    base + N rollouts (N=1 greedy, N>1 first-N temp — same reuse as the standard arms)."""
+    base = [e["text"] for e in rec["desc_examples"][:n_base]]
+    yield f"base{n_base}", 0, base
+    for N in n_list:
+        rolls = [rec["rollout_greedy"]] if N == 1 else rec["rollouts_temp"][:N]
+        yield f"base{n_base}roll", N, base + rolls
+
+
 def cmd_judge(a):
     import anthropic
+
+    import itertools
 
     tb = json.load(open(a.testbed))
     n_list = sorted(int(x) for x in a.n_list.split(","))
     assert max(n_list) <= tb["config"]["n_max"] and max(n_list) <= tb["config"]["n_desc"]
-    reqs, labels = [], {}
+    if a.variant == "marginal":
+        assert a.n_base <= tb["config"]["n_desc"]
+        make = lambda rec: _variants_marginal(rec, n_list, a.n_base)
+    elif a.variant == "hardneg":
+        # ALL variant keys from both prior modes x ONLY the two new hard-neg pools; positive +
+        # random-negative scores are reused from the prior batches (--prior), whose prompts for
+        # those tests are byte-identical.
+        assert "negatives_nearmiss" in tb["features"][0], "testbed not augmented — run augment"
+        assert a.prior, "--prior required for hardneg (comma list of prior results jsons)"
+        make = lambda rec: itertools.chain(_variants(rec, n_list),
+                                           _variants_marginal(rec, n_list, a.n_base))
+    else:
+        make = lambda rec: _variants(rec, n_list)
+
+    def tests_for(rec):
+        np_, nn = len(rec["positives"]), len(rec["negatives"])
+        if a.variant == "hardneg":   # ti offsets: nearmiss after random, embnn after nearmiss
+            return ([(np_ + nn + i, x["text"], 0)
+                     for i, x in enumerate(rec["negatives_nearmiss"])]
+                    + [(np_ + 2 * nn + i, x["text"], 0)
+                       for i, x in enumerate(rec["negatives_embnn"])])
+        return ([(i, p["text"], 1) for i, p in enumerate(rec["positives"])]
+                + [(np_ + i, n["text"], 0) for i, n in enumerate(rec["negatives"])])
+
+    reqs, labels, variant_keys = [], {}, []
     for rec in tb["features"]:
-        tests = ([(i, p["text"], 1) for i, p in enumerate(rec["positives"])]
-                 + [(len(rec["positives"]) + i, n["text"], 0)
-                    for i, n in enumerate(rec["negatives"])])
-        for arm, N, desc in _variants(rec, n_list):
+        tests = tests_for(rec)
+        for arm, N, desc in make(rec):
+            if f"{arm}_N{N}" not in variant_keys:
+                variant_keys.append(f"{arm}_N{N}")
             block = "\n".join(f"{j + 1}. {t}" for j, t in enumerate(desc))
             for ti, text, label in tests:
                 cid = f"f{rec['feature']}-{arm}-N{N}-t{ti}"
                 labels[cid] = label
+                # delimit the test snippet + end on the question: with thinking disabled the
+                # model otherwise sometimes CONTINUES the raw snippet instead of rating it
+                prompt = (f"DESCRIPTION SNIPPETS:\n{block}\n\nTEST SNIPPET:\n<<<\n{text}\n>>>"
+                          "\n\nProbability (integer 0-100) that the feature activates on the "
+                          "test snippet:")
                 reqs.append({
                     "custom_id": cid,
                     "params": {
@@ -289,15 +486,18 @@ def cmd_judge(a):
                         "thinking": {"type": "disabled"},
                         "system": [{"type": "text", "text": JUDGE_SYSTEM,
                                     "cache_control": {"type": "ephemeral"}}],
-                        "messages": [{"role": "user", "content":
-                                      f"DESCRIPTION SNIPPETS:\n{block}\n\nTEST SNIPPET:\n{text}"}],
+                        "messages": [{"role": "user", "content": prompt}],
                     }})
     print(f"[judge] {len(reqs)} requests ({len(tb['features'])} features x "
-          f"{len(n_list)} N x 2 arms x {len(tb['features'][0]['positives']) + len(tb['features'][0]['negatives'])} tests)", flush=True)
+          f"{len(variant_keys)} variants {variant_keys} x "
+          f"{len(tb['features'][0]['positives']) + len(tb['features'][0]['negatives'])} tests)",
+          flush=True)
 
     client = anthropic.Anthropic(api_key=a.api_key or os.environ["ANTHROPIC_API_KEY_BATCH"])
     batch = client.messages.batches.create(requests=reqs)
     state = {"batch_id": batch.id, "judge_model": a.judge_model, "n_list": n_list,
+             "variant": a.variant, "variants": variant_keys, "n_base": a.n_base,
+             "prior_results": [os.path.abspath(p) for p in a.prior.split(",")] if a.prior else [],
              "testbed": os.path.abspath(a.testbed), "labels": labels,
              "created_at": str(batch.created_at)}
     json.dump(state, open(a.state, "w"))
@@ -312,6 +512,65 @@ def _auc(pos, neg):
     """Mann-Whitney AUC with ties counted 0.5."""
     p, n = np.asarray(pos, float)[:, None], np.asarray(neg, float)[None, :]
     return float((p > n).mean() + 0.5 * (p == n).mean())
+
+
+def _score_hardneg(a, state, tb, scores, fails):
+    """Merge the hard-negative batch with prior batches' positive/random scores (byte-identical
+    prompts) -> AUC per (variant key, negative type). Writes a.out."""
+    n_pos, n_neg = tb["config"]["n_pos"], tb["config"]["n_neg"]
+    priors = {}
+    for p in state["prior_results"]:
+        Rp = json.load(open(p))
+        for f in Rp["per_feature"]:
+            priors.setdefault(f["feature"], {}).update(f["scores"])
+    per_feat, missing = [], 0
+    for rec in tb["features"]:
+        f = rec["feature"]
+        row = {"feature": f, "auc": {}, "scores": {}}
+        for vk in state["variants"]:
+            arm, Ns = vk.rsplit("_N", 1)
+            prior = priors[f][vk]
+            pos, rand = prior[:n_pos], prior[n_pos:n_pos + n_neg]
+
+            def grab(base_off, pool):
+                nonlocal missing
+                out = []
+                for i in range(len(rec[pool])):
+                    x = scores.get(f"f{f}-{arm}-N{Ns}-t{base_off + i}")
+                    missing += x is None
+                    out.append(50 if x is None else x)
+                return out
+
+            nm = grab(n_pos + n_neg, "negatives_nearmiss")
+            en = grab(n_pos + 2 * n_neg, "negatives_embnn")
+            row["auc"][vk] = {"random": _auc(pos, rand),
+                              "nearmiss": _auc(pos, nm) if nm else None,
+                              "embnn": _auc(pos, en) if en else None}
+            row["scores"][vk] = {"nearmiss": nm, "embnn": en}
+        per_feat.append(row)
+
+    agg = {}
+    for vk in state["variants"]:
+        arm, Ns = vk.rsplit("_N", 1)
+        for nt in ("random", "nearmiss", "embnn"):
+            v = np.array([r["auc"][vk][nt] for r in per_feat
+                          if r["auc"][vk][nt] is not None])
+            agg[f"auc/{arm}/N{Ns}/{nt}"] = {"mean": float(v.mean()),
+                                            "sem": float(v.std(ddof=1) / np.sqrt(len(v))),
+                                            "n": int(len(v))}
+    out = {"state": {k: state[k] for k in ("batch_id", "judge_model", "n_list", "variants",
+                                           "variant", "testbed", "prior_results", "n_base")},
+           "config": tb["config"], "aggregate": agg, "per_feature": per_feat,
+           "n_parse_failures": len(fails), "n_missing_scores": missing,
+           "failures": fails[:50]}
+    json.dump(out, open(a.out, "w"), indent=1)
+    print("=== HARD-NEGATIVE AUC (judge = " + state["judge_model"] + ") ===", flush=True)
+    for vk in state["variants"]:
+        arm, Ns = vk.rsplit("_N", 1)
+        r = {nt: agg[f"auc/{arm}/N{Ns}/{nt}"]["mean"] for nt in ("random", "nearmiss", "embnn")}
+        print(f"  {vk:>16}  random {r['random']:.4f}  nearmiss {r['nearmiss']:.4f}  "
+              f"embnn {r['embnn']:.4f}", flush=True)
+    print(f"SCORE_DONE {a.out}", flush=True)
 
 
 def cmd_score(a):
@@ -345,42 +604,49 @@ def cmd_score(a):
     print(f"[score] parsed {len(scores)} scores, {len(fails)} failures", flush=True)
 
     tb = json.load(open(state["testbed"] if os.path.exists(state["testbed"]) else a.testbed))
+    if state.get("variant") == "hardneg":
+        return _score_hardneg(a, state, tb, scores, fails)
     n_list = state["n_list"]
+    # variant keys "{arm}_N{N}": stored by newer judge runs; legacy states get the standard set
+    variants = state.get("variants") or [f"{arm}_N{N}" for arm in ("maemm", "examples")
+                                         for N in n_list]
     n_pos = tb["config"]["n_pos"]
     n_tests = n_pos + tb["config"]["n_neg"]
     per_feat, missing = [], 0
     for rec in tb["features"]:
         f = rec["feature"]
         row = {"feature": f, "auc": {}, "bal_acc": {}, "scores": {}}
-        for arm in ("maemm", "examples"):
-            for N in n_list:
-                s = [scores.get(f"f{f}-{arm}-N{N}-t{ti}") for ti in range(n_tests)]
-                missing += sum(x is None for x in s)
-                s = [50 if x is None else x for x in s]              # failures -> uninformative
-                pos, neg = s[:n_pos], s[n_pos:]
-                row["auc"][f"{arm}_N{N}"] = _auc(pos, neg)
-                row["bal_acc"][f"{arm}_N{N}"] = 0.5 * (np.mean(np.array(pos) >= 50)
-                                                       + np.mean(np.array(neg) < 50))
-                row["scores"][f"{arm}_N{N}"] = s
+        for vk in variants:
+            arm, Ns = vk.rsplit("_N", 1)
+            s = [scores.get(f"f{f}-{arm}-N{Ns}-t{ti}") for ti in range(n_tests)]
+            missing += sum(x is None for x in s)
+            s = [50 if x is None else x for x in s]              # failures -> uninformative
+            pos, neg = s[:n_pos], s[n_pos:]
+            row["auc"][vk] = _auc(pos, neg)
+            row["bal_acc"][vk] = 0.5 * (np.mean(np.array(pos) >= 50)
+                                        + np.mean(np.array(neg) < 50))
+            row["scores"][vk] = s
         per_feat.append(row)
 
     agg = {}
-    for arm in ("maemm", "examples"):
+    for vk in variants:
+        arm, Ns = vk.rsplit("_N", 1)
         for metr in ("auc", "bal_acc"):
-            for N in n_list:
-                v = np.array([r[metr][f"{arm}_N{N}"] for r in per_feat])
-                agg[f"{metr}/{arm}/N{N}"] = {"mean": float(v.mean()),
-                                             "sem": float(v.std(ddof=1) / np.sqrt(len(v)))}
-    out = {"state": {k: state[k] for k in ("batch_id", "judge_model", "n_list", "testbed")},
+            v = np.array([r[metr][vk] for r in per_feat])
+            agg[f"{metr}/{arm}/N{Ns}"] = {"mean": float(v.mean()),
+                                          "sem": float(v.std(ddof=1) / np.sqrt(len(v)))}
+    out = {"state": {k: state[k] for k in ("batch_id", "judge_model", "n_list", "testbed")
+                     if k in state} | {"variants": variants,
+                                       "variant": state.get("variant", "standard")},
            "config": tb["config"], "aggregate": agg, "per_feature": per_feat,
            "n_parse_failures": len(fails), "n_missing_scores": missing,
            "failures": fails[:50]}
     json.dump(out, open(a.out, "w"), indent=1)
     print("=== AUTOINTERP DETECTION (judge = " + state["judge_model"] + ") ===", flush=True)
-    for N in n_list:
-        mm, ex = agg[f"auc/maemm/N{N}"], agg[f"auc/examples/N{N}"]
-        print(f"  N={N:>2}  MAEMM-rollout AUC {mm['mean']:.4f} ±{mm['sem']:.4f}   "
-              f"max-act-example AUC {ex['mean']:.4f} ±{ex['sem']:.4f}", flush=True)
+    for vk in variants:
+        arm, Ns = vk.rsplit("_N", 1)
+        m = agg[f"auc/{arm}/N{Ns}"]
+        print(f"  {vk:>16}  AUC {m['mean']:.4f} ±{m['sem']:.4f}", flush=True)
     print(f"SCORE_DONE {a.out}", flush=True)
 
 
@@ -418,11 +684,37 @@ def build_parser():
     b.add_argument("--out", default="/data/eval_autointerp/testbed.json")
     b.set_defaults(fn=cmd_build)
 
+    g = sp.add_parser("augment", help="GPU stage: mine hard negatives into an existing testbed")
+    g.add_argument("--testbed", required=True, help="existing testbed.json (reused verbatim)")
+    g.add_argument("--out", default="/data/eval_autointerp/testbed_v2.json")
+    g.add_argument("--sae-path", default=None, help="default: the testbed config's sae_path")
+    g.add_argument("--mine-pool", type=int, default=8192, help="candidate windows to mine from")
+    g.add_argument("--mine-skip-docs", type=int, default=102_000,
+                   help="corpus docs to skip — must clear the original random pool's doc range")
+    g.add_argument("--nearmiss-lo", type=float, default=0.2)
+    g.add_argument("--nearmiss-hi-frac", type=float, default=0.9,
+                   help="near-miss band upper bound as a fraction of the fire threshold")
+    g.add_argument("--embed-model", default="BAAI/bge-small-en-v1.5",
+                   help="mining-only text embedder (CLS+L2); the metric stays the Opus judge")
+    g.add_argument("--seed", type=int, default=0)
+    g.add_argument("--device", default="cuda:0")
+    g.set_defaults(fn=cmd_augment)
+
     j = sp.add_parser("judge", help="submit the Opus judge batch (Anthropic Batches API)")
     j.add_argument("--testbed", required=True)
     j.add_argument("--state", default="batch_state.json")
     j.add_argument("--judge-model", default="claude-opus-5")
     j.add_argument("--n-list", default="1,2,4,8")
+    j.add_argument("--prior", default=None,
+                   help="hardneg: comma list of prior results jsons whose positive/random "
+                        "scores are reused (their prompts are byte-identical)")
+    j.add_argument("--variant", choices=("standard", "marginal", "hardneg"), default="standard",
+                   help="standard: maemm-alone vs examples-alone at each N. marginal: "
+                        "top-n_base examples alone (N=0 reference) vs the same base + N "
+                        "appended rollouts — the marginal value of rollouts on top of real "
+                        "examples. Judge-only; reuses the cached testbed")
+    j.add_argument("--n-base", type=int, default=4,
+                   help="marginal mode: real max-act examples in the fixed base description")
     j.add_argument("--api-key", default=None, help="default: $ANTHROPIC_API_KEY_BATCH")
     j.set_defaults(fn=cmd_judge)
 
