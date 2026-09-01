@@ -1,9 +1,19 @@
 """Modal launcher for the snippet-locality eval's GPU stage (MAEMMBench/snippet_locality.py
 build): one B200, the maemm-data volume (base-model HF cache + SAE + augmented autointerp
-testbed). Clean-base reads only — no adapter, no generation, no corpus streaming. One-shot.
+testbed + RL adapter checkpoints). One-shot.
+
+Two modes:
+  * no --adapter: clean-base scoring of the testbed's STORED rollouts (the original run).
+  * --adapter <dir>: regenerate the rollouts ON-POLICY for that adapter first (locality is an
+    on-policy metric), same feature set + real examples + gen seed -> adapter-vs-adapter
+    comparisons are apples-to-apples.
 
 Run (from this box, profile safety-sahan):
-    MODAL_PROFILE=safety-sahan modal run modal_snippet_locality.py
+    MODAL_PROFILE=safety-sahan modal run modal_snippet_locality.py \
+        --adapter /data/ckpts_last5/step_75 --out /data/eval_autointerp/locality_last5_75.json
+    # or both arms of the last-5-vs-baseline comparison in parallel (one B200 each):
+    MODAL_PROFILE=safety-sahan modal run modal_snippet_locality.py::compare \
+        --adapters last5_step75=/data/ckpts_last5/step_75,v2_step225=/data/ckpts_v2/step_225
 Then pull the profiles locally and continue with the local score stage:
     MODAL_PROFILE=safety-sahan modal volume get maemm-data eval_autointerp/locality.json .
     python MAEMMBench/snippet_locality.py score --locality locality.json \
@@ -50,7 +60,8 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
     timeout=2 * 3600,
 )
 def build(testbed: str = "/data/eval_autointerp/testbed_v2.json",
-          out: str = "/data/eval_autointerp/locality.json"):
+          out: str = "/data/eval_autointerp/locality.json",
+          adapter: str = ""):
     import os
     import sys
 
@@ -62,12 +73,34 @@ def build(testbed: str = "/data/eval_autointerp/testbed_v2.json",
 
     import snippet_locality as SL
 
-    a = SL.build_parser().parse_args(["build", "--testbed", testbed, "--out", out])
+    argv = ["build", "--testbed", testbed, "--out", out]
+    if adapter:
+        argv += ["--adapter", adapter]
+    a = SL.build_parser().parse_args(argv)
     a.fn(a)
     vol.commit()
     print(f"[modal] committed {out} to maemm-data", flush=True)
 
 
 @app.local_entrypoint()
-def main():
-    build.remote()
+def main(testbed: str = "/data/eval_autointerp/testbed_v2.json",
+         out: str = "/data/eval_autointerp/locality.json",
+         adapter: str = ""):
+    build.remote(testbed=testbed, out=out, adapter=adapter)
+
+
+@app.local_entrypoint()
+def compare(adapters: str = ("last5_step75=/data/ckpts_last5/step_75,"
+                             "v2_step225=/data/ckpts_v2/step_225"),
+            testbed: str = "/data/eval_autointerp/testbed_v2.json"):
+    """Spawn one on-policy build per name=adapter_dir spec (parallel, one B200 each) and wait.
+    Outputs land at /data/eval_autointerp/locality_<name>.json on the maemm-data volume."""
+    calls = []
+    for spec in adapters.split(","):
+        name, path = spec.split("=", 1)
+        out = f"/data/eval_autointerp/locality_{name}.json"
+        calls.append((name, out, build.spawn(testbed=testbed, out=out, adapter=path)))
+        print(f"[compare] spawned {name}: adapter={path} -> {out}")
+    for name, out, c in calls:
+        c.get()
+        print(f"[compare] DONE {name} -> {out}")

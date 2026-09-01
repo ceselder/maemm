@@ -35,7 +35,7 @@ import modal
 
 REPO = Path(__file__).parent.parent   # repo root (this file lives in MAEMMBench/)
 
-app = modal.App("maemm-eval-last5-heldout")
+app = modal.App("maemm-eval-last5-heldout-v11")  # separate app so the v10 daemon (still scoring steps 20-100) keeps running
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -65,12 +65,12 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
 
 CACHE = "/data/eval_universal_ho/eval_sets_heldout.pt"
 SAE_PATH = "/data/sae/ae.pt"
-CKPT_DIR = "/data/ckpts_last5_v7"    # LAST-5 RL run v7 (YOLO no-KL: kl 0, groups 256) — surprisingly stable
-STATE = "/data/eval_state/evaled_last5_v7.json"   # fresh state file for v7
+CKPT_DIR = "/data/ckpts_last5_v11"   # LAST-5 RL run v11 (v10 recipe + KL 0.01 + 64x32 global batch-norm + vLLM rollouts, from v9/step_50)
+STATE = "/data/eval_state/evaled_last5_v11.json"  # fresh state file for v11
 WANDB_PROJECT = "maxact-fast"                  # same project as the RL run
-WANDB_RUN = "last5_rp_rl_eval_v7"              # separate run (see module docstring for why
-WANDB_RUN_ID = "last5_rp_rl_eval_v7"           # the RL run is NOT resumed); fresh id
-RL_RUN_ID = "last5_rp_rl_v7"                   # the v7 RL run this eval tracks (config xref)
+WANDB_RUN = "last5_rp_rl_eval_v11"             # separate run (see module docstring for why
+WANDB_RUN_ID = "last5_rp_rl_eval_v11"          # the RL run is NOT resumed); fresh id
+RL_RUN_ID = "last5_rp_rl_v10"                  # the v10 RL run this eval tracks (config xref)
 FINAL_STEP = 400   # <CKPT_DIR>/final is logged as this step (last-5 run: --total-steps 400)
 CONTROL_FAMS = {"random"}  # lower-is-better controls: logged per-family, EXCLUDED from mean_all
 

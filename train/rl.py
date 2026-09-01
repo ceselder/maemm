@@ -1,34 +1,45 @@
-"""Stage 6: Dr. GRPO RL — vllm-lens rollouts, no KL, no /std, global-token normalizer.
+"""Dr. GRPO-style RL for the MAEMM inverter — HF-generate rollouts, LoRA actor, data-parallel over groups.
 
-Rollouts: ONE llm.generate() per step; per-request SteeringVector(norm_match=True) == our
-norm-matched inject@INJECT_LAYER at the marker. old_logp comes from vLLM's generation logprobs
-(valid behavior-policy logps at temperature 1.0 ONLY). new_logp is recomputed HF-side with the
-same inject hook; TIS (ratio capped at cfg.tis_cap, upper only) absorbs the residual vLLM/HF
-kernel mismatch; the LoRA-merged actor is pushed back into vLLM every --sync-every steps.
+One step:
+  1. sample B directions (a contiguous slice of WHOLE groups per DDP rank);
+  2. rollout (--rollout-engine hf | vllm): G samples per direction at T=1 with unit(dir) injected
+     (norm-matched) at the prompt marker through INJECT_LAYER. vllm: a per-rank vLLM engine (child
+     process) generates with the CURRENT LoRA (re-saved each step -> LoRARequest) and vllm_lens
+     per-request steering; old_logp is ALWAYS recomputed HF-side with the SAME hook update() uses
+     (ratio == 1 on-policy), and every step the vLLM per-token logprobs are checked against the HF
+     recompute (--vllm-logp-tol) so the sampler provably IS the training policy;
+  3. score(): every generation re-tokenized STANDALONE (sink-prepended, no chat template) through the
+     CLEAN base model (adapter disabled, no injection); reward = [log1p] max cosine between the
+     READ_LAYER residual and unit(dir) over the LAST --reward-window-last kept tokens (0 = all);
+  4. gates (clean-base fluency floor, distinct-token floor) subtract --gate-penalty; length beyond
+     --len-penalty-start costs --len-penalty-per-tok (valid rollouts only);
+  5. compute_advantages(): r - group_mean, optionally / per-group std (--std-norm) or / one
+     GLOBAL-batch std with zero-variance groups dropped (--batch-norm, ScaleRL);
+  6. update(): ONE clipped policy-gradient step, per-token normalized over the global batch,
+     optional --entropy-coef bonus and --kl-coef capped-k3 KL to the frozen init adapter.
 
-Reward: each generation re-tokenized STANDALONE through the CLEAN base model (adapter disabled,
-no injection); reward = max over kept positions of x_t · unit(v) at READ_LAYER, position 0
-skipped (attention-sink guard). No μ-centering: v is shared within a group, so μ·v is a constant
-that cancels exactly in the Dr. GRPO advantage (r − group_mean).
-
-Held-out eval: the first --n-eval-dirs UNIQUE bank directions are reserved (never sampled for
-training); every --eval-every steps each gets ONE greedy (T=0) rollout, scored by the same clean-
-base scorer → eval/greedy_act_{mean,max} (+ eval/greedy_beat_frac vs the corpus_max_proj baseline
-when the pool's records.jsonl carries it).
-
-    python scripts/rl.py --tp 8                                                    # full box (sbatch_rl.sh)
-    python scripts/rl.py --groups-per-step 8 --group-size 4 --total-steps 3 --no-wandb   # 1-GPU smoke
+    torchrun --nproc_per_node=8 train/rl.py --data-dir <pool> --init-adapter <sft> ...
+    python train/rl.py --groups-per-step 2 --group-size 4 --total-steps 2 --no-wandb   # 1-GPU smoke
 """
 import argparse
-import functools
 import json
 import math
 import os
 import time
-import zlib
-from collections import defaultdict
 
-os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")  # pickle for apply_model(partial)
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")   # collective_rpc(callable) for the steer counter
+
+# ---- ONE visible GPU per DDP rank, set BEFORE torch is imported. Each rank and its vLLM engine child
+# then address the same physical GPU as cuda:0 (vLLM maps current_device through CUDA_VISIBLE_DEVICES;
+# narrowing it after CUDA init -> "Invalid device id"). The engine child re-imports this module with
+# LOCAL_RANK hidden (init_vllm), so its inherited single-GPU setting is left untouched. ----
+if "LOCAL_RANK" in os.environ:
+    _lr = int(os.environ["LOCAL_RANK"])
+    _cvd = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+    if not _cvd:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(_lr)
+    elif len(_cvd) > 1:
+        os.environ["CUDA_VISIBLE_DEVICES"] = _cvd[_lr]
 
 import numpy as np
 import torch
@@ -43,111 +54,318 @@ from mxf.inject import get_layer, hooked, make_inject_hook, read_resid
 from mxf.prompts import build_prompt_ids
 
 
-def _distinct_ngram_ratio(ids, n=3):
-    """Fraction of distinct n-grams in a token sequence. 1.0 = no repetition; low = repetitive.
-    Catches verbatim loops (e.g. 'Duration: 10 minutes' ×N) the distinct-TOKEN gate misses."""
-    if len(ids) < n + 1:
-        return 1.0
-    grams = [tuple(ids[i:i + n]) for i in range(len(ids) - n + 1)]
-    return len(set(grams)) / len(grams)
+# ----------------------------------------------------------------------------------------------
+# rollouts
+# ----------------------------------------------------------------------------------------------
+def _eos_ids(tok, actor):
+    """Stop-token set shared by BOTH engines (tokenizer eos + generation_config eos ids)."""
+    ids = set()
+
+    def add(e):
+        if isinstance(e, (list, tuple)):
+            for x in e:
+                ids.add(int(x))
+        elif e is not None:
+            ids.add(int(e))
+    add(tok.eos_token_id)
+    try:
+        add(actor.generation_config.eos_token_id)
+    except Exception:
+        pass
+    return ids
 
 
-def _compression_ratio(text):
-    """zlib compressed/raw byte ratio of the decoded text. Catches TEMPLATED repetition (number/
-    citation lists like 'Moore 2000; Moore 2002; …') that distinct-n-gram under-penalizes because
-    the varying tokens keep n-grams nominally distinct. Natural text ~0.5-0.7; degenerate ~0.15-0.35."""
-    b = text.encode("utf-8")
-    return len(zlib.compress(b, 6)) / max(len(b), 1) if b else 1.0
-
-
-def _load_chunk(model, chunk):
-    """Module-level (picklable) target for llm.apply_model — runs on every TP worker."""
-    model.load_weights(iter(chunk))
-
-
-def sync_weights(actor=None, llm=None):
-    """No-op stub. HF-generate rollouts use the LoRA actor DIRECTLY as the rollout engine, so there
-    is no separate vLLM process to push merged weights into. Kept so main() call sites are unchanged."""
-    return 0.0
+def _trim_at_stop(g, eos_ids):
+    """Keep tokens up to and INCLUDING the first stop token; drop any pad tail."""
+    trimmed = []
+    for t in g:
+        trimmed.append(t)
+        if t in eos_ids:
+            break
+    return trimmed if trimmed else g
 
 
 @torch.no_grad()
-def rollout(actor, submodule, tok, prompt_ids, marker, dirs, a, device):
-    """B groups × G rollouts via HF generate() + the inject hook, chunked into rollout-chunk-sized
-    mini-batches (no paged attn, so 1024 seqs won't fit one generate). dirs: [B, d]. Returns flat
-    group-major lists (texts, gen_ids, old_logps) — rollout i belongs to group i // group_size.
+def _old_logp(actor, submodule, prompt, row_gen, vecs, marker, tok, device):
+    """Behaviour-policy logps of the sampled tokens: a no-grad forward over prompt+gen with the SAME
+    inject hook update() uses (log_softmax of RAW logits gathered at the sampled tokens). Used by
+    both engines so old_logp/new_logp are computed identically (ratio == 1 at step 0)."""
+    bsz, p_len = len(row_gen), prompt.shape[0]
+    gmax = max(len(g) for g in row_gen)
+    ids_f = torch.full((bsz, p_len + gmax), tok.pad_token_id, dtype=torch.long, device=device)
+    attn_f = torch.zeros((bsz, p_len + gmax), dtype=torch.long, device=device)
+    ids_f[:, :p_len] = prompt
+    for i, g in enumerate(row_gen):
+        ids_f[i, p_len : p_len + len(g)] = torch.tensor(g, dtype=torch.long, device=device)
+        attn_f[i, : p_len + len(g)] = 1
+    hook = make_inject_hook(vecs, [[marker]] * bsz, STEER_COEFF, device, torch.bfloat16)
+    with hooked(submodule, hook):
+        logits = actor(input_ids=ids_f, attention_mask=attn_f).logits[:, p_len - 1 : -1].float()
+    lp = torch.log_softmax(logits, -1).gather(-1, ids_f[:, p_len:, None]).squeeze(-1)  # [bsz, gmax]
+    del logits
+    return [lp[i, : len(g)].detach().float().cpu() for i, g in enumerate(row_gen)]
 
-    The inject hook fires only at PREFILL (h.shape[1] > 1) and adds unit(dir) at the marker, so the
-    injected direction conditions the whole continuation; decode steps (h.shape[1] == 1) are skipped.
-    Sampling is pure temperature-T FULL softmax (top_p=1, top_k off, rep-penalty 1) so the behavior
-    policy == the T=1 policy old_logp measures. old_logp is then recomputed with the SAME inject via a
-    fresh no-grad forward over prompt+gen (log_softmax of RAW logits gathered at the sampled tokens, NO
-    temperature scaling) — identical to how update() computes new_logp, so the importance ratio is
-    exact (mean ratio == 1 at step 0, before any optimizer step)."""
+
+def rollout(actor, submodule, tok, prompt_ids, marker, dirs, a, device):
+    """HF-generate engine: B groups x G rollouts in --rollout-chunk mini-batches. dirs: [B, d].
+    Returns flat group-major lists (texts, gen_ids, old_logps); rollout i belongs to group i // G.
+    The hook fires only at PREFILL (h.shape[1] > 1) and adds unit(dir) at the marker. Sampling is
+    pure temperature-1 softmax (top_p=1, top_k off, no repetition penalty)."""
     G = a.group_size
     all_dirs = dirs.repeat_interleave(G, 0).to(device)          # [B*G, d] group-major
     N = all_dirs.shape[0]
     p_len = len(prompt_ids)
     prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
-    # generate() stops on any of these; a padded row's first stop token == its true end.
-    eos_ids = set()
-    def _add_eos(e):
-        if isinstance(e, (list, tuple)):
-            for x in e:
-                eos_ids.add(int(x))
-        elif e is not None:
-            eos_ids.add(int(e))
-    _add_eos(tok.eos_token_id)
-    try:
-        _add_eos(actor.generation_config.eos_token_id)
-    except Exception:
-        pass
+    eos_ids = _eos_ids(tok, actor)
     texts, gen_ids, old_lps = [], [], []
-    chunk = a.rollout_chunk
-    for s in range(0, N, chunk):
-        e = min(s + chunk, N)
+    for s in range(0, N, a.rollout_chunk):
+        e = min(s + a.rollout_chunk, N)
         bsz = e - s
         inp = prompt.unsqueeze(0).expand(bsz, -1).contiguous()          # shared prompt, left-aligned
-        attn = torch.ones_like(inp)
         vecs = [all_dirs[s + i : s + i + 1] for i in range(bsz)]        # one direction per row
         hook = make_inject_hook(vecs, [[marker]] * bsz, STEER_COEFF, device, torch.bfloat16)
         with hooked(submodule, hook):
-            out = actor.generate(input_ids=inp, attention_mask=attn, do_sample=True,
+            out = actor.generate(input_ids=inp, attention_mask=torch.ones_like(inp), do_sample=True,
                                  temperature=a.temperature, top_p=1.0, top_k=0, min_p=0.0,
                                  repetition_penalty=1.0, max_new_tokens=a.max_new_tokens,
                                  min_new_tokens=a.min_new_tokens, use_cache=True,
                                  pad_token_id=tok.pad_token_id)
-        gen_full = out[:, p_len:].tolist()                              # generated ids (right-padded)
-        row_gen = []
-        for g in gen_full:
-            trimmed = []
-            for t in g:
-                trimmed.append(t)
-                if t in eos_ids:                                       # include the stop token, drop pad tail
-                    break
-            row_gen.append(trimmed if trimmed else g)                  # min_new_tokens keeps this non-empty
-        # ---- recompute old_logp with the SAME inject hook (exactly how update() gets new_logp) ----
-        gmax = max(len(g) for g in row_gen)
-        Lc = p_len + gmax
-        ids_f = torch.full((bsz, Lc), tok.pad_token_id, dtype=torch.long, device=device)
-        attn_f = torch.zeros((bsz, Lc), dtype=torch.long, device=device)
-        ids_f[:, :p_len] = prompt
-        for i, g in enumerate(row_gen):
-            ids_f[i, p_len : p_len + len(g)] = torch.tensor(g, dtype=torch.long, device=device)
-            attn_f[i, : p_len + len(g)] = 1
-        with hooked(submodule, hook):
-            logits = actor(input_ids=ids_f, attention_mask=attn_f).logits[:, p_len - 1 : -1].float()
-        lp = torch.log_softmax(logits, -1).gather(-1, ids_f[:, p_len:, None]).squeeze(-1)  # [bsz, gmax]
-        del logits
-        for i, g in enumerate(row_gen):
-            gen_ids.append(g)
-            old_lps.append(lp[i, : len(g)].detach().float().cpu())
-            texts.append(tok.decode(g, skip_special_tokens=True))
+        row_gen = [_trim_at_stop(g, eos_ids) for g in out[:, p_len:].tolist()]
+        for c0 in range(0, bsz, a.logp_chunk):
+            c1 = min(c0 + a.logp_chunk, bsz)
+            old_lps += _old_logp(actor, submodule, prompt, row_gen[c0:c1], vecs[c0:c1], marker, tok, device)
+        gen_ids += row_gen
+        texts += [tok.decode(g, skip_special_tokens=True) for g in row_gen]
     return texts, gen_ids, old_lps
 
 
+def init_vllm(a, local, rank, p_len, max_seqs):
+    """Per-rank vLLM engine (TP=1, child process) on THIS rank's GPU. Built AFTER the HF actor (see
+    main(): vllm's import clobbers transformers' Qwen3_5 AutoConfig entry). torchrun's distributed env is hidden from the child (it
+    must not join our gloo world); the rank's single visible GPU (module top) is inherited. LoRA enabled so the
+    current adapter is served via LoRARequest (vLLM reads rsLoRA alpha/sqrt(r) from
+    adapter_config.json); prefix caching OFF (the shared prompt's KV carries the injected
+    direction — reuse across requests would leak direction A into direction B); TRITON_ATTN +
+    eager are what vllm_lens' steering needs."""
+    hidden = {k: os.environ.pop(k) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE",
+                                             "GROUP_RANK", "ROLE_RANK", "MASTER_ADDR", "MASTER_PORT",
+                                             "TORCHELASTIC_RUN_ID", "TORCHELASTIC_USE_AGENT_STORE")
+              if k in os.environ}
+    try:
+        from vllm import LLM
+        llm = LLM(model=MODEL, tensor_parallel_size=1, gpu_memory_utilization=a.vllm_gpu_mem,
+                  max_model_len=p_len + a.max_new_tokens + 8, attention_backend="TRITON_ATTN",
+                  enforce_eager=True, language_model_only=True, enable_prefix_caching=False,
+                  enable_lora=True, max_loras=1, max_lora_rank=64, max_num_seqs=max(int(max_seqs), 1),
+                  seed=a.seed * 1000 + rank, dtype="bfloat16")
+    finally:
+        os.environ.update(hidden)
+    return llm
+
+
+@torch.no_grad()
+def _marker_norm(actor, submodule, prompt, marker, device, adapter=True):
+    """||h|| at the marker of the INJECT_LAYER output for the shared prompt — the exact scalar
+    make_inject_hook multiplies unit(dir) by (bf16 norm, as in the hook). A per-step constant: the
+    prompt is shared and causal, so every rollout's marker activation is identical."""
+    cap = {}
+
+    def grab(_m, _i, out):
+        cap["h"] = out[0] if isinstance(out, tuple) else out
+    hd = submodule.register_forward_hook(grab)
+    try:
+        ids = prompt.unsqueeze(0)
+        if adapter:
+            actor(input_ids=ids, attention_mask=torch.ones_like(ids))
+        else:
+            with actor.disable_adapter():
+                actor(input_ids=ids, attention_mask=torch.ones_like(ids))
+    finally:
+        hd.remove()
+    return cap["h"][0, marker].norm().float().item()
+
+
+def _save_adapter_for_vllm(actor, lora_dir):
+    """Write the CURRENT 'default' adapter in the module naming vLLM expects for this model.
+
+    The actor is AutoModelForCausalLM (paths `model.layers.N...`) but vLLM serves the
+    Qwen3_5ForConditionalGeneration wrapper, whose hf_to_vllm_mapper only knows
+    `model.language_model.` -> `language_model.model.`. vLLM's LoRA loader validates module names by
+    SUFFIX only, so a CausalLM-named adapter passes validation and is then SILENTLY ignored — every
+    per-module lookup misses and the engine samples from the BASE model (measured: mean
+    |logp_vllm - logp_hf| = 1.47 nats). Renaming to `model.language_model.layers.` fixes the lookup."""
+    from peft import get_peft_model_state_dict
+    from safetensors.torch import save_file
+    os.makedirs(lora_dir, exist_ok=True)
+    sd = get_peft_model_state_dict(actor, adapter_name="default")
+    out = {}
+    for k, v in sd.items():
+        k2 = k if "language_model" in k else k.replace("model.layers.", "model.language_model.layers.", 1)
+        out[k2] = v.detach().to("cpu", copy=True).contiguous()
+    save_file(out, f"{lora_dir}/adapter_model.safetensors", metadata={"format": "pt"})
+    actor.peft_config["default"].save_pretrained(lora_dir)              # adapter_config.json (r, alpha, rslora, targets)
+    return len(out)
+
+
+def _steer_vec(v, hnorm, marker):
+    """vllm_lens SteeringVector carrying the ABSOLUTE injection coeff*||h||*unit(v) (norm_match=False):
+    lens adds the vector 1:1 into the residual stream, but its own norm_match would scale by the
+    norm of vLLM's split-residual COMPONENT (~12% of the full stream) — verified numerically."""
+    from vllm_lens import SteeringVector
+    vec = (F.normalize(v.float(), dim=0) * (hnorm * STEER_COEFF)).view(1, 1, -1).cpu()
+    return SteeringVector(activations=vec, layer_indices=[INJECT_LAYER], scale=1.0, norm_match=False,
+                          position_indices=[marker])
+
+
+@torch.no_grad()
+def _hf_logp_conditions(actor, submodule, prompt, gen_ids, dirs_rep, marker, tok, device, chunk):
+    """HF logps of the SAME sampled tokens under 4 policies: {adapter on/off} x {inject hook on/off}.
+    Whichever condition matches vLLM's logprobs tells us what the engine is actually running."""
+    out = {}
+    for ad in (True, False):
+        for hk in (True, False):
+            lps = []
+            for s0 in range(0, len(gen_ids), chunk):
+                e0 = min(s0 + chunk, len(gen_ids))
+                vecs = [dirs_rep[i : i + 1] for i in range(s0, e0)]
+                if hk:
+                    fn = lambda: _old_logp(actor, submodule, prompt, gen_ids[s0:e0], vecs, marker, tok, device)
+                else:
+                    fn = lambda: _old_logp_nohook(actor, prompt, gen_ids[s0:e0], tok, device)
+                if ad:
+                    lps += fn()
+                else:
+                    with actor.disable_adapter():
+                        lps += fn()
+            out[(ad, hk)] = lps
+    return out
+
+
+@torch.no_grad()
+def _old_logp_nohook(actor, prompt, row_gen, tok, device):
+    bsz, p_len = len(row_gen), prompt.shape[0]
+    gmax = max(len(g) for g in row_gen)
+    ids_f = torch.full((bsz, p_len + gmax), tok.pad_token_id, dtype=torch.long, device=device)
+    attn_f = torch.zeros((bsz, p_len + gmax), dtype=torch.long, device=device)
+    ids_f[:, :p_len] = prompt
+    for i, g in enumerate(row_gen):
+        ids_f[i, p_len : p_len + len(g)] = torch.tensor(g, dtype=torch.long, device=device)
+        attn_f[i, : p_len + len(g)] = 1
+    logits = actor(input_ids=ids_f, attention_mask=attn_f).logits[:, p_len - 1 : -1].float()
+    lp = torch.log_softmax(logits, -1).gather(-1, ids_f[:, p_len:, None]).squeeze(-1)
+    del logits
+    return [lp[i, : len(g)].detach().float().cpu() for i, g in enumerate(row_gen)]
+
+
+def _absdiff(hf_lps, vllm_lps):
+    d = [abs(h - v) for hl, vl in zip(hf_lps, vllm_lps) for h, v in zip(hl.tolist(), vl) if v is not None]
+    return (sum(d) / len(d)) if d else float("nan")
+
+
+@torch.no_grad()
+def verify_vllm_injection(llm, actor, submodule, prompt_ids, marker, device, seed=0):
+    """One-time numeric PROOF that vllm_lens steering reaches the engine and matches our HF hook's
+    norm-matched formula. Capture the INJECT_LAYER residual (vllm_lens output_residual_stream) for a
+    clean and a steered request (base weights, greedy, 1 token): the marker-row delta must equal
+    STEER_COEFF * ||h_clean|| * unit(v) (cos ~ 1, norm ratio ~ 1); rows before the marker must be
+    untouched (causal prefill is deterministic in eager mode)."""
+    from vllm import SamplingParams
+    g = torch.Generator().manual_seed(seed)
+    v = F.normalize(torch.randn(D_MODEL, generator=g), dim=0)
+    prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+    hnorm_hf = _marker_norm(actor, submodule, prompt, marker, device, adapter=False)   # probe runs BASE weights
+
+    def run(steer):
+        extra = {"output_residual_stream": [INJECT_LAYER]}
+        if steer:
+            extra["apply_steering_vectors"] = [_steer_vec(v, hnorm_hf, marker)]
+        out = llm.generate([{"prompt_token_ids": list(prompt_ids)}],
+                           [SamplingParams(temperature=0.0, max_tokens=1, extra_args=extra)], use_tqdm=False)[0]
+        act = getattr(out, "activations", None)
+        assert act is not None and "residual_stream" in act, "vllm_lens capture returned nothing — plugin not active?"
+        return act["residual_stream"][0].float()                     # [seq, d] (one captured layer)
+    h_clean, h_steer = run(False), run(True)
+    delta = h_steer[marker] - h_clean[marker]
+    cos = F.cosine_similarity(delta, v, dim=0).item()
+    ratio = (delta.norm() / (STEER_COEFF * hnorm_hf)).item()            # injected magnitude vs the HF hook's
+    hnorm_vllm = h_clean[marker].norm().item()                          # vLLM's clean marker norm vs HF's
+    other = (h_steer[:marker] - h_clean[:marker]).norm(dim=-1).max().item() if marker > 0 else 0.0
+    return {"cos": cos, "norm_ratio": ratio, "hnorm_hf": hnorm_hf, "hnorm_vllm": hnorm_vllm,
+            "hnorm_agree": hnorm_vllm / max(hnorm_hf, 1e-6), "max_other_row_delta": other,
+            "ok": cos > 0.99 and 0.95 < ratio < 1.05 and 0.97 < hnorm_vllm / max(hnorm_hf, 1e-6) < 1.03}
+
+
+def rollout_vllm(llm, actor, submodule, tok, prompt_ids, marker, dirs, a, device, step, rank):
+    """vLLM engine: publish the CURRENT LoRA (save -> LoRARequest with a fresh id), then ONE
+    generate() call with one request per direction, n=G samples each, the direction steered at the
+    marker by vllm_lens (norm_match == our hook). Token-identical to rollout(): same prompt ids,
+    same stop set (stop token kept), T=1 full softmax; old_logp from the HF recompute; the vLLM
+    per-token logprobs are compared against it (stats returned; main() enforces --vllm-logp-tol)."""
+    from vllm import SamplingParams
+    from vllm.lora.request import LoRARequest
+    G, p_len = a.group_size, len(prompt_ids)
+    prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+    eos_ids = _eos_ids(tok, actor)
+    hnorm = _marker_norm(actor, submodule, prompt, marker, device, adapter=True)  # current policy's ||h|| at the marker
+    t0 = time.time()
+    lora_dir = f"/tmp/rl_lora/rank{rank}/step{step}"
+    _save_adapter_for_vllm(actor, lora_dir)
+    t_save = time.time() - t0
+    lora_req = LoRARequest(lora_name=f"step{step}", lora_int_id=step + 1, lora_path=lora_dir)
+    reqs, params = [], []
+    for v in dirs:
+        sv = _steer_vec(v, hnorm, marker)
+        reqs.append({"prompt_token_ids": list(prompt_ids)})
+        params.append(SamplingParams(n=G, temperature=a.temperature, top_p=1.0, top_k=0, min_p=0.0,
+                                     repetition_penalty=1.0, max_tokens=a.max_new_tokens,
+                                     min_tokens=a.min_new_tokens, stop_token_ids=sorted(eos_ids),
+                                     logprobs=0, extra_args={"apply_steering_vectors": [sv]}))
+    t1 = time.time()
+    outs = llm.generate(reqs, params, lora_request=lora_req, use_tqdm=False)
+    t_gen = time.time() - t1
+    gen_ids, vllm_lps, appended = [], [], 0
+    for out in outs:                                                      # request order == dirs order
+        assert len(out.outputs) == G, f"expected {G} samples, got {len(out.outputs)}"
+        for o in out.outputs:
+            g = list(o.token_ids)
+            lp = [None] * len(g)
+            if o.logprobs:
+                lp = [(d[t].logprob if (d is not None and t in d) else None) for d, t in zip(o.logprobs, g)]
+            if o.finish_reason == "stop" and (not g or g[-1] not in eos_ids):   # engine dropped the stop token
+                g.append(int(o.stop_reason) if isinstance(o.stop_reason, int) else int(tok.eos_token_id))
+                lp.append(None); appended += 1
+            g2 = _trim_at_stop(g, eos_ids)
+            gen_ids.append(g2); vllm_lps.append(lp[: len(g2)])
+    # old_logp: HF recompute with the SAME hook update() uses (chunked for memory)
+    all_dirs = dirs.repeat_interleave(G, 0).to(device)
+    old_lps = []
+    for s in range(0, len(gen_ids), a.logp_chunk):
+        e = min(s + a.logp_chunk, len(gen_ids))
+        vecs = [all_dirs[i : i + 1] for i in range(s, e)]
+        old_lps += _old_logp(actor, submodule, prompt, gen_ids[s:e], vecs, marker, tok, device)
+    # token-similarity: vLLM's sampled-token logprobs vs the HF recompute
+    diffs = torch.tensor([abs(h - v) for hl, vl in zip(old_lps, vllm_lps) for h, v in zip(hl.tolist(), vl) if v is not None])
+    texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
+    stats = {"rollout/vllm_hf_logp_absdiff_mean": diffs.mean().item() if len(diffs) else float("nan"),
+             "rollout/vllm_hf_logp_absdiff_p99": diffs.quantile(0.99).item() if len(diffs) > 1 else float("nan"),
+             "rollout/vllm_hf_logp_absdiff_max": diffs.max().item() if len(diffs) else float("nan"),
+             "rollout/vllm_compared_tokens": float(len(diffs)),
+             "rollout/appended_stop": float(appended), "rollout/marker_hnorm": hnorm,
+             "time/lora_save_s": t_save, "time/vllm_gen_s": t_gen}
+    prev = f"/tmp/rl_lora/rank{rank}/step{step - 1}"
+    if os.path.isdir(prev):
+        import shutil
+        shutil.rmtree(prev, ignore_errors=True)
+    stats["_vllm_lps"] = vllm_lps                                     # for the failure diagnosis only
+    stats["_lora_req"] = lora_req
+    return texts, gen_ids, old_lps, stats
+
+
+# ----------------------------------------------------------------------------------------------
+# reward (clean base model, standalone re-tokenization)
+# ----------------------------------------------------------------------------------------------
 def _distinct_fraction(input_ids, attention_mask):
-    """Vectorized distinct-token fraction, including special tokens like the original gate."""
+    """Vectorized distinct-token fraction (special tokens included)."""
     masked = input_ids.masked_fill(~attention_mask.bool(), -1)
     ordered = masked.sort(dim=1).values
     unique = torch.ones(len(input_ids), dtype=torch.long, device=input_ids.device)
@@ -157,25 +375,30 @@ def _distinct_fraction(input_ids, attention_mask):
 
 
 @torch.no_grad()
-def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False, return_act=False):
-    """Score standalone generations through the clean base model.
+def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
+    """Reward each generation through the CLEAN base model (adapter disabled, no injection).
 
-    With fluency gates enabled, capture the layer-READ_LAYER residual during the full fluency
-    forward. This produces the same reward and gate values in one clean-model pass instead of the
-    previous full fluency pass plus a redundant early-exit reward pass.
-    """
+    Tokenization matches the shared clean-base read path (eval_universal / collect_acts): a sink
+    token (bos, or eos=<|endoftext|> for Qwen) is PREPENDED, add_special_tokens=False, position 0
+    dropped from the reward. Returns r [n] (+ mean clean-base logp/token and distinct fraction when
+    with_fluency, the gate inputs) — one forward per batch does reward and gates together."""
     r = torch.zeros(len(texts))
-    meanact = torch.zeros(len(texts), D_MODEL)
     logp = torch.full((len(texts),), -20.0) if with_fluency else None
     dis = torch.zeros(len(texts)) if with_fluency else None
     valid = [i for i, t in enumerate(texts) if t.strip()]
     prev = tok.padding_side
-    tok.padding_side = "right"  # position 0 must be the first real token
+    tok.padding_side = "right"  # position 0 must be the sink token
     try:
+        sink = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
         for s in range(0, len(valid), a.score_batch):
             idxs = valid[s : s + a.score_batch]
-            enc = tok([texts[i] for i in idxs], return_tensors="pt", padding=True, truncation=True,
-                      max_length=a.max_new_tokens + 32, add_special_tokens=True).to(device)
+            e = tok([texts[i] for i in idxs], return_tensors="pt", padding=True, truncation=True,
+                    max_length=95, add_special_tokens=False).to(device)
+            n = e["input_ids"].shape[0]
+            enc = {"input_ids": torch.cat([torch.full((n, 1), sink, device=device, dtype=e["input_ids"].dtype),
+                                           e["input_ids"]], 1),
+                   "attention_mask": torch.cat([torch.ones((n, 1), device=device, dtype=e["attention_mask"].dtype),
+                                                e["attention_mask"]], 1)}
             if with_fluency:
                 captured = {}
 
@@ -194,215 +417,91 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False, return_act
                 with actor.disable_adapter():
                     h, mask = read_resid(actor, READ_LAYER, dict(enc), pool="all")
             keep = mask.clone()
-            keep[:, 0] = False  # attention-sink guard (old repo also norm-filtered; keep it simple)
-            hh = F.normalize(h, dim=-1) if a.reward_metric == "cosine" else h  # cosine: kill norm-inflation
+            keep[:, 0] = False                                            # drop the sink position
+            hh = F.normalize(h, dim=-1) if a.reward_metric == "cosine" else h
             proj = torch.einsum("btd,bd->bt", hh, dirs_rep[idxs])
-            _sel = keep
-            if getattr(a, "reward_window_last", 0) and a.reward_window_last > 0:
-                # anti-smear: restrict the reward to the LAST N kept (content) tokens. max-over-ALL
-                # tokens lets the policy earn reward by making every token fire (the smearing the
-                # snippet-locality eval found); a small fixed window forces localized firing.
-                _revcnt = _sel.flip(1).cumsum(1).flip(1)          # #kept tokens from here to the end (incl)
-                _sel = _sel & (_revcnt <= a.reward_window_last)
-            _pf = proj.masked_fill(~_sel, torch.finfo(proj.dtype).min)
-            _k = max(1, int(getattr(a, "reward_topk", 1) or 1))
-            if _k == 1:
-                best = _pf.max(1).values
-            else:                                                 # mean of the top-K within the window
-                _topv = _pf.topk(min(_k, _pf.shape[1]), dim=1).values
-                _avail = _sel.sum(1, keepdim=True).clamp(min=1)    # real tokens available per row
-                _tk = torch.arange(_topv.shape[1], device=proj.device).unsqueeze(0) < _avail
-                _topv = torch.where(_tk, _topv, torch.zeros_like(_topv))   # avoid -inf*0 = nan
-                best = _topv.sum(1) / _tk.sum(1).clamp(min=1)
-            has = keep.any(1)
-            r[idxs] = torch.where(has, best, 0).cpu()
-            _filled = proj.masked_fill(~keep, torch.finfo(proj.dtype).min)
-            _pstar = _filled.argmax(1)                       # peak (max-activation) token per rollout
-            _tt = torch.arange(h.shape[1], device=h.device)
-            _pmask = keep & (_tt.unsqueeze(0) <= _pstar.unsqueeze(1))   # kept tokens up to & incl peak (excl after)
-            _msum = (h * _pmask.unsqueeze(-1)).sum(1); _mcnt = _pmask.sum(1, keepdim=True).clamp(min=1)
-            meanact[idxs] = (_msum / _mcnt).float().cpu()
+            sel = keep
+            if a.reward_window_last > 0:                                  # anti-smear: last N kept tokens only
+                revcnt = sel.flip(1).cumsum(1).flip(1)                    # kept tokens from here to the end
+                sel = sel & (revcnt <= a.reward_window_last)
+            pf = proj.masked_fill(~sel, torch.finfo(proj.dtype).min)
+            k = max(1, a.reward_topk)
+            if k == 1:
+                best = pf.max(1).values
+            else:                                                         # mean of the top-K in the window
+                topv = pf.topk(min(k, pf.shape[1]), dim=1).values
+                avail = sel.sum(1, keepdim=True).clamp(min=1)
+                tk = torch.arange(topv.shape[1], device=proj.device).unsqueeze(0) < avail
+                topv = torch.where(tk, topv, torch.zeros_like(topv))
+                best = topv.sum(1) / tk.sum(1).clamp(min=1)
+            if a.log_reward:
+                best = torch.log1p(best.clamp(min=-0.9))                  # diminishing returns at the high end
+            r[idxs] = torch.where(keep.any(1), best, 0).cpu()
             if with_fluency and logits.shape[1]:
                 targets = enc["input_ids"][:, 1:]
-                token_lp = -F.cross_entropy(
-                    logits.flatten(0, 1), targets.flatten(), reduction="none"
-                ).view_as(targets)
+                token_lp = -F.cross_entropy(logits.flatten(0, 1), targets.flatten(),
+                                            reduction="none").view_as(targets)
                 next_mask = mask[:, 1:]
                 mean_lp = (token_lp * next_mask).sum(1) / next_mask.sum(1).clamp(min=1)
-                # rows that retokenize to a single token have no next-token logprob → keep the -20.0
-                # default so they FAIL the fluency floor (the degenerate collapse the gate exists to punish)
-                logp[idxs] = torch.where(next_mask.any(1), mean_lp,
-                                         torch.full_like(mean_lp, -20.0)).cpu()
+                # single-token rows have no next-token logprob -> keep -20 so they FAIL the floor
+                logp[idxs] = torch.where(next_mask.any(1), mean_lp, torch.full_like(mean_lp, -20.0)).cpu()
                 dis[idxs] = _distinct_fraction(enc["input_ids"], mask).cpu()
     finally:
         tok.padding_side = prev
-    if return_act:
-        return (r, logp, dis, meanact) if with_fluency else (r, meanact)
     return (r, logp, dis) if with_fluency else r
 
 
-@torch.no_grad()
-def greedy_eval(llm, prompt_ids, marker, eval_dirs, eval_base, actor, tok, device, a):
-    """Greedy-decode (T=0) ONE rollout per held-out eval dir through the same vLLM+steering path,
-    scored by the training scorer (clean base, max-over-kept-positions act·dir, sink skip).
-    Returns (metrics, texts). Identical texts across distinct dirs mean steering silently isn't
-    firing (the FLASHINFER failure mode) — crash loudly rather than log garbage."""
-    from vllm import SamplingParams
-    from vllm_lens import SteeringVector
-
-    reqs, params = [], []
-    for v in eval_dirs:
-        sv = SteeringVector(activations=v.view(1, 1, -1).cpu().float(), layer_indices=[INJECT_LAYER],
-                            scale=STEER_COEFF, norm_match=True, position_indices=[marker])
-        reqs.append({"prompt_token_ids": list(prompt_ids)})
-        params.append(SamplingParams(temperature=0.0, max_tokens=a.max_new_tokens,
-                                     min_tokens=a.min_new_tokens,
-                                     extra_args={"apply_steering_vectors": [sv]}))
-    outs = llm.generate(reqs, params)
-    texts = [out.outputs[0].text for out in outs]
-    assert len(texts) < 2 or len(set(texts)) > 1, (
-        "greedy eval: all rollouts identical across distinct directions — steering is not firing "
-        "(wrong attention backend? vllm-lens/vLLM version drift?)")
-    r = score(texts, eval_dirs.to(device), actor, tok, device, a)  # max over positions, per dir
-    m = {"eval/greedy_act_mean": r.mean().item(), "eval/greedy_act_max": r.max().item()}
-    if eval_base is not None:  # corpus baseline: best candidate-span projection per direction
-        m["eval/greedy_beat_frac"] = (r > eval_base).float().mean().item()
-    return m, texts
-
-
-@torch.no_grad()
-def sae_score(texts, feats, sae, actor, tok, device, a):
-    """max_t relu((x_t - b_dec)·W_enc[:,f] + b_enc[f]) at READ_LAYER, clean base, standalone re-tok.
-    Row i is scored on ITS paired feature feats[i]. Mirrors SL/eval_sae.py exactly so the number is
-    comparable to the pretrain cross-uplift curve: add_special_tokens=False + 10x-median norm-filter
-    + pos-0 attention-sink drop (deliberately different from score()'s simpler dot path)."""
-    NORM_FILTER_MULT = 10.0
-    r = torch.zeros(len(texts))
-    valid = [i for i, t in enumerate(texts) if t.strip()]
-    prev = tok.padding_side
-    tok.padding_side = "right"  # position 0 must be the first real token
-    try:
-        for s in range(0, len(valid), a.score_batch):
-            idxs = valid[s : s + a.score_batch]
-            enc = tok([texts[i] for i in idxs], return_tensors="pt", padding=True, truncation=True,
-                      max_length=a.max_new_tokens + 32, add_special_tokens=False).to(device)
-            with actor.disable_adapter():
-                h, mask = read_resid(actor, READ_LAYER, dict(enc), pool="all")  # [b,T,d] fp32, [b,T]
-            norms = h.norm(dim=-1)
-            med = norms[mask].median() if mask.any() else norms.new_tensor(1.0)
-            keep = mask & (norms <= NORM_FILTER_MULT * med)
-            keep[:, 0] = False
-            per = sae.encode_features(h, [feats[i] for i in idxs])   # [b,T,b]
-            b = torch.arange(len(idxs), device=per.device)
-            per = per[b, :, b]                                        # diagonal: row i on feature i -> [b,T]
-            best = per.masked_fill(~keep, 0.0).max(1).values
-            r[idxs] = best.float().cpu()
-    finally:
-        tok.padding_side = prev
-    return r
-
-
-@torch.no_grad()
-def sae_eval(llm, prompt_ids, marker, sae_dirs, sae_feats, sae, dataset_max, actor, tok, device, a):
-    """Zero-shot held-out SAE eval (greedy). Inject each held-out feature's unit encoder column,
-    greedy-decode one rollout, score the true SAE feature activation, and compare to the feature's
-    corpus peak. normalized_act / beat_frac match SL/eval_sae.py's greedy metrics."""
-    from vllm import SamplingParams
-    from vllm_lens import SteeringVector
-    reqs, params = [], []
-    for v in sae_dirs:
-        sv = SteeringVector(activations=v.view(1, 1, -1).cpu().float(), layer_indices=[INJECT_LAYER],
-                            scale=STEER_COEFF, norm_match=True, position_indices=[marker])
-        reqs.append({"prompt_token_ids": list(prompt_ids)})
-        params.append(SamplingParams(temperature=0.0, max_tokens=a.max_new_tokens,
-                                     min_tokens=a.min_new_tokens,
-                                     extra_args={"apply_steering_vectors": [sv]}))
-    texts = [out.outputs[0].text for out in llm.generate(reqs, params)]
-    assert len(texts) < 2 or len(set(texts)) > 1, "sae eval: all greedy rollouts identical — steering not firing"
-    act = sae_score(texts, sae_feats, sae, actor, tok, device, a)   # [N] max-pos post-ReLU enc act
-    dm = dataset_max.detach().cpu().clamp(min=1e-6)
-    dmax = dataset_max.detach().cpu()
-    metrics = {"eval/sae_act_mean": act.mean().item(),
-               "eval/sae_norm_act": (act / dm).mean().item(),        # canonical GREEDY cross-uplift metric
-               "eval/sae_beat_frac": (act > dmax).float().mean().item()}
-    if a.sae_eval_bo > 1:  # best-of-N sampling read: sampling is far more productive than greedy
-        bo_reqs, bo_params = [], []                                  # (mirrors the SL Bo16 curve)
-        for v in sae_dirs:
-            sv = SteeringVector(activations=v.view(1, 1, -1).cpu().float(), layer_indices=[INJECT_LAYER],
-                                scale=STEER_COEFF, norm_match=True, position_indices=[marker])
-            bo_reqs.append({"prompt_token_ids": list(prompt_ids)})
-            bo_params.append(SamplingParams(temperature=a.sae_eval_temp, top_p=1.0, n=a.sae_eval_bo,
-                                            max_tokens=a.max_new_tokens, min_tokens=a.min_new_tokens,
-                                            extra_args={"apply_steering_vectors": [sv]}))
-        bo_texts, bo_feats = [], []
-        for i, out in enumerate(llm.generate(bo_reqs, bo_params)):
-            for o in out.outputs:                                   # N samples/feature, feature-major
-                bo_texts.append(o.text); bo_feats.append(sae_feats[i])
-        bo_act = sae_score(bo_texts, bo_feats, sae, actor, tok, device, a).view(len(sae_dirs), a.sae_eval_bo)
-        bo_best = bo_act.max(1).values                              # per-feature best of the N samples
-        k = a.sae_eval_bo
-        metrics.update({f"eval/sae_bo{k}_act_mean": bo_best.mean().item(),
-                        f"eval/sae_bo{k}_norm_act": (bo_best / dm).mean().item(),
-                        f"eval/sae_bo{k}_beat_frac": (bo_best > dmax).float().mean().item()})
-    return metrics, texts
-
-
-@torch.no_grad()
-def fluency(texts, actor, tok, device, a):
-    """(mean clean-base logprob/token, distinct-token fraction) per standalone text — gate inputs.
-    Adapter disabled so the policy can't inflate its own fluency score."""
-    logp, dis = torch.full((len(texts),), -20.0), torch.zeros(len(texts))
-    valid = [i for i, t in enumerate(texts) if t.strip()]
-    prev = tok.padding_side
-    tok.padding_side = "right"
-    try:
-        for s in range(0, len(valid), a.score_batch):
-            idxs = valid[s : s + a.score_batch]
-            enc = tok([texts[i] for i in idxs], return_tensors="pt", padding=True, truncation=True,
-                      max_length=a.max_new_tokens + 32, add_special_tokens=True).to(device)
-            if enc["input_ids"].shape[1] < 2:
-                continue
-            with actor.disable_adapter():
-                logits = actor(**enc).logits[:, :-1].float()
-            lp = torch.log_softmax(logits, -1).gather(-1, enc["input_ids"][:, 1:, None]).squeeze(-1)
-            m = enc["attention_mask"][:, 1:].bool()
-            for row, i in enumerate(idxs):
-                n = int(m[row].sum())
-                if n:
-                    logp[i] = (lp[row][m[row]].sum() / n).item()
-                ids = enc["input_ids"][row][enc["attention_mask"][row].bool()]
-                dis[i] = len(set(ids.tolist())) / max(len(ids), 1)
-    finally:
-        tok.padding_side = prev
-    return logp, dis
+# ----------------------------------------------------------------------------------------------
+# advantages + update
+# ----------------------------------------------------------------------------------------------
+def compute_advantages(r, n_groups, group_size, mode="none"):
+    """GRPO advantages for group-major rewards r [n_groups*group_size].
+    mode 'none'  = Dr. GRPO: r - group_mean (no /std);
+         'group' = standard GRPO: / per-group std;
+         'batch' = ScaleRL: drop zero-variance groups, / ONE std over all surviving rollouts of the
+                   GLOBAL batch (all_reduce'd across DDP ranks — each rank only holds its own groups)."""
+    rg = r.view(n_groups, group_size)
+    adv = rg - rg.mean(1, keepdim=True)
+    if mode == "group":
+        adv = adv / (rg.std(1, keepdim=True) + 1e-6)
+    elif mode == "batch":
+        nz = (rg.std(1, keepdim=True) > 1e-6).expand(-1, group_size)
+        adv = adv * nz
+        stats = torch.tensor([adv[nz].double().pow(2).sum(), adv[nz].double().sum(), nz.sum()],
+                             dtype=torch.float64)
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(stats)                                        # gloo: CPU tensor
+        n = stats[2].item()
+        std = math.sqrt(max(stats[0].item() / n - (stats[1].item() / n) ** 2, 0.0)) if n > 1 else 1.0
+        adv = adv / (std + 1e-6)
+    elif mode != "none":
+        raise ValueError(mode)
+    return adv.flatten().detach()
 
 
 def _ddp_sync_grads(params, total_tok):
-    """All-reduce the trainable (LoRA) grads across ranks — ONE flat CPU buffer over gloo (NCCL
-    deadlocks on this box; gloo is fine because only the small LoRA grads move). Token-weighted
+    """All-reduce the LoRA grads across ranks as ONE flat CPU buffer over gloo. Token-weighted
     average: each rank's grad is (sum of its token grads)/local_tok, so
-    Σ_r grad_r·tok_r / Σ_r tok_r == EXACTLY the single-GPU gradient over the union batch (with
-    equal per-rank token counts this reduces to the plain average). The trailing buffer slot
-    carries local_tok so a single collective yields both the weighted sum and the global count."""
+    sum_r grad_r*tok_r / sum_r tok_r == EXACTLY the single-GPU gradient over the union batch."""
     grads = [p.grad for p in params if p.grad is not None]
     if not grads:
         return
     flat = torch.cat([g.detach().reshape(-1).float() for g in grads]
                      + [torch.ones(1, device=grads[0].device)]).cpu()
     flat.mul_(float(total_tok))                    # token-weight this rank's contribution
-    dist.all_reduce(flat, op=dist.ReduceOp.SUM)    # gloo: CPU tensor, no NCCL anywhere
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
     flat.div_(flat[-1].item())                     # /= global completion-token count
     off = 0
     for g in grads:
         n = g.numel()
-        g.copy_(flat[off : off + n].view_as(g))    # copy_ handles cpu->cuda + dtype cast
+        g.copy_(flat[off : off + n].view_as(g))
         off += n
 
 
 def update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_rep, a, device):
-    """ONE Dr. GRPO optimizer update. loss = Σ_tokens −min(ratio·A, clip(ratio)·A)·mask / TOTAL
-    completion tokens in batch (GLOBAL constant normalizer — no per-sequence mean, no /std, no KL).
-    ratio TIS-capped (upper only). new_logp forward runs with the SAME inject hook as rollout."""
+    """ONE optimizer update. loss = sum_tokens -min(ratio*A, clip(ratio)*A) / total completion tokens
+    (global per-token normalizer). ratio is TIS-capped (upper only). new_logp runs with the SAME
+    inject hook as rollout. Optional entropy bonus and capped-k3 KL to the frozen 'ref' adapter."""
     n = ids.shape[0]
     gen_mask = attn[:, p_len:].bool()
     total_tok = max(int(gen_mask.sum()), 1)
@@ -420,236 +519,167 @@ def update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_re
         del logits
         new_lp = logp_full.gather(-1, b_ids[:, p_len:, None]).squeeze(-1)
         m = gen_mask[s:e].to(device)
-        ratio = torch.exp(new_lp - old_lp[s:e].to(device)).clamp(max=a.tis_cap)  # TIS, upper only
+        ratio = torch.exp(new_lp - old_lp[s:e].to(device)).clamp(max=a.tis_cap)
         A = adv[s:e, None].to(device)
         loss = (-torch.minimum(ratio * A, ratio.clamp(lo, hi) * A) * m).sum() / total_tok
-        # per-token entropy: ALWAYS computed for logging (logits already materialized, ~free);
-        # bonus term added to the loss only when entropy_coef > 0 (Dr. GRPO stays KL/bonus-free by default).
-        ent = -(logp_full.exp() * logp_full).sum(-1)
+        ent = -(logp_full.exp() * logp_full).sum(-1)                    # per-token entropy (logged always)
         ent_sum += float((ent.detach() * m).sum())
-        if a.entropy_coef > 0:  # maximize r + β·H(π): keeps policy stochastic for Bo-N, no KL anchoring
+        if a.entropy_coef > 0:
             loss = loss - a.entropy_coef * (ent * m).sum() / total_tok
-        if a.kl_coef > 0:  # capped KL-to-init anchor: ref logps from the FROZEN init adapter, same inject hook
+        if a.kl_coef > 0:  # capped KL-to-init: ref logps from the FROZEN init adapter, same inject hook
             with torch.no_grad():
                 actor.set_adapter("ref")
                 with hooked(submodule, hook):
                     ref_logits = actor(input_ids=b_ids, attention_mask=b_attn).logits[:, p_len - 1 : -1]
                 ref_lp = torch.log_softmax(ref_logits.float(), -1).gather(-1, b_ids[:, p_len:, None]).squeeze(-1)
                 del ref_logits
-                actor.set_adapter("default")  # MUST restore before next micro-batch / sync_weights merge
-            delta = ref_lp - new_lp                                    # log(π_ref / π)
+                actor.set_adapter("default")
+            delta = ref_lp - new_lp                                    # log(pi_ref / pi)
             kl = (torch.exp(delta) - delta - 1).clamp(0.0, a.kl_cap)   # k3 estimator, capped per token
             loss = loss + a.kl_coef * (kl * m).sum() / total_tok
             kl_sum += float((kl.detach() * m).sum())
         del logp_full
-        loss.backward()  # micro-losses share the global normalizer → grads sum correctly
+        loss.backward()                              # micro-losses share the global normalizer
         loss_sum += loss.item()
         clipped_tok += int((((ratio < lo) | (ratio > hi)) & m).sum())
         ratio_sum += float((ratio.detach() * m).sum())
     params = [p for p in actor.parameters() if p.requires_grad]
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        _ddp_sync_grads(params, total_tok)  # after this, grads (hence clip + step) match on all ranks
+        _ddp_sync_grads(params, total_tok)           # grads (hence clip + step) match on all ranks
     gn = float(torch.nn.utils.clip_grad_norm_(params, a.max_grad_norm))
     if math.isfinite(gn):
         opt.step()
-    else:  # stepping Adam on nan/inf grads corrupts moments AND weights
+    else:                                            # stepping Adam on nan/inf grads corrupts moments
         opt.zero_grad(set_to_none=True)
         print(f"[update] non-finite grad norm ({gn}) — skipping step", flush=True)
     return {"loss": loss_sum, "grad_norm": gn, "clipfrac": clipped_tok / total_tok,
-            "entropy": ent_sum / total_tok, "kl": kl_sum / total_tok,
-            "ratio_mean": ratio_sum / total_tok}
+            "entropy": ent_sum / total_tok, "kl": kl_sum / total_tok, "ratio_mean": ratio_sum / total_tok}
 
 
-def main():
-    cfg, tr = RLConfig(), TrainConfig()
-    ap = argparse.ArgumentParser()
+# ----------------------------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------------------------
+def parse_args():
+    cfg = RLConfig()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # data / init / resume
     ap.add_argument("--data-dir", default="data/pretrain")
+    ap.add_argument("--bank-file", default="vecs.f32", help="direction-bank file under --data-dir")
+    ap.add_argument("--direction-source", choices=("cluster", "random"), default=cfg.direction_source,
+                    help="cluster: rows of the bank; random: fresh isotropic unit directions each step")
+    ap.add_argument("--n-eval-dirs", type=int, default=64,
+                    help="UNIQUE directions at the FRONT of the bank reserved as eval-only (never sampled)")
     ap.add_argument("--init-adapter", default=cfg.init_adapter)
-    ap.add_argument("--ref-adapter", default=None,
-                    help="KL reference adapter (default: --init-adapter). Set on 24h-wall resume to "
-                         "keep the ORIGINAL anchor (the SFT init) instead of re-anchoring to the "
-                         "resume checkpoint — re-anchoring is the collapse-prone pattern")
+    ap.add_argument("--ref-adapter", default=None, help="KL reference adapter (default: --init-adapter)")
     ap.add_argument("--step-offset", type=int, default=0,
-                    help="resume continuity: the loop runs range(step_offset, total_steps), so step "
-                         "numbers/saves/wandb continue globally and --total-steps stays the ABSOLUTE "
-                         "target. Resuming from step_N -> --step-offset N+1 (step_N saved after "
-                         "iteration N)")
+                    help="resume: loop runs range(step_offset, total_steps); resuming from step_N -> N+1")
     ap.add_argument("--wandb-id", default=None, help="resume logging into an existing wandb run")
     ap.add_argument("--save-dir", default=cfg.save_dir)
+    ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--run-name", default=cfg.run_name)
-    ap.add_argument("--direction-source", default=cfg.direction_source)
+    ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--seed", type=int, default=0)
+    # batch / sampling
     ap.add_argument("--groups-per-step", type=int, default=cfg.groups_per_step)
     ap.add_argument("--group-size", type=int, default=cfg.group_size)
-    ap.add_argument("--lr", type=float, default=cfg.lr)
-    ap.add_argument("--std-norm", action="store_true",
-                    help="standard-GRPO advantage normalization: adv = (r-mean)/per-group-std. "
-                         "Default OFF = Dr.GRPO (r-mean, no /std). ON amplifies small advantages "
-                         "when within-group reward variance is low (diagnostic for flat reward).")
-    ap.add_argument("--clip-eps", type=float, default=cfg.clip_eps)
-    ap.add_argument("--tis-cap", type=float, default=cfg.tis_cap)
+    ap.add_argument("--total-steps", type=int, default=cfg.total_steps)
     ap.add_argument("--max-new-tokens", type=int, default=cfg.max_new_tokens)
     ap.add_argument("--min-new-tokens", type=int, default=cfg.min_new_tokens)
     ap.add_argument("--temperature", type=float, default=cfg.temperature)
-    ap.add_argument("--total-steps", type=int, default=cfg.total_steps)
-    ap.add_argument("--sync-every", type=int, default=cfg.sync_every)
-    ap.add_argument("--fluency-floor", type=float, default=cfg.fluency_floor)
-    ap.add_argument("--distinct-floor", type=float, default=cfg.distinct_floor)
+    ap.add_argument("--rollout-chunk", type=int, default=32, help="hf engine: sequences per generate() call")
+    ap.add_argument("--logp-chunk", type=int, default=16,
+                    help="sequences per old_logp recompute forward (fp32 logits over the 248k vocab: 64 seqs ~13 GB peak)")
+    ap.add_argument("--rollout-engine", choices=("hf", "vllm"), default="hf",
+                    help="vllm: per-rank vLLM engine + vllm_lens steering, LoRA re-published each step")
+    ap.add_argument("--vllm-gpu-mem", type=float, default=0.42,
+                    help="vLLM gpu_memory_utilization (the HF actor shares the GPU; ~0.3 of it is weights)")
+    ap.add_argument("--vllm-logp-tol", type=float, default=0.10,
+                    help="max allowed MEAN |vLLM logp - HF logp| per sampled token; exceeding it aborts "
+                         "(the sampler is not the training policy: LoRA/steering/tokenization drift)")
+    ap.add_argument("--micro-batch", type=int, default=8)
+    ap.add_argument("--score-batch", type=int, default=64)
+    # reward
+    ap.add_argument("--reward-metric", choices=("proj", "cosine"), default="proj",
+                    help="proj: max_t <h_t, unit(v)>; cosine: max_t cos(h_t, v) (scale-invariant)")
+    ap.add_argument("--reward-scale", type=float, default=1.0, help="multiply raw reward before shaping")
+    ap.add_argument("--log-reward", action="store_true", help="log1p-compress the (cosine) reward")
+    ap.add_argument("--reward-window-last", type=int, default=0,
+                    help="reward over only the LAST N kept tokens (0 = all tokens)")
+    ap.add_argument("--reward-topk", type=int, default=1, help="mean of the top-K cosines in the window (1=max)")
+    ap.add_argument("--fluency-floor", type=float, default=cfg.fluency_floor,
+                    help="min clean-base mean logp/token; below it the rollout fails the gate")
+    ap.add_argument("--distinct-floor", type=float, default=cfg.distinct_floor,
+                    help="min distinct-token fraction; below it the rollout fails the gate")
     ap.add_argument("--gate-penalty", type=float, default=cfg.gate_penalty)
     ap.add_argument("--len-penalty-start", type=int, default=cfg.len_penalty_start)
     ap.add_argument("--len-penalty-per-tok", type=float, default=cfg.len_penalty_per_tok)
-    ap.add_argument("--div-coef", type=float, default=0.0,
-                    help="within-group activation-orthogonal diversity bonus (0=off)")
-    ap.add_argument("--reward-window-last", type=int, default=0,
-                    help="anti-smear: compute the reward over only the LAST N kept content tokens "
-                         "(0=off=max over all tokens, the smearing-prone default). The "
-                         "snippet-locality eval showed max-over-all lets the policy smear the feature "
-                         "across every token; a small window forces localized firing")
-    ap.add_argument("--reward-topk", type=int, default=1,
-                    help="reward = mean of the top-K per-token cosines within the reward window "
-                         "(1=max, default). K>1 with --reward-window-last N averages the top-K of N")
     ap.add_argument("--no-gates", action="store_true", help="disable fluency/distinct/len shaping")
-    ap.add_argument("--entropy-coef", type=float, default=cfg.entropy_coef,
-                    help="β for maximize r + β·H(π): direct diversity pressure (Bo-N depends on it)")
-    ap.add_argument("--kl-coef", type=float, default=0.0,
-                    help="mild KL-to-init anchor (0=off): loss += kl_coef * capped_KL(pi || pi_init). "
-                         "reference = base + the --init-adapter LoRA (the SL policy RL starts from)")
-    ap.add_argument("--kl-cap", type=float, default=10.0,
-                    help="per-token KL clamp in nats — a single low-ref-prob token can't blow up the penalty")
-    ap.add_argument("--tri-floor", type=float, default=0.0,
-                    help="min distinct-trigram ratio; below it a rollout fails the gate (0=off)")
-    ap.add_argument("--comp-floor", type=float, default=0.0,
-                    help="min zlib compression ratio of the text; catches templated repetition (0=off)")
-    ap.add_argument("--reward-metric", choices=("proj", "cosine"), default="proj",
-                    help="proj: max_t <h_t, unit(v)> (raw residual dot unit dir; norm-sensitive = the "
-                         "v1/v2 objective). cosine: max_t cos(h_t, v) — scale-invariant, kills the "
-                         "residual-norm inflation hack (pumping ||h|| buys nothing).")
-    ap.add_argument("--reward-scale", type=float, default=1.0,
-                    help="multiply raw reward before shaping; use ~1000 with --reward-metric cosine to keep "
-                         "the ~proj magnitude so LR/gate/KL coefs stay valid under Dr.GRPO unnormalized adv.")
-    ap.add_argument("--firsttok-coef", type=float, default=0.0,
-                    help="reward shaping (0=off): += coef * fraction of THIS direction's max-act target's "
-                         "first-k token ids present in the rollout. Direction-SPECIFIC anchor the "
-                         "direction-agnostic hack can't collect; needs records.jsonl target_text.")
-    ap.add_argument("--firsttok-k", type=int, default=4,
-                    help="how many of the target's leading token ids to anchor on")
-    ap.add_argument("--tp", type=int, default=int(os.environ.get("WORLD_SIZE", "1")))
-    ap.add_argument("--vllm-gpu-mem", type=float, default=0.35)
-    ap.add_argument("--attn-backend", default="TRITON_ATTN",
-                    help="vLLM attention backend; TRITON_ATTN is the only one verified to expose "
-                         "the metadata vllm-lens needs (FLASHINFER silently breaks injection)")
-    ap.add_argument("--vllm-max-len", type=int, default=1024)
-    ap.add_argument("--rollout-chunk", type=int, default=32,
-                    help="HF-generate mini-batch size — sequences per generate() call; lower it if OOM")
-    ap.add_argument("--bank-file", default="vecs.f32",
-                    help="direction-bank filename under --data-dir (e.g. probes.f32 for the RL pool)")
-    ap.add_argument("--micro-batch", type=int, default=8)
-    ap.add_argument("--score-batch", type=int, default=64)
+    # optimization
+    ap.add_argument("--lr", type=float, default=cfg.lr)
+    ap.add_argument("--adam-eps", type=float, default=1e-8)
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
-    ap.add_argument("--save-every", type=int, default=500)
-    ap.add_argument("--eval-every", type=int, default=25,
-                    help="greedy-decode the held-out eval dirs every N steps (0 disables)")
-    ap.add_argument("--n-eval-dirs", type=int, default=64,
-                    help="UNIQUE directions reserved from the FRONT of the bank as eval-only; "
-                         "training samples strictly past their rows, so they are never RL'd on")
-    # ---- zero-shot held-out SAE eval: inject a held-out SAE feature's unit encoder column, greedy-
-    # decode, score the TRUE post-ReLU feature activation vs the feature's corpus-peak baseline.
-    # SAE features are NEVER trained on (RL is on cluster probes) — this is a pure cross-basis
-    # generalization probe, mirroring SL/eval_sae.py so numbers match the pretrain cross-uplift curve.
-    ap.add_argument("--sae-eval-every", type=int, default=0,
-                    help="every N steps, zero-shot eval on held-out SAE features (0 disables)")
-    ap.add_argument("--n-sae-eval-feats", type=int, default=128,
-                    help="held-out SAE features (prefix of the split 'eval' list) for the in-loop eval")
-    ap.add_argument("--sae-path", default=None, help="local ae.pt (offline env); None -> HF cache")
-    ap.add_argument("--maxacts-path", default=None,
-                    help="local max_acts .pt for per-feature corpus-peak baselines; None -> HF cache")
-    ap.add_argument("--sae-split", default=None,
-                    help="split.json carrying an 'eval' list of held-out SAE feature ids")
-    ap.add_argument("--sae-eval-bo", type=int, default=1,
-                    help="best-of-N SAE eval: also sample N/feature and report Bo-N max (1=greedy only)")
-    ap.add_argument("--sae-eval-temp", type=float, default=0.75,
-                    help="sampling temperature for the best-of-N SAE eval (greedy eval stays T=0)")
-    ap.add_argument("--no-wandb", action="store_true")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--clip-eps", type=float, default=cfg.clip_eps)
+    ap.add_argument("--tis-cap", type=float, default=cfg.tis_cap, help="upper cap on the importance ratio")
+    ap.add_argument("--std-norm", action="store_true", help="advantage / per-group std (standard GRPO)")
+    ap.add_argument("--batch-norm", action="store_true",
+                    help="advantage / ONE global-batch std, zero-variance groups dropped (ScaleRL)")
+    ap.add_argument("--entropy-coef", type=float, default=cfg.entropy_coef, help="beta in r + beta*H(pi)")
+    ap.add_argument("--kl-coef", type=float, default=0.0, help="capped-k3 KL-to-init anchor (0=off)")
+    ap.add_argument("--kl-cap", type=float, default=10.0, help="per-token KL clamp (nats)")
+    # removed reward-shaping terms — fail loudly rather than silently ignore an old launcher
+    ap.add_argument("--div-coef", type=float, default=0.0, help="REMOVED (must be 0)")
+    ap.add_argument("--firsttok-coef", type=float, default=0.0, help="REMOVED (must be 0)")
     a = ap.parse_args()
+    assert a.div_coef == 0 and a.firsttok_coef == 0, "--div-coef/--firsttok-coef were removed from the trainer"
+    assert not (a.std_norm and a.batch_norm), "pick one of --std-norm / --batch-norm"
+    assert a.temperature == 1.0, "sampling temp must be 1.0 so the behaviour policy == the policy old_logp measures"
     if a.no_gates:
         a.fluency_floor = a.distinct_floor = a.len_penalty_start = None
-    # vLLM generation logprobs equal the sampling distribution's ONLY at T=1 (raw_logprobs).
-    assert a.temperature == 1.0, "sampling temp must be 1.0 so behavior == the T=1 policy old_logp measures"
+    return a
+
+
+def main():
+    a = parse_args()
+    tr = TrainConfig()
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
-    # ---- data-parallel over groups (torchrun sets WORLD_SIZE/RANK/LOCAL_RANK). Launch with
-    # DDP_BACKEND=gloo on this box: NCCL deadlocks at the first collective (ranks spin 100% CPU,
-    # 0% GPU — see SL/pretrain.py, fixed the same way). world=1 (no torchrun): every DDP branch
-    # below is skipped and behavior is identical to the original single-GPU script. ----
+
+    # ---- data-parallel over groups (torchrun sets WORLD_SIZE/RANK/LOCAL_RANK). DDP_BACKEND=gloo:
+    # all collectives here run on CPU tensors (NCCL deadlocked on the original box). ----
     world = int(os.environ.get("WORLD_SIZE", 1)); rank = int(os.environ.get("RANK", 0))
     local = int(os.environ.get("LOCAL_RANK", 0)); is_main = rank == 0
     if world > 1:
-        assert a.groups_per_step % world == 0, (
-            f"groups_per_step ({a.groups_per_step}) must divide by world ({world}): each rank "
-            f"takes a contiguous slice of WHOLE groups so Dr.GRPO advantages stay intra-rank")
+        assert a.groups_per_step % world == 0, "groups_per_step must divide by world (whole groups per rank)"
         dist.init_process_group(os.environ.get("DDP_BACKEND", "nccl"))
-        torch.cuda.set_device(local)
-    device = f"cuda:{local}"  # HF actor lives here; world=1 -> "cuda:0" exactly as before
+    torch.cuda.set_device(0)
+    device = "cuda:0"                                  # the rank's single visible GPU (see module top)
 
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     prompt_ids, mpos = build_prompt_ids(tok)
     marker, p_len = mpos[0], len(prompt_ids)
-    assert p_len + a.max_new_tokens <= a.vllm_max_len
 
-    # ---- direction bank ----
+    # ---- direction bank + held-out reservation (first --n-eval-dirs UNIQUE blocks never sampled) ----
+    bank, n_vecs, eval_rows = None, None, 0
     if a.direction_source == "cluster":
         stats_p = f"{a.data_dir}/build_stats.json"
         n_vecs = (json.load(open(stats_p))["n_examples"] if os.path.exists(stats_p)
                   else os.path.getsize(f"{a.data_dir}/{a.bank_file}") // (4 * D_MODEL))
         bank = np.memmap(f"{a.data_dir}/{a.bank_file}", dtype=np.float32, mode="r", shape=(n_vecs, D_MODEL))
-    elif a.direction_source == "random":
-        # isotropic random unit directions sampled fresh every step — infinite data, no bank/targets.
-        # tests whether the invert-a-direction skill generalizes to ARBITRARY (non-feature) directions.
-        bank, n_vecs = None, None
-    else:
-        # TODO: "sae" = unit encoder columns of the L27 SAE, "mix" = interleave cluster+sae.
-        # The SAE loader isn't in this repo yet — port from max-activating-examples/src/maxact/sae.py.
-        raise NotImplementedError(f"direction_source={a.direction_source!r}: only 'cluster'/'random' so far")
+        if a.n_eval_dirs > 0:
+            blocks, i = 0, 0
+            while i < n_vecs and blocks < a.n_eval_dirs:
+                row = np.asarray(bank[i]); i += 1; blocks += 1
+                while i < n_vecs and np.array_equal(np.asarray(bank[i]), row):
+                    i += 1
+            eval_rows = i
+        assert n_vecs - eval_rows >= a.groups_per_step, "bank too small after the eval reservation"
 
-    # ---- held-out greedy-eval reservation. build_data mints --targets consecutive rows per probe
-    # direction, so unique directions are contiguous blocks; reserve the first n_eval_dirs UNIQUE
-    # blocks as EVAL-ONLY and make training sample rows strictly past them. SAE features are a
-    # separate zero-shot eval elsewhere — they are never RL'd on. ----
-    eval_dirs, eval_base, eval_rows = None, None, 0
-    if a.eval_every > 0 and a.n_eval_dirs > 0 and bank is not None:
-        blocks, starts, i = [], [], 0
-        while i < n_vecs and len(blocks) < a.n_eval_dirs:
-            row = np.asarray(bank[i], dtype=np.float32)
-            starts.append(i)
-            blocks.append(row)
-            i += 1
-            while i < n_vecs and np.array_equal(np.asarray(bank[i]), row):
-                i += 1
-        assert len(blocks) == a.n_eval_dirs, f"bank has only {len(blocks)} unique dirs < {a.n_eval_dirs}"
-        eval_rows = i
-        eval_dirs = torch.nn.functional.normalize(torch.from_numpy(np.stack(blocks)), dim=-1)
-        rec_p = f"{a.data_dir}/records.jsonl"
-        if os.path.exists(rec_p):  # per-dir corpus baseline (only in pools built with corpus_max_proj)
-            with open(rec_p) as f:
-                recs = [json.loads(next(f)) for _ in range(eval_rows)]
-            base = [recs[s].get("corpus_max_proj") for s in starts]
-            if all(b is not None for b in base):
-                eval_base = torch.tensor(base, dtype=torch.float32)
-        if is_main:
-            print(f"[eval] reserved rows [0, {eval_rows}) = {a.n_eval_dirs} eval-only dirs "
-                  f"(corpus baseline: {'yes' if eval_base is not None else 'no'})", flush=True)
-    tgt_texts = None
-    if a.firsttok_coef > 0:
-        tgt_texts = [json.loads(l).get("target_text", "") for l in open(f"{a.data_dir}/records.jsonl")]
-        if is_main:
-            print(f"[firsttok] loaded {len(tgt_texts)} target texts (first-{a.firsttok_k}-tok anchor, "
-                  f"coef {a.firsttok_coef})", flush=True)
-    assert a.direction_source == "random" or n_vecs - eval_rows >= a.groups_per_step
+    B, G = a.groups_per_step, a.group_size            # B = GLOBAL groups/step
+    Bl = B // world                                   # groups THIS rank rolls out / scores / backprops
 
-    # ---- actor (HF + LoRA, cuda:0). NO gradient checkpointing EVER: recompute happens after the
-    # inject-hook context exits → silently wrong grads. ----
+    # ---- actor (HF + LoRA). NO gradient checkpointing: recompute would run outside the hook. ----
     actor = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16,
                                                  attn_implementation="sdpa", device_map={"": device})
     if a.init_adapter:
@@ -659,168 +689,122 @@ def main():
             r=tr.lora_r, lora_alpha=tr.lora_alpha, lora_dropout=0.0, use_rslora=True,
             target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
     actor.train()
-    opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
-    # ---- resume: restore AdamW moments saved next to the resume checkpoint (avoids the
-    # fresh-optimizer transient on an already-RL'd policy — part of every past collapse). Same
-    # construction order as at save time (opt is built BEFORE the ref adapter loads), so the
-    # integer param ids in the state dict line up. All ranks load (DDP keeps states identical). ----
-    if a.init_adapter and os.path.exists(os.path.join(a.init_adapter, "optim.pt")):
-        opt.load_state_dict(torch.load(os.path.join(a.init_adapter, "optim.pt"), map_location="cpu"))
+    opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr,
+                            weight_decay=0.0, eps=a.adam_eps)
+    optim_p = os.path.join(a.init_adapter or "", "optim.pt")
+    if a.init_adapter and os.path.exists(optim_p):                  # resume AdamW moments (same param order)
+        opt.load_state_dict(torch.load(optim_p, map_location="cpu"))
         if is_main:
-            print(f"[resume] AdamW state restored from {a.init_adapter}/optim.pt", flush=True)
+            print(f"[resume] AdamW state restored from {optim_p}", flush=True)
     elif a.step_offset and is_main:
-        print(f"[resume] WARNING: no optim.pt in {a.init_adapter} — FRESH AdamW moments "
-              "(pre-patch checkpoint); watch the first steps for a transient", flush=True)
+        print(f"[resume] WARNING: no optim.pt in {a.init_adapter} — fresh AdamW moments", flush=True)
     submodule = get_layer(actor, INJECT_LAYER)
-    if a.kl_coef > 0:  # frozen reference policy for the capped KL anchor (default: the init/SL policy)
+    if a.kl_coef > 0:                                                # frozen reference for the KL anchor
         ref_src = a.ref_adapter or a.init_adapter
-        assert ref_src, "--kl-coef needs --init-adapter or --ref-adapter (reference = base + LoRA)"
-        actor.load_adapter(ref_src, adapter_name="ref")         # loaded frozen (not trainable)
-        actor.set_adapter("default")                            # keep the trainable adapter active
+        assert ref_src, "--kl-coef needs --init-adapter or --ref-adapter"
+        actor.load_adapter(ref_src, adapter_name="ref")
+        actor.set_adapter("default")
         if is_main:
-            print(f"[kl] ref adapter = {ref_src}; kl_coef={a.kl_coef} cap={a.kl_cap} nats/tok", flush=True)
+            print(f"[kl] ref adapter = {ref_src}; kl_coef={a.kl_coef} cap={a.kl_cap}", flush=True)
 
-    # ---- HF-generate rollouts: the LoRA actor IS the rollout engine (no vLLM). ----
+    # ---- vLLM engine AFTER the HF actor: importing vllm registers its vendored Qwen3_5Config with
+    # transformers' AutoConfig (exist_ok=True), which breaks AutoModelForCausalLM.from_pretrained for
+    # this model if it runs afterwards. Memory: the engine's util*total check is against FREE memory,
+    # which still clears with the 54 GB actor resident (0.42*183 = 77 GB <= ~127 GB free). ----
     llm = None
-    if is_main:
-        print(f"[hf-rollout] actor ready | {n_vecs} directions | prompt {p_len} toks, marker @{marker} "
-              f"| rollout_chunk {a.rollout_chunk} | world {world}", flush=True)
+    if a.rollout_engine == "vllm":
+        t_v = time.time()
+        llm = init_vllm(a, local, rank, p_len, max_seqs=Bl * G)
+        if is_main:
+            print(f"[vllm] engine up in {time.time() - t_v:.0f}s (rank-local, TP=1, LoRA on, prefix-cache off)", flush=True)
+        chk = verify_vllm_injection(llm, actor, submodule, prompt_ids, marker, device, seed=a.seed)
+        if not chk["ok"]:
+            raise RuntimeError(f"vLLM steering does NOT match the HF inject hook (cos/norm-ratio): {chk}")
+        if is_main:
+            print(f"[vllm] injection verified: cos(delta, v) = {chk['cos']:.4f} | injected/HF magnitude = {chk['norm_ratio']:.3f} "
+                  f"| ||h|| vllm/hf = {chk['hnorm_agree']:.3f} ({chk['hnorm_vllm']:.1f}/{chk['hnorm_hf']:.1f}) "
+                  f"| max |delta| pre-marker rows = {chk['max_other_row_delta']:.2e}", flush=True)
 
-    # ---- held-out SAE zero-shot eval setup (features NEVER RL'd on — a pure cross-basis
-    # generalization probe; mirrors SL/eval_sae.py so numbers track the pretrain cross-uplift curve) ----
-    sae_obj = sae_dirs = sae_feats = sae_dataset_max = None
-    if a.sae_eval_every > 0 and is_main:  # in-loop evals are rank-0-only under DDP
-        from mxf.sae import load_max_acts, load_sae
-        assert a.sae_split, "--sae-eval-every set but --sae-split (split.json with 'eval' ids) missing"
-        sae_obj = load_sae(path=a.sae_path, device=device, dtype=torch.float32)
-        sae_feats = json.load(open(a.sae_split))["eval"][: a.n_sae_eval_feats]
-        sae_dirs = sae_obj.enc_dirs(sae_feats)                        # [n,d] unit encoder cols, cuda:0
-        ma = load_max_acts(path=a.maxacts_path)["max_acts"]           # [F,N,L] corpus peaks
-        sae_dataset_max = ma[torch.as_tensor(sae_feats)].amax(dim=(1, 2)).to(device)  # [n]
-        del ma
-        print(f"[sae-eval] {len(sae_feats)} held-out SAE feats every {a.sae_eval_every} steps; "
-              f"baseline median {sae_dataset_max.median().item():.1f}", flush=True)
-
-    if not a.no_wandb and is_main:
-        wandb.init(project="maxact-fast", name=a.run_name, config=vars(a),
-                   id=a.wandb_id or None, resume="must" if a.wandb_id else None)
+    adv_mode = "batch" if a.batch_norm else ("group" if a.std_norm else "none")
+    use_gates = a.fluency_floor is not None or a.distinct_floor is not None
     if is_main:
+        print(f"[rl] {n_vecs} directions (eval-reserved rows [0,{eval_rows})) | prompt {p_len} toks, "
+              f"marker @{marker} | world {world} | adv {adv_mode} | gates {use_gates} | engine {a.rollout_engine}", flush=True)
+        if not a.no_wandb:
+            wandb.init(project="maxact-fast", name=a.run_name, config=vars(a),
+                       id=a.wandb_id or None, resume="must" if a.wandb_id else None)
         os.makedirs(a.save_dir, exist_ok=True)
-    B, G = a.groups_per_step, a.group_size   # B = GLOBAL groups/step (same meaning as world=1)
-    Bl = B // world                          # groups THIS rank rolls out / scores / backprops
+    for _ in range(a.step_offset if a.direction_source == "cluster" else 0):
+        rng.choice(n_vecs - eval_rows, size=B, replace=False)   # fast-forward the direction rng on resume
 
-    if a.step_offset and a.direction_source != "random":
-        # fast-forward the direction-sampling rng stream past the completed steps (one draw/step),
-        # so the resumed leg samples the directions the uninterrupted run would have
-        for _ in range(a.step_offset):
-            rng.choice(n_vecs - eval_rows, size=B, replace=False)
-    for step in range(a.step_offset, a.total_steps):   # step is GLOBAL (resume: offset = ckpt+1)
-        ev = {}
-        if eval_dirs is not None and is_main and step % a.eval_every == 0:
-            te = time.time()
-            ev, ev_texts = greedy_eval(llm, prompt_ids, marker, eval_dirs, eval_base, actor, tok, device, a)
-            ev["time/eval_s"] = time.time() - te
-            print(f"[eval] step {step:05d} | greedy act mean {ev['eval/greedy_act_mean']:.2f} "
-                  f"max {ev['eval/greedy_act_max']:.2f}"
-                  + (f" | beat {ev['eval/greedy_beat_frac']:.0%}" if "eval/greedy_beat_frac" in ev else "")
-                  + f" | {ev_texts[0][:90]!r}", flush=True)
-        if sae_obj is not None and step % a.sae_eval_every == 0:
-            ts = time.time()
-            sev, sev_texts = sae_eval(llm, prompt_ids, marker, sae_dirs, sae_feats, sae_obj,
-                                      sae_dataset_max, actor, tok, device, a)
-            sev["time/sae_eval_s"] = time.time() - ts
-            ev.update(sev)
-            print(f"[sae-eval] step {step:05d} | norm_act {sev['eval/sae_norm_act']:.3f} | "
-                  f"beat {sev['eval/sae_beat_frac']:.0%} | act_mean {sev['eval/sae_act_mean']:.1f}"
-                  + (f" | Bo{a.sae_eval_bo}@{a.sae_eval_temp} beat {sev[f'eval/sae_bo{a.sae_eval_bo}_beat_frac']:.0%} "
-                     f"norm {sev[f'eval/sae_bo{a.sae_eval_bo}_norm_act']:.3f}" if a.sae_eval_bo > 1 else "")
-                  + f" | {sev_texts[0][:60]!r}", flush=True)
+    for step in range(a.step_offset, a.total_steps):
         t0 = time.time()
-        # B distinct vec_idx past the eval reservation (sorted: memmap-friendly). Under DDP every
-        # rank draws the SAME B directions (identical seed -> identical rng stream), then takes its
-        # contiguous slice of Bl WHOLE groups — group membership never crosses a rank boundary, so
-        # the Dr.GRPO advantage (r - group_mean) stays intra-rank and exact.
-        idx = None
-        if a.direction_source == "random":                     # fresh isotropic unit dirs each step
-            dirs = torch.nn.functional.normalize(torch.randn(B, D_MODEL, dtype=torch.float32), dim=-1)
+        # every rank draws the SAME B directions (same seed), then takes its slice of WHOLE groups
+        if a.direction_source == "random":
+            dirs = F.normalize(torch.randn(B, D_MODEL, dtype=torch.float32), dim=-1)
         else:
             idx = eval_rows + np.sort(rng.choice(n_vecs - eval_rows, size=B, replace=False))
-            dirs = torch.nn.functional.normalize(
-                torch.from_numpy(np.asarray(bank[idx], dtype=np.float32)), dim=-1)
+            dirs = F.normalize(torch.from_numpy(np.asarray(bank[idx], dtype=np.float32)), dim=-1)
         if world > 1:
             dirs = dirs[rank * Bl : (rank + 1) * Bl]
-            if idx is not None:
-                idx = idx[rank * Bl : (rank + 1) * Bl]
-        texts, gen_ids, old_lps = rollout(actor, submodule, tok, prompt_ids, marker, dirs, a, device)
-        t_roll = time.time() - t0
-        dirs_rep = dirs.repeat_interleave(G, 0).to(device)  # [B*G, d] rollout i's group direction
-
-        use_fluency = a.fluency_floor is not None or a.distinct_floor is not None
-        scored = score(texts, dirs_rep, actor, tok, device, a, with_fluency=use_fluency, return_act=(a.div_coef > 0))
-        meanact = None
-        if use_fluency and a.div_coef > 0:
-            r, flu, dis, meanact = scored
-        elif use_fluency:
-            r, flu, dis = scored
-        elif a.div_coef > 0:
-            r, meanact = scored
+        if llm is not None:
+            texts, gen_ids, old_lps, rstats = rollout_vllm(llm, actor, submodule, tok, prompt_ids, marker,
+                                                           dirs, a, device, step, rank)
+            if is_main:
+                print(f"  [vllm] |logp_vllm - logp_hf| mean {rstats['rollout/vllm_hf_logp_absdiff_mean']:.4f} "
+                      f"p99 {rstats['rollout/vllm_hf_logp_absdiff_p99']:.3f} max {rstats['rollout/vllm_hf_logp_absdiff_max']:.3f} "
+                      f"over {int(rstats['rollout/vllm_compared_tokens'])} toks | appended_stop {int(rstats['rollout/appended_stop'])} "
+                      f"| lora save {rstats['time/lora_save_s']:.1f}s | gen {rstats['time/vllm_gen_s']:.1f}s", flush=True)
+            if not (rstats["rollout/vllm_hf_logp_absdiff_mean"] <= a.vllm_logp_tol):
+                # ---- diagnose WHICH policy the engine is running before dying ----
+                prompt_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+                conds = _hf_logp_conditions(actor, submodule, prompt_t, gen_ids, dirs_rep, marker, tok, device, a.logp_chunk)
+                table = {f"adapter={'on' if ad else 'off'},hook={'on' if hk else 'off'}": round(_absdiff(l, rstats["_vllm_lps"]), 4)
+                         for (ad, hk), l in conds.items()}
+                # LoRA-only probe: greedy vLLM WITH the adapter, NO steering -> HF adapter-on/no-hook logps
+                from vllm import SamplingParams
+                po = llm.generate([{"prompt_token_ids": list(prompt_ids)}],
+                                  [SamplingParams(temperature=0.0, max_tokens=24, min_tokens=24, logprobs=0)],
+                                  lora_request=rstats["_lora_req"], use_tqdm=False)[0].outputs[0]
+                pg = list(po.token_ids); pv = [(d[t].logprob if (d is not None and t in d) else None) for d, t in zip(po.logprobs or [], pg)]
+                ph_on = _old_logp_nohook(actor, prompt_t, [pg], tok, device)
+                with actor.disable_adapter():
+                    ph_off = _old_logp_nohook(actor, prompt_t, [pg], tok, device)
+                table["LORA-ONLY probe: vllm(lora,no-steer) vs hf(adapter on,no hook)"] = round(_absdiff(ph_on, [pv]), 4)
+                table["LORA-ONLY probe: vllm(lora,no-steer) vs hf(adapter OFF,no hook)"] = round(_absdiff(ph_off, [pv]), 4)
+                table["LORA-ONLY probe text"] = tok.decode(pg, skip_special_tokens=True)[:80]
+                print("[vllm-diag] mean |logp_vllm - logp_hf| per HF condition:", json.dumps(table, indent=1), flush=True)
+                raise RuntimeError(f"vLLM sampler is NOT the training policy: mean |logp_vllm - logp_hf| = "
+                                   f"{rstats['rollout/vllm_hf_logp_absdiff_mean']:.4f} > tol {a.vllm_logp_tol} "
+                                   f"(p99 {rstats['rollout/vllm_hf_logp_absdiff_p99']:.3f}); diagnosis: {table}")
+            rstats = {k: v for k, v in rstats.items() if not k.startswith("_")}
         else:
-            r = scored
-        r = r * a.reward_scale                       # cosine runs: ~1000x to match proj magnitude
+            texts, gen_ids, old_lps = rollout(actor, submodule, tok, prompt_ids, marker, dirs, a, device)
+            rstats = {}
+        t_roll = time.time() - t0
+        dirs_rep = dirs.repeat_interleave(G, 0).to(device)             # [Bl*G, d]
+
+        # ---- reward + shaping ----
+        if use_gates:
+            r, flu, dis = score(texts, dirs_rep, actor, tok, device, a, with_fluency=True)
+        else:
+            r = score(texts, dirs_rep, actor, tok, device, a)
+        r = r * a.reward_scale
         raw_r, gate_frac = r.clone(), 1.0
-        if use_fluency:
-            gate = torch.ones(Bl * G, dtype=torch.bool)
+        gate = torch.ones(Bl * G, dtype=torch.bool)
+        if use_gates:
             if a.fluency_floor is not None:
                 gate &= flu >= a.fluency_floor
             if a.distinct_floor is not None:
                 gate &= dis >= a.distinct_floor
-            # repetition gates (catch the reward-hack templates the distinct-TOKEN floor misses):
-            # trigram-distinctness kills verbatim loops; compression-ratio kills templated number/citation spam
-            if a.tri_floor > 0 or a.comp_floor > 0:
-                tri = torch.tensor([_distinct_ngram_ratio(g, 3) for g in gen_ids])
-                comp = torch.tensor([_compression_ratio(t) for t in texts])
-                if a.tri_floor > 0:
-                    gate &= tri >= a.tri_floor
-                if a.comp_floor > 0:
-                    gate &= comp >= a.comp_floor
-            # sign-safe subtract, NOT zero: zeroing would rank gated garbage above coherent
-            # negative-dot rollouts
-            r = r - a.gate_penalty * (~gate).float()
+            r = r - a.gate_penalty * (~gate).float()       # subtract (not zero): gated garbage ranks below coherent negatives
             gate_frac = gate.float().mean().item()
-        if a.len_penalty_start is not None:
-            over = torch.tensor([max(0, len(g) - a.len_penalty_start) for g in gen_ids],
-                                dtype=torch.float32)
-            # gate-masked like the div bonus (_gmask): gated/garbage rollouts already eat the
-            # gate_penalty — len-penalty (and div) only shape VALID rollouts.
-            r = r - a.len_penalty_per_tok * over * (gate.float() if use_fluency else torch.ones_like(over))
-        div_mean = 0.0
-        if a.div_coef > 0 and meanact is not None:
-            ma = meanact.to(device).view(Bl, G, D_MODEL)
-            vhat = dirs.to(device)
-            dots = torch.einsum("bgd,bd->bg", ma, vhat)
-            perp = F.normalize(ma - dots.unsqueeze(-1) * vhat.unsqueeze(1), dim=-1)
-            sim = torch.einsum("bgd,bhd->bgh", perp, perp)
-            div = (1.0 - (sim.sum(2) - 1.0) / max(G - 1, 1)).flatten().cpu()
-            _gmask = gate.float() if use_fluency else torch.ones_like(div)
-            r = r + a.div_coef * div * _gmask
-            div_mean = div.mean().item()
-        ftok_mean = 0.0
-        if a.firsttok_coef > 0 and tgt_texts is not None:
-            # per-group (=direction) target first-k token-id sets; rollout i's group is i//G.
-            # overlap varies ACROSS a group's rollouts, so it does NOT cancel in adv = r - group_mean.
-            tgt_sets = [frozenset(tok.encode(tgt_texts[j], add_special_tokens=False)[: a.firsttok_k])
-                        for j in idx]
-            ftok = torch.tensor([len(set(gen_ids[i]) & tgt_sets[i // G]) / max(len(tgt_sets[i // G]), 1)
-                                 for i in range(Bl * G)], dtype=torch.float32)
-            r = r + a.firsttok_coef * ftok
-            ftok_mean = ftok.mean().item()
-        _rg = r.view(Bl, G)
-        _adv = _rg - _rg.mean(1, keepdim=True)          # Dr.GRPO baseline (r - group_mean)
-        if getattr(a, "std_norm", False):               # standard-GRPO: /per-group-std amplifies small advantages
-            _adv = _adv / (_rg.std(1, keepdim=True) + 1e-6)
-        adv = _adv.flatten().detach()
+        if a.len_penalty_start is not None:                # length costs only for VALID rollouts (gated ones already pay)
+            over = torch.tensor([max(0, len(g) - a.len_penalty_start) for g in gen_ids], dtype=torch.float32)
+            r = r - a.len_penalty_per_tok * over * gate.float()
+        adv = compute_advantages(r, Bl, G, adv_mode)
 
-        # pad the batch — prompt is shared, so p_len is constant across rows
+        # ---- pad the batch (shared prompt -> constant p_len) and update ----
         L = p_len + max(len(g) for g in gen_ids)
         ids = torch.full((Bl * G, L), tok.pad_token_id, dtype=torch.long)
         attn = torch.zeros((Bl * G, L), dtype=torch.long)
@@ -832,57 +816,48 @@ def main():
             attn[i, : p_len + len(g)] = 1
             old_lp[i, : len(g)] = lp
         stats = update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_rep, a, device)
-        if os.environ.get("RL_DDP_CHECK"):  # per-rank LoRA weight checksum — MUST match across ranks
-            with torch.no_grad():
-                cs = torch.stack([p.detach().float().norm()
-                                  for p in actor.parameters() if p.requires_grad]).norm().item()
-            print(f"[ddp-check] rank {rank} step {step} lora_l2 {cs:.10f}", flush=True)
 
-        sync_s = 0.0  # no-op: the HF actor IS the rollout engine (no vLLM to sync)
+        # ---- logging (reward stats aggregated over ALL ranks) ----
         secs = time.time() - t0
+        mem_alloc = torch.cuda.memory_allocated(device) / 2**30
+        mem_peak = torch.cuda.max_memory_allocated(device) / 2**30
+        torch.cuda.reset_peak_memory_stats(device)
         n_gen = float(sum(len(g) for g in gen_ids))
-        if world > 1:  # aggregate reward stats over ALL ranks so the logged numbers mean the
-            gath = [torch.zeros_like(raw_r) for _ in range(world)]  # same thing as a world=1 run
-            dist.all_gather(gath, raw_r)
-            raw_r_all = torch.cat(gath)
+        rg_std = r.view(Bl, G).std(1).mean().item()
+        if world > 1:
+            gath = [torch.zeros_like(raw_r) for _ in range(world)]
+            dist.all_gather(gath, raw_r); raw_r_all = torch.cat(gath)
             gath = [torch.zeros_like(r) for _ in range(world)]
-            dist.all_gather(gath, r)
-            r_all = torch.cat(gath)
-            aux = torch.tensor([n_gen, gate_frac, div_mean, ftok_mean], dtype=torch.float64)
-            dist.all_reduce(aux)                  # SUM; equal rollout counts/rank -> mean of per-
-            n_gen = float(aux[0])                 # rank means is exact for the fraction metrics
-            gate_frac, div_mean, ftok_mean = (aux[1:] / world).tolist()
+            dist.all_gather(gath, r); r_all = torch.cat(gath)
+            aux = torch.tensor([n_gen, gate_frac, rg_std], dtype=torch.float64)
+            dist.all_reduce(aux)                                       # equal rollouts/rank -> means are exact
+            n_gen, gate_frac, rg_std = float(aux[0]), float(aux[1] / world), float(aux[2] / world)
         else:
             raw_r_all, r_all = raw_r, r
         log = {"reward/mean": raw_r_all.mean().item(), "reward/std": raw_r_all.std().item(),
                "reward/max": raw_r_all.max().item(), "reward/shaped_mean": r_all.mean().item(),
-               "reward/div_mean": div_mean,
-               "reward/within_group_std": _rg.std(1).mean().item(),  # the ACTUAL Dr.GRPO learning signal (batch-wide reward/std is cross-direction & misleading)
-               "reward/firsttok_mean": ftok_mean,
-               "reward/gate_frac": gate_frac, "ratio/clipfrac": stats["clipfrac"],
+               "reward/within_group_std": rg_std, "reward/gate_frac": gate_frac,
+               "ratio/clipfrac": stats["clipfrac"], "ratio/mean": stats["ratio_mean"],
                "policy/entropy": stats["entropy"], "policy/kl_to_init": stats["kl"],
-               "ratio/mean": stats["ratio_mean"],
                "loss": stats["loss"], "grad_norm": stats["grad_norm"],
-               "grad_norm_clipped": min(stats["grad_norm"], a.max_grad_norm),
                "grad_norm_did_clip": float(stats["grad_norm"] > a.max_grad_norm),
                "rollout/mean_logp": torch.cat(old_lps).mean().item(),
                "rollout/len_mean": n_gen / (B * G), "tokens_per_sec": n_gen / secs,
-               "time/rollout_s": t_roll, "time/sync_s": sync_s, "time/step_s": secs}
-        log.update(ev)
+               "time/rollout_s": t_roll, "time/step_s": secs,
+               "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, **rstats}
         if is_main:
-            print(f"step {step:05d} | r {log['reward/mean']:.2f} (max {log['reward/max']:.1f}) | "
-                  f"gate {gate_frac:.0%} | ratio {log['ratio/mean']:.3f} clip {log['ratio/clipfrac']:.2%} | len {log['rollout/len_mean']:.0f} "
-                  f"| gnorm {log['grad_norm']:.3f}->{log['grad_norm_clipped']:.3f}{'*CLIP' if log['grad_norm_did_clip'] else ''} "
-                  f"| {log['tokens_per_sec']:.0f} tok/s | {secs:.0f}s", flush=True)
+            print(f"step {step:05d} | r {log['reward/mean']:.2f} (max {log['reward/max']:.1f}) | gate {gate_frac:.0%} "
+                  f"| ent {log['policy/entropy']:.2f} | ratio {log['ratio/mean']:.3f} clip {log['ratio/clipfrac']:.2%} "
+                  f"| len {log['rollout/len_mean']:.0f} | gnorm {log['grad_norm']:.3f}{'*CLIP' if log['grad_norm_did_clip'] else ''} "
+                  f"| {log['tokens_per_sec']:.0f} tok/s | {secs:.0f}s | hf mem {mem_alloc:.0f}G (peak {mem_peak:.0f}G)"
+                  + (f" | vllm-hf |dlogp| {rstats['rollout/vllm_hf_logp_absdiff_mean']:.4f} (p99 {rstats['rollout/vllm_hf_logp_absdiff_p99']:.3f}) gen {rstats['time/vllm_gen_s']:.0f}s" if rstats else ""), flush=True)
             if step % 10 == 0:
                 print(f"  sample r={raw_r[0]:.2f}: {texts[0][:110]!r}", flush=True)
             if not a.no_wandb:
                 wandb.log(log, step=step)
             if a.save_every and step and step % a.save_every == 0:
                 actor.save_pretrained(f"{a.save_dir}/step_{step}")
-                # AdamW moments next to the ckpt (24h-wall resume). ~2x adapter size in fp32, so
-                # keep only the NEWEST TWO optim.pt (the ckpts themselves are all kept).
-                torch.save(opt.state_dict(), f"{a.save_dir}/step_{step}/optim.pt")
+                torch.save(opt.state_dict(), f"{a.save_dir}/step_{step}/optim.pt")   # keep newest two
                 stale = os.path.join(a.save_dir, f"step_{step - 2 * a.save_every}", "optim.pt")
                 if os.path.exists(stale):
                     os.remove(stale)
@@ -892,7 +867,7 @@ def main():
             torch.save(opt.state_dict(), f"{a.save_dir}/final/optim.pt")
         print("RL_DONE", flush=True)
     if world > 1:
-        dist.barrier()  # non-zero ranks wait for rank 0's final save before tearing down
+        dist.barrier()
         dist.destroy_process_group()
 
 

@@ -42,11 +42,14 @@ app = modal.App("maemm-rl-last5-8xb200")
 
 # torch 2.10.0+cu128 == the box venv; cu128 wheels carry sm_100 (B200) kernels.
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.debian_slim(python_version="3.12")  # vllm-lens needs >=3.12
     .pip_install(
         "torch==2.10.0",
         index_url="https://download.pytorch.org/whl/cu128",
     )
+    # vLLM rollout engine (pins torch==2.10.0 -> matches the layer above) + vllm_lens steering plugin
+    # (1.1.0 = the version proven on this model in scripts/vllm_smoke.py). transformers is re-pinned below.
+    .pip_install("vllm==0.19.0", "vllm-lens==1.1.0")
     .pip_install(
         "transformers==5.15.0",
         "peft==0.20.0",
@@ -66,7 +69,7 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
 
 POOL_DIR = "/data/pool_rl_last5"                 # built by modal_pool_last5.py
 SFT_INIT = "/data/sft_mix/last5_rp/final"        # SFT-final adapter (init AND frozen KL ref)
-CKPT_DIR = "/data/ckpts_last5_v7"   # v7 = YOLO no-KL (kl 0, ref-forward skipped for speed), lr 1e-5, groups 256; "see what happens" w/ no leash. v6=kl0.01 (stopped ~step18), v5=kl0.005 collapsed ~step52
+CKPT_DIR = "/data/ckpts_last5_v11"  # v11 = v10 recipe (log-reward, batch-norm, adam-eps 1e-15) + a SMALL KL leash (0.01: v10 kl=0 collapsed @~110 via entropy loss, v9 kl=0.04 held but capped fidelity ~0.71) + big batch 64x32=2048 (true GLOBAL batch-norm now) + vLLM rollouts. From v9/step_50 (has optim.pt).
 
 TRAIN_ARGS = [
     "--bank-file", "vecs.f32",
@@ -74,7 +77,7 @@ TRAIN_ARGS = [
     # deep-RL ckpt collapsed even at LP 1.0 (fresh optimizer + weak KL anchor + policy already
     # near the reward-hack cliff). SFT-init is the proven-stable pattern.
     "--init-adapter", SFT_INIT,
-    "--lr", "1e-5",                              # paper scale (kept)
+    "--lr", "1e-5",                              # v9: our LoRA lr (DeepSeek used 1e-6 for full-FT — too slow for LoRA)
     "--reward-metric", "cosine",
     # ---- RAW-COSINE units from step 0 (paper run's post-resume re-param values, ABSOLUTE).
     # The kl 0.1 leash is the fix for the paper run's step-330+ gate collapse (the x1000-era
@@ -82,9 +85,12 @@ TRAIN_ARGS = [
     # resume-time re-param) means the first leg never runs the collapse-prone inert-KL config. ----
     "--reward-scale", "1000",                    # v5: PROVEN paper scale (v4 std-norm+scale1 collapsed ~step28: KL 0.22->9.5, gate->0)
     "--len-penalty-start", "16",
-    "--len-penalty-per-tok", "0.25",             # paper
-    "--gate-penalty", "25",                      # paper
-    "--kl-coef", "0",                            # v7 YOLO: NO KL leash (pure reward-max). kl_coef==0 gates OFF the ref-model forward (rl.py:432/675) -> skips ref pass = per-step SPEEDUP + no ref adapter loaded. Expect fast drift/collapse (no direction constraint) — "see what happens" run.
+    "--len-penalty-per-tok", "0.2",              # v10: x0.8 (log-reward compresses cosine-part log1p(cos)x1000 vs cos x1000 → restore v9 relative weight)
+    "--gate-penalty", "20",                      # v10: x0.8 (same log-reward proportional rescale; was 25)
+    "--kl-coef", "0.01",                         # v11: small leash — v10 (0) collapsed at ~step 110 (objective-driven entropy loss, gnorm creep), v9 (0.04) was stable but capped ~0.71; 0.01 = 4x weaker than v9 on unit-scale advantages
+    "--batch-norm",                              # v10/ScaleRL: batch-level advantage std-norm + zero-variance-group filtering (vs v9's per-group --std-norm)
+    "--log-reward",                              # v10: log1p-compress the cosine reward — diminishing returns at high end → less over-optimization pressure
+    "--adam-eps", "1e-15",                       # v10/ScaleRL (avoids grad-clip underflow)
     "--max-grad-norm", "1",                      # paper (clips the ~x1000 grads; Adam handles it)
     # ---- the LAST-5 reward: max per-token cosine over only the last 5 kept content tokens
     # (anti-smear — the snippet-locality eval showed max-over-ALL lets the policy smear the
@@ -93,19 +99,19 @@ TRAIN_ARGS = [
     "--reward-topk", "1",
     "--min-new-tokens", "16",
     "--max-new-tokens", "96",
-    # --div-coef is a launch parameter (see train()/main); default 1 = paper 1000 at cosine scale.
-    "--groups-per-step", "256",  # v6: 2x batch (256 % 8 == 0 -> 32 whole groups per rank = 4096 rollouts/step) -> lower-variance grads = more stable (~280s/step on 8xB200)
-    "--group-size", "16",
+    "--groups-per-step", "64",   # v11: 64 groups (8/rank) x 32 = 2048 rollouts/step; vLLM makes this affordable, and batch-norm is now a GLOBAL std (v10's was rank-local = per-group)
+    "--group-size", "32",        # v10: 32 samples/group (enough for batch-level std + zero-var filtering)
     "--rollout-chunk", "64",
+    "--logp-chunk", "16",        # old_logp recompute chunk (fp32 248k-vocab logits: 64 seqs ~13 GB peak OOM'd next to the vLLM engine)
+    "--rollout-engine", "vllm",  # v11: per-rank vLLM engine + vllm_lens steering; HF only recomputes old_logp
+    "--vllm-gpu-mem", "0.36",
     # micro-batch 4 (box used 8): update() peaked OOM on 178GB B200s at gen len ~42. Pure grad-
     # accumulation slicing — global-token-normalized loss makes gradients identical to mb=8.
-    "--micro-batch", "4",
+    "--micro-batch", "2",   # v11: HF peak was 110 GB at mb=4 next to the 64 GB vLLM engine (178 GB B200) — halve the update activation peak
     "--score-batch", "24",
     "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.
-    "--eval-every", "0",
-    "--sae-eval-every", "0",
     "--save-dir", CKPT_DIR,
-    "--run-name", "last5_rp_rl_v7",
+    "--run-name", "last5_rp_rl_v11",
 ]
 
 
@@ -119,7 +125,7 @@ TRAIN_ARGS = [
     ],
     timeout=86400,
 )
-def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 1.0,
+def train(backend: str = "gloo", total_steps: int = 400,
           resume_from: str = "", step_offset: int = 0, wandb_id: str = "",
           save_dir: str = "", run_name: str = "", groups_per_step: int = 0, save_every: int = 0):
     # resume_from: path to a step_N ckpt dir -> becomes --init-adapter, with --ref-adapter kept at
@@ -137,22 +143,18 @@ def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 1.0,
     import threading
     import time
 
-    # ---- collapse-fix guard: the mounted trainer MUST carry the gate-masked diversity bonus
-    # (_gmask). Refuse to train on unpatched code — the un-masked div bonus caused the box
-    # collapse (reward 390->53, gate 90%->8%). ----
+    # ---- trainer guards: the mounted rl_hf.py must be the SIMPLIFIED trainer (diversity /
+    # first-token shaping REMOVED, in-trainer evals removed) with the sink-prepended clean-base reward
+    # and the last-N reward window. Fail fast on a stale mount. ----
     with open("/pmx/RL/rl_hf.py") as f:
-        _src_lines = f.read().splitlines()
-    _hits = [f"{i + 1}: {l.strip()}" for i, l in enumerate(_src_lines) if "_gmask" in l]
-    assert len(_hits) >= 2, f"collapse fix (_gmask) MISSING from mounted rl_hf.py — got {_hits}"
-    _lp_hits = [f"{i + 1}: {l.strip()}" for i, l in enumerate(_src_lines)
-                if "len_penalty_per_tok * over * " in l]
-    assert _lp_hits, "gate-masked LEN PENALTY missing from mounted rl_hf.py (expected 'r = r - "\
-                     "a.len_penalty_per_tok * over * (gate.float() ...)')"
-    # last-5 reward guard: the mounted trainer must parse --reward-window-last/--reward-topk
-    _w_hits = [l for l in _src_lines if "reward_window_last" in l]
-    assert _w_hits, "last-5 reward (--reward-window-last) MISSING from mounted rl_hf.py"
-    print("[modal] guards OK (_gmask div + gate-masked len-penalty + reward-window-last):\n  "
-          + "\n  ".join(_hits + _lp_hits), flush=True)
+        _src = f.read()
+    assert "def compute_advantages" in _src, "simplified trainer missing (no compute_advantages)"
+    assert "meanact" not in _src and "firsttok" not in _src.replace("--firsttok-coef", "").replace("a.firsttok_coef", ""), \
+        "stale trainer: diversity/first-token shaping still present"
+    assert "sink = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id" in _src, \
+        "sink-prepended clean-base reward missing"
+    assert "reward_window_last" in _src, "last-N reward window missing"
+    print("[modal] guards OK (simplified trainer: sink reward + last-N window, no div/firsttok)", flush=True)
 
     # ---- input guards: fail FAST and CLEARLY if the pool or the SFT-final adapter is missing
     # (the SFT run writes `final` only when it completes — do not launch before that). ----
@@ -233,7 +235,6 @@ def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 1.0,
         "torchrun", "--nproc_per_node=8", "--master_port=29531", "RL/rl_hf.py",
         "--data-dir", local_pool,
         "--total-steps", str(total_steps),
-        "--div-coef", str(div_coef),
     ] + args
     print("[modal] launching:", " ".join(cmd), f"(DDP_BACKEND={backend})", flush=True)
     p = subprocess.Popen(cmd, cwd="/pmx", env=env,
@@ -293,11 +294,11 @@ def smoke():
         "--len-penalty-start", "16", "--len-penalty-per-tok", "0.00025",
         "--gate-penalty", "0.025", "--max-grad-norm", "0.001",
         "--reward-window-last", "5", "--reward-topk", "1",
-        "--div-coef", "0", "--kl-coef", "0.1",
+        "--kl-coef", "0.1",
         "--groups-per-step", "2", "--group-size", "4",
         "--rollout-chunk", "8", "--micro-batch", "4", "--score-batch", "8",
+        "--rollout-engine", "vllm", "--vllm-gpu-mem", "0.36",
         "--total-steps", "2", "--save-every", "0",
-        "--eval-every", "0", "--sae-eval-every", "0",
         "--save-dir", "/tmp/smoke_ckpt", "--no-wandb",
     ]
     print("[modal-smoke] launching:", " ".join(cmd), flush=True)
