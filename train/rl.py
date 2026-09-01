@@ -197,7 +197,23 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False, return_act
             keep[:, 0] = False  # attention-sink guard (old repo also norm-filtered; keep it simple)
             hh = F.normalize(h, dim=-1) if a.reward_metric == "cosine" else h  # cosine: kill norm-inflation
             proj = torch.einsum("btd,bd->bt", hh, dirs_rep[idxs])
-            best = proj.masked_fill(~keep, torch.finfo(proj.dtype).min).max(1).values
+            _sel = keep
+            if getattr(a, "reward_window_last", 0) and a.reward_window_last > 0:
+                # anti-smear: restrict the reward to the LAST N kept (content) tokens. max-over-ALL
+                # tokens lets the policy earn reward by making every token fire (the smearing the
+                # snippet-locality eval found); a small fixed window forces localized firing.
+                _revcnt = _sel.flip(1).cumsum(1).flip(1)          # #kept tokens from here to the end (incl)
+                _sel = _sel & (_revcnt <= a.reward_window_last)
+            _pf = proj.masked_fill(~_sel, torch.finfo(proj.dtype).min)
+            _k = max(1, int(getattr(a, "reward_topk", 1) or 1))
+            if _k == 1:
+                best = _pf.max(1).values
+            else:                                                 # mean of the top-K within the window
+                _topv = _pf.topk(min(_k, _pf.shape[1]), dim=1).values
+                _avail = _sel.sum(1, keepdim=True).clamp(min=1)    # real tokens available per row
+                _tk = torch.arange(_topv.shape[1], device=proj.device).unsqueeze(0) < _avail
+                _topv = torch.where(_tk, _topv, torch.zeros_like(_topv))   # avoid -inf*0 = nan
+                best = _topv.sum(1) / _tk.sum(1).clamp(min=1)
             has = keep.any(1)
             r[idxs] = torch.where(has, best, 0).cpu()
             _filled = proj.masked_fill(~keep, torch.finfo(proj.dtype).min)
@@ -449,12 +465,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default="data/pretrain")
     ap.add_argument("--init-adapter", default=cfg.init_adapter)
+    ap.add_argument("--ref-adapter", default=None,
+                    help="KL reference adapter (default: --init-adapter). Set on 24h-wall resume to "
+                         "keep the ORIGINAL anchor (the SFT init) instead of re-anchoring to the "
+                         "resume checkpoint — re-anchoring is the collapse-prone pattern")
+    ap.add_argument("--step-offset", type=int, default=0,
+                    help="resume continuity: the loop runs range(step_offset, total_steps), so step "
+                         "numbers/saves/wandb continue globally and --total-steps stays the ABSOLUTE "
+                         "target. Resuming from step_N -> --step-offset N+1 (step_N saved after "
+                         "iteration N)")
+    ap.add_argument("--wandb-id", default=None, help="resume logging into an existing wandb run")
     ap.add_argument("--save-dir", default=cfg.save_dir)
     ap.add_argument("--run-name", default=cfg.run_name)
     ap.add_argument("--direction-source", default=cfg.direction_source)
     ap.add_argument("--groups-per-step", type=int, default=cfg.groups_per_step)
     ap.add_argument("--group-size", type=int, default=cfg.group_size)
     ap.add_argument("--lr", type=float, default=cfg.lr)
+    ap.add_argument("--std-norm", action="store_true",
+                    help="standard-GRPO advantage normalization: adv = (r-mean)/per-group-std. "
+                         "Default OFF = Dr.GRPO (r-mean, no /std). ON amplifies small advantages "
+                         "when within-group reward variance is low (diagnostic for flat reward).")
     ap.add_argument("--clip-eps", type=float, default=cfg.clip_eps)
     ap.add_argument("--tis-cap", type=float, default=cfg.tis_cap)
     ap.add_argument("--max-new-tokens", type=int, default=cfg.max_new_tokens)
@@ -469,6 +499,14 @@ def main():
     ap.add_argument("--len-penalty-per-tok", type=float, default=cfg.len_penalty_per_tok)
     ap.add_argument("--div-coef", type=float, default=0.0,
                     help="within-group activation-orthogonal diversity bonus (0=off)")
+    ap.add_argument("--reward-window-last", type=int, default=0,
+                    help="anti-smear: compute the reward over only the LAST N kept content tokens "
+                         "(0=off=max over all tokens, the smearing-prone default). The "
+                         "snippet-locality eval showed max-over-all lets the policy smear the feature "
+                         "across every token; a small window forces localized firing")
+    ap.add_argument("--reward-topk", type=int, default=1,
+                    help="reward = mean of the top-K per-token cosines within the reward window "
+                         "(1=max, default). K>1 with --reward-window-last N averages the top-K of N")
     ap.add_argument("--no-gates", action="store_true", help="disable fluency/distinct/len shaping")
     ap.add_argument("--entropy-coef", type=float, default=cfg.entropy_coef,
                     help="β for maximize r + β·H(π): direct diversity pressure (Bo-N depends on it)")
@@ -622,13 +660,25 @@ def main():
             target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
     actor.train()
     opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
+    # ---- resume: restore AdamW moments saved next to the resume checkpoint (avoids the
+    # fresh-optimizer transient on an already-RL'd policy — part of every past collapse). Same
+    # construction order as at save time (opt is built BEFORE the ref adapter loads), so the
+    # integer param ids in the state dict line up. All ranks load (DDP keeps states identical). ----
+    if a.init_adapter and os.path.exists(os.path.join(a.init_adapter, "optim.pt")):
+        opt.load_state_dict(torch.load(os.path.join(a.init_adapter, "optim.pt"), map_location="cpu"))
+        if is_main:
+            print(f"[resume] AdamW state restored from {a.init_adapter}/optim.pt", flush=True)
+    elif a.step_offset and is_main:
+        print(f"[resume] WARNING: no optim.pt in {a.init_adapter} — FRESH AdamW moments "
+              "(pre-patch checkpoint); watch the first steps for a transient", flush=True)
     submodule = get_layer(actor, INJECT_LAYER)
-    if a.kl_coef > 0:  # frozen reference = the init (SL) policy, for the capped KL-to-init anchor
-        assert a.init_adapter, "--kl-coef needs --init-adapter (reference = base + init-LoRA)"
-        actor.load_adapter(a.init_adapter, adapter_name="ref")  # loaded frozen (not trainable)
+    if a.kl_coef > 0:  # frozen reference policy for the capped KL anchor (default: the init/SL policy)
+        ref_src = a.ref_adapter or a.init_adapter
+        assert ref_src, "--kl-coef needs --init-adapter or --ref-adapter (reference = base + LoRA)"
+        actor.load_adapter(ref_src, adapter_name="ref")         # loaded frozen (not trainable)
         actor.set_adapter("default")                            # keep the trainable adapter active
         if is_main:
-            print(f"[kl] ref=init adapter loaded; kl_coef={a.kl_coef} cap={a.kl_cap} nats/tok", flush=True)
+            print(f"[kl] ref adapter = {ref_src}; kl_coef={a.kl_coef} cap={a.kl_cap} nats/tok", flush=True)
 
     # ---- HF-generate rollouts: the LoRA actor IS the rollout engine (no vLLM). ----
     llm = None
@@ -652,13 +702,19 @@ def main():
               f"baseline median {sae_dataset_max.median().item():.1f}", flush=True)
 
     if not a.no_wandb and is_main:
-        wandb.init(project="maxact-fast", name=a.run_name, config=vars(a))
+        wandb.init(project="maxact-fast", name=a.run_name, config=vars(a),
+                   id=a.wandb_id or None, resume="must" if a.wandb_id else None)
     if is_main:
         os.makedirs(a.save_dir, exist_ok=True)
     B, G = a.groups_per_step, a.group_size   # B = GLOBAL groups/step (same meaning as world=1)
     Bl = B // world                          # groups THIS rank rolls out / scores / backprops
 
-    for step in range(a.total_steps):
+    if a.step_offset and a.direction_source != "random":
+        # fast-forward the direction-sampling rng stream past the completed steps (one draw/step),
+        # so the resumed leg samples the directions the uninterrupted run would have
+        for _ in range(a.step_offset):
+            rng.choice(n_vecs - eval_rows, size=B, replace=False)
+    for step in range(a.step_offset, a.total_steps):   # step is GLOBAL (resume: offset = ckpt+1)
         ev = {}
         if eval_dirs is not None and is_main and step % a.eval_every == 0:
             te = time.time()
@@ -734,7 +790,9 @@ def main():
         if a.len_penalty_start is not None:
             over = torch.tensor([max(0, len(g) - a.len_penalty_start) for g in gen_ids],
                                 dtype=torch.float32)
-            r = r - a.len_penalty_per_tok * over
+            # gate-masked like the div bonus (_gmask): gated/garbage rollouts already eat the
+            # gate_penalty — len-penalty (and div) only shape VALID rollouts.
+            r = r - a.len_penalty_per_tok * over * (gate.float() if use_fluency else torch.ones_like(over))
         div_mean = 0.0
         if a.div_coef > 0 and meanact is not None:
             ma = meanact.to(device).view(Bl, G, D_MODEL)
@@ -756,7 +814,11 @@ def main():
                                  for i in range(Bl * G)], dtype=torch.float32)
             r = r + a.firsttok_coef * ftok
             ftok_mean = ftok.mean().item()
-        adv = (r.view(Bl, G) - r.view(Bl, G).mean(1, keepdim=True)).flatten().detach()  # NO /std
+        _rg = r.view(Bl, G)
+        _adv = _rg - _rg.mean(1, keepdim=True)          # Dr.GRPO baseline (r - group_mean)
+        if getattr(a, "std_norm", False):               # standard-GRPO: /per-group-std amplifies small advantages
+            _adv = _adv / (_rg.std(1, keepdim=True) + 1e-6)
+        adv = _adv.flatten().detach()
 
         # pad the batch — prompt is shared, so p_len is constant across rows
         L = p_len + max(len(g) for g in gen_ids)
@@ -795,11 +857,14 @@ def main():
         log = {"reward/mean": raw_r_all.mean().item(), "reward/std": raw_r_all.std().item(),
                "reward/max": raw_r_all.max().item(), "reward/shaped_mean": r_all.mean().item(),
                "reward/div_mean": div_mean,
+               "reward/within_group_std": _rg.std(1).mean().item(),  # the ACTUAL Dr.GRPO learning signal (batch-wide reward/std is cross-direction & misleading)
                "reward/firsttok_mean": ftok_mean,
                "reward/gate_frac": gate_frac, "ratio/clipfrac": stats["clipfrac"],
                "policy/entropy": stats["entropy"], "policy/kl_to_init": stats["kl"],
                "ratio/mean": stats["ratio_mean"],
                "loss": stats["loss"], "grad_norm": stats["grad_norm"],
+               "grad_norm_clipped": min(stats["grad_norm"], a.max_grad_norm),
+               "grad_norm_did_clip": float(stats["grad_norm"] > a.max_grad_norm),
                "rollout/mean_logp": torch.cat(old_lps).mean().item(),
                "rollout/len_mean": n_gen / (B * G), "tokens_per_sec": n_gen / secs,
                "time/rollout_s": t_roll, "time/sync_s": sync_s, "time/step_s": secs}
@@ -807,6 +872,7 @@ def main():
         if is_main:
             print(f"step {step:05d} | r {log['reward/mean']:.2f} (max {log['reward/max']:.1f}) | "
                   f"gate {gate_frac:.0%} | ratio {log['ratio/mean']:.3f} clip {log['ratio/clipfrac']:.2%} | len {log['rollout/len_mean']:.0f} "
+                  f"| gnorm {log['grad_norm']:.3f}->{log['grad_norm_clipped']:.3f}{'*CLIP' if log['grad_norm_did_clip'] else ''} "
                   f"| {log['tokens_per_sec']:.0f} tok/s | {secs:.0f}s", flush=True)
             if step % 10 == 0:
                 print(f"  sample r={raw_r[0]:.2f}: {texts[0][:110]!r}", flush=True)
@@ -814,8 +880,16 @@ def main():
                 wandb.log(log, step=step)
             if a.save_every and step and step % a.save_every == 0:
                 actor.save_pretrained(f"{a.save_dir}/step_{step}")
+                # AdamW moments next to the ckpt (24h-wall resume). ~2x adapter size in fp32, so
+                # keep only the NEWEST TWO optim.pt (the ckpts themselves are all kept).
+                torch.save(opt.state_dict(), f"{a.save_dir}/step_{step}/optim.pt")
+                stale = os.path.join(a.save_dir, f"step_{step - 2 * a.save_every}", "optim.pt")
+                if os.path.exists(stale):
+                    os.remove(stale)
     if is_main:
         actor.save_pretrained(f"{a.save_dir}/final")
+        if a.save_every:
+            torch.save(opt.state_dict(), f"{a.save_dir}/final/optim.pt")
         print("RL_DONE", flush=True)
     if world > 1:
         dist.barrier()  # non-zero ranks wait for rank 0's final save before tearing down

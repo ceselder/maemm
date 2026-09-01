@@ -1,22 +1,35 @@
-"""Modal app: Dr.GRPO RL (train/rl.py) on a single 8xB200 container.
+"""Modal app: Dr.GRPO RL, LAST-5 run — peak-in-last-5 reward on the 4-family direction pool.
 
-The trainer lives at train/rl.py in this repo; it is mounted into the container at
-/pmx/RL/rl_hf.py (its original path on the training box, which the commands below expect),
-with mxf/ importable via PYTHONPATH=/pmx/helpers. Port of the B300-box run
-`big_rl_longhz_dp4_lp025`. Data lives on the `maemm-data` Volume (uploaded via
-`modal volume put`):
-    /data/pool_rl_mix        direction bank (vecs.f32 750k x 5120 f32 + records.jsonl + build_stats.json)
-    /data/sft_init           init LoRA adapter (also the frozen KL reference)
-    /data/sae/{ae.pt,maxacts.pt}, /data/pool_heldout, /data/eval_universal_ho   (future evals)
-    /data/hf_cache           HF_HOME (Qwen/Qwen3.6-27B downloads once, persists)
-    /data/ckpts              output checkpoints (step_25, step_50, ... final)
+Copy of modal_rl.py (the paper app) with the last-5 config baked in:
+    data      /data/pool_rl_last5   (100k dirs: 25k realact + 25k cluster + 25k realact_long
+                                     + 25k unit SAE ENCODER columns unit(W_enc[:,f]) — the
+                                     mxf.sae.enc_dirs convention; built by modal_pool_last5.py)
+    init/ref  /data/sft_mix/last5_rp/final   (the last5_rp SFT-final adapter = start policy
+                                              AND frozen KL reference; SFT-init is the
+                                              proven-stable pattern — never warm-start deep-RL)
+    reward    --reward-window-last 5 --reward-topk 1  (anti-smear: max cos over only the LAST
+                                     5 kept tokens — the snippet-locality fix)
+    ckpts     /data/ckpts_last5, wandb run last5_rp_rl
+    units     RAW-COSINE from step 0: reward-scale 1, LP 2.5e-4/tok, gate-penalty 0.025,
+              max-grad-norm 1e-3, div-coef 1, KL 0.1 (the kl-0.1 leash that fixed the paper
+              run's step-330 gate collapse — modal_rl.py only reaches these values via its
+              resume-time re-param; a FRESH run starts there directly so every leg, first or
+              resumed, runs the same proven-final config). To revert to the paper first-leg
+              x1000 units: reward-scale 1000, LP 0.25, gate-penalty 25, max-grad-norm 1,
+              kl 0.005, div-coef 1000.
 
-Needs two Modal secrets in your workspace: `maemm-hf` (HF_TOKEN) and `maemm-wandb`
-(WANDB_API_KEY). Launch from the repo root:
-    modal run --detach modal_rl.py
+Launch (MODAL_PROFILE=safety-sahan, AFTER /data/sft_mix/last5_rp/final exists):
+    modal deploy modal_rl_last5.py                    # registers train + auto-resume supervisor
+    modal run --detach modal_rl_last5.py::main        # first leg (gloo, 400 steps, div 1)
+After the first leg starts, write its wandb run id to /data/ckpts_last5/wandb_id.txt so
+wall-resume legs continue the same wandb run (else each leg logs to a fresh run).
 Options:
-    --backend gloo           if NCCL hangs at the first collective (box-specific bug; try nccl first)
-    --total-steps N          override step count (default 400)
+    --backend gloo    REQUIRED default: rl.py's grad all-reduce + reward all_gather run on CPU
+                      tensors by design; under NCCL they raise "No backend type associated with
+                      device type cpu" at the first collective (see TRAINING_LEDGER.md).
+    --total-steps N   override step count (default 400; keep RL_TOTAL_STEPS in sync for resume)
+
+Needs Modal secrets `maemm-hf` (HF_TOKEN) and `maemm-wandb` (WANDB_API_KEY).
 """
 
 from pathlib import Path
@@ -25,7 +38,7 @@ import modal
 
 REPO = Path(__file__).parent
 
-app = modal.App("maemm-rl-8xb200")
+app = modal.App("maemm-rl-last5-8xb200")
 
 # torch 2.10.0+cu128 == the box venv; cu128 wheels carry sm_100 (B200) kernels.
 image = (
@@ -51,36 +64,48 @@ image = (
 
 vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
 
+POOL_DIR = "/data/pool_rl_last5"                 # built by modal_pool_last5.py
+SFT_INIT = "/data/sft_mix/last5_rp/final"        # SFT-final adapter (init AND frozen KL ref)
+CKPT_DIR = "/data/ckpts_last5_v7"   # v7 = YOLO no-KL (kl 0, ref-forward skipped for speed), lr 1e-5, groups 256; "see what happens" w/ no leash. v6=kl0.01 (stopped ~step18), v5=kl0.005 collapsed ~step52
+
 TRAIN_ARGS = [
     "--bank-file", "vecs.f32",
-    # Start RL FRESH from the SFT adapter (= start policy AND KL ref). Warm-starting from the
-    # deep-RL dp4/step_100 collapsed even at LP 1.0 (fresh optimizer + weak KL anchor + policy
-    # already near the reward-hack cliff). SFT-init is the proven-stable pattern (uni_rl: 270
-    # steps no collapse; original longhz: 100 steps stable).
-    "--init-adapter", "/data/sft_init",
-    "--lr", "1e-5",
+    # Start RL FRESH from the SFT adapter (= start policy AND KL ref). Warm-starting from a
+    # deep-RL ckpt collapsed even at LP 1.0 (fresh optimizer + weak KL anchor + policy already
+    # near the reward-hack cliff). SFT-init is the proven-stable pattern.
+    "--init-adapter", SFT_INIT,
+    "--lr", "1e-5",                              # paper scale (kept)
     "--reward-metric", "cosine",
-    "--reward-scale", "1000",
+    # ---- RAW-COSINE units from step 0 (paper run's post-resume re-param values, ABSOLUTE).
+    # The kl 0.1 leash is the fix for the paper run's step-330+ gate collapse (the x1000-era
+    # kl 0.005 ≈ 5e-6 at cosine scale was inert). Baking them here (instead of modal_rl.py's
+    # resume-time re-param) means the first leg never runs the collapse-prone inert-KL config. ----
+    "--reward-scale", "1000",                    # v5: PROVEN paper scale (v4 std-norm+scale1 collapsed ~step28: KL 0.22->9.5, gate->0)
+    "--len-penalty-start", "16",
+    "--len-penalty-per-tok", "0.25",             # paper
+    "--gate-penalty", "25",                      # paper
+    "--kl-coef", "0",                            # v7 YOLO: NO KL leash (pure reward-max). kl_coef==0 gates OFF the ref-model forward (rl.py:432/675) -> skips ref pass = per-step SPEEDUP + no ref adapter loaded. Expect fast drift/collapse (no direction constraint) — "see what happens" run.
+    "--max-grad-norm", "1",                      # paper (clips the ~x1000 grads; Adam handles it)
+    # ---- the LAST-5 reward: max per-token cosine over only the last 5 kept content tokens
+    # (anti-smear — the snippet-locality eval showed max-over-ALL lets the policy smear the
+    # feature across every token). topk 1 = plain max within the window. ----
+    "--reward-window-last", "5",
+    "--reward-topk", "1",
     "--min-new-tokens", "16",
     "--max-new-tokens", "96",
-    "--len-penalty-start", "16",
-    # PAPER RUN (final config): LP 0.25/tok, from-SFT. Earlier 0.25 collapses were warm-start
-    # runs (deep-RL init + fresh optimizer), not the LP value itself.
-    "--len-penalty-per-tok", "0.25",
-    # --div-coef is a launch parameter (see train()/main); paper run uses 1000 (gate-masked).
-    "--kl-coef", "0.005",
-    "--groups-per-step", "128",  # 128 % 8 == 0 -> 16 whole groups per rank = 2048 rollouts/step
+    # --div-coef is a launch parameter (see train()/main); default 1 = paper 1000 at cosine scale.
+    "--groups-per-step", "256",  # v6: 2x batch (256 % 8 == 0 -> 32 whole groups per rank = 4096 rollouts/step) -> lower-variance grads = more stable (~280s/step on 8xB200)
     "--group-size", "16",
     "--rollout-chunk", "64",
     # micro-batch 4 (box used 8): update() peaked OOM on 178GB B200s at gen len ~42. Pure grad-
     # accumulation slicing — global-token-normalized loss makes gradients identical to mb=8.
     "--micro-batch", "4",
     "--score-batch", "24",
-    "--save-every", "25",
+    "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.
     "--eval-every", "0",
     "--sae-eval-every", "0",
-    "--save-dir", "/data/ckpts_v2",
-    "--run-name", "maemm-8xb200-paper-v3",   # v3 = resume-from-step_250 era (kl 0.1 leash)
+    "--save-dir", CKPT_DIR,
+    "--run-name", "last5_rp_rl_v7",
 ]
 
 
@@ -94,13 +119,14 @@ TRAIN_ARGS = [
     ],
     timeout=86400,
 )
-def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 0.0,
+def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 1.0,
           resume_from: str = "", step_offset: int = 0, wandb_id: str = "",
           save_dir: str = "", run_name: str = "", groups_per_step: int = 0, save_every: int = 0):
     # resume_from: path to a step_N ckpt dir -> becomes --init-adapter, with --ref-adapter kept at
     # the SFT init (KL anchor NEVER re-anchors to the resume ckpt) + --step-offset for global-step
     # continuity + optional --wandb-id to continue the same wandb run. The trainer auto-loads
-    # <resume_from>/optim.pt (AdamW moments) when present.
+    # <resume_from>/optim.pt (AdamW moments) when present. NO resume-time re-param here (unlike
+    # modal_rl.py): TRAIN_ARGS already carries the raw-cosine values, identical on every leg.
     # save_dir/run_name/groups_per_step/save_every: TRAIN_ARGS overrides for throwaway smoke runs.
     # backend MUST be gloo: rl_hf.py's _ddp_sync_grads/all_gather run on CPU tensors by design
     # ("gloo: CPU tensor, no NCCL anywhere") — under NCCL they raise
@@ -122,8 +148,21 @@ def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 0.0,
                 if "len_penalty_per_tok * over * " in l]
     assert _lp_hits, "gate-masked LEN PENALTY missing from mounted rl_hf.py (expected 'r = r - "\
                      "a.len_penalty_per_tok * over * (gate.float() ...)')"
-    print("[modal] collapse-fix check OK (_gmask div + gate-masked len-penalty):\n  "
+    # last-5 reward guard: the mounted trainer must parse --reward-window-last/--reward-topk
+    _w_hits = [l for l in _src_lines if "reward_window_last" in l]
+    assert _w_hits, "last-5 reward (--reward-window-last) MISSING from mounted rl_hf.py"
+    print("[modal] guards OK (_gmask div + gate-masked len-penalty + reward-window-last):\n  "
           + "\n  ".join(_hits + _lp_hits), flush=True)
+
+    # ---- input guards: fail FAST and CLEARLY if the pool or the SFT-final adapter is missing
+    # (the SFT run writes `final` only when it completes — do not launch before that). ----
+    for p in (f"{POOL_DIR}/vecs.f32", f"{POOL_DIR}/records.jsonl", f"{POOL_DIR}/build_stats.json"):
+        assert os.path.exists(p), f"direction pool incomplete: missing {p} (run modal_pool_last5.py)"
+    init = resume_from or SFT_INIT
+    assert os.path.exists(f"{init}/adapter_model.safetensors") and \
+        os.path.exists(f"{init}/adapter_config.json"), (
+        f"init adapter incomplete at {init} — if this is {SFT_INIT}, the last5_rp SFT run has "
+        "not written `final` yet; wait for it (do NOT init from a step_N ckpt)")
 
     os.environ["HF_HOME"] = "/data/hf_cache"
 
@@ -137,9 +176,9 @@ def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 0.0,
     # stage the direction bank onto container-local disk: memmap over the volume FUSE mount is
     # the one thing we don't trust, and per-step random row reads are faster off local NVMe.
     t0 = time.time()
-    local_pool = "/root/pool_rl_mix"
+    local_pool = "/root/pool_rl_last5"
     if not os.path.exists(local_pool):
-        shutil.copytree("/data/pool_rl_mix", local_pool)
+        shutil.copytree(POOL_DIR, local_pool)
     print(f"[modal] pool staged to {local_pool} ({time.time() - t0:.0f}s)", flush=True)
 
     # periodic volume commit so checkpoints land even if the container dies mid-run
@@ -178,7 +217,7 @@ def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 0.0,
 
     if resume_from:
         _set("--init-adapter", resume_from)
-        args += ["--ref-adapter", "/data/sft_init", "--step-offset", str(step_offset)]
+        args += ["--ref-adapter", SFT_INIT, "--step-offset", str(step_offset)]
         if wandb_id:
             args += ["--wandb-id", wandb_id]
     if save_dir:
@@ -189,30 +228,6 @@ def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 0.0,
         _set("--groups-per-step", groups_per_step)
     if save_every:
         _set("--save-every", save_every)
-    if resume_from:
-        # Resume-time RE-PARAMETERIZATION to raw-cosine reward units: every scale-coupled term
-        # ÷1000, so reward/mean logs as ~0.42 (cosine) instead of ~420. Pure re-param — advantages,
-        # clipped gradients and AdamW steps are unchanged (AdamW is scale-invariant modulo eps;
-        # moments are fresh at the first wall-resume and saved/loaded at the NEW scale on later
-        # legs, so the invariance holds exactly). Values are ABSOLUTE -> idempotent across resume
-        # legs. Appended LAST so argparse last-wins overrides both TRAIN_ARGS and the launch
-        # --div-coef. EXPECTED at the resume boundary: reward/mean + grad_norm wandb curves drop
-        # 1000x. NOT scaled (scale-free): clip_eps 0.2, kl_cap 10 (nats), fluency/distinct/tri/
-        # comp floors, lr (lr change is a separate step-400 decision).
-        reparam = [
-            ("--reward-scale", "1"),               # was 1000
-            ("--len-penalty-per-tok", "0.00025"),  # was 0.25
-            ("--div-coef", "1"),                   # was 1000
-            ("--gate-penalty", "0.025"),           # was 25
-            # kl 0.1 at cosine scale = a REAL leash to SFT (user-approved after the step-330+ gate
-            # collapse: the scale-preserving 5e-6 was inert — kl_to_init drifted to 0.7 nats/tok
-            # and the policy reward-hacked). NOT a pure re-param: this is the fix.
-            ("--kl-coef", "0.1"),
-            ("--max-grad-norm", "0.001"),          # was 1
-        ]
-        for _flag, _val in reparam:
-            args += [_flag, _val]
-        print(f"[modal] RESUME RE-PARAM to raw-cosine units: {reparam}", flush=True)
 
     cmd = [
         "torchrun", "--nproc_per_node=8", "--master_port=29531", "RL/rl_hf.py",
@@ -244,7 +259,8 @@ def train(backend: str = "gloo", total_steps: int = 400, div_coef: float = 0.0,
 )
 def smoke():
     """1xB200 pipeline validation: pre-warms /data/hf_cache (so the 8x run skips the 55GB
-    download) and runs 2 tiny world=1 steps (no wandb, ckpts to /tmp)."""
+    download) and runs 2 tiny world=1 steps of the EXACT last-5 config (no wandb, ckpts to /tmp).
+    Needs the SFT-final adapter — run only after /data/sft_mix/last5_rp/final exists."""
     import os
     import shutil
     import subprocess
@@ -257,9 +273,9 @@ def smoke():
     vol.commit()
     print(f"[modal-smoke] base model cached ({time.time() - t0:.0f}s)", flush=True)
 
-    local_pool = "/root/pool_rl_mix"
+    local_pool = "/root/pool_rl_last5"
     if not os.path.exists(local_pool):
-        shutil.copytree("/data/pool_rl_mix", local_pool)
+        shutil.copytree(POOL_DIR, local_pool)
     print("[modal-smoke] pool staged", flush=True)
 
     env = os.environ.copy()
@@ -271,11 +287,13 @@ def smoke():
         "python", "RL/rl_hf.py",
         "--data-dir", local_pool,
         "--bank-file", "vecs.f32",
-        "--init-adapter", "/data/warmstart",
-        "--lr", "1e-5", "--reward-metric", "cosine", "--reward-scale", "1000",
+        "--init-adapter", SFT_INIT,
+        "--lr", "1e-5", "--reward-metric", "cosine", "--reward-scale", "1",
         "--min-new-tokens", "16", "--max-new-tokens", "96",
-        "--len-penalty-start", "16", "--len-penalty-per-tok", "0.25",
-        "--div-coef", "0", "--kl-coef", "0.03",
+        "--len-penalty-start", "16", "--len-penalty-per-tok", "0.00025",
+        "--gate-penalty", "0.025", "--max-grad-norm", "0.001",
+        "--reward-window-last", "5", "--reward-topk", "1",
+        "--div-coef", "0", "--kl-coef", "0.1",
         "--groups-per-step", "2", "--group-size", "4",
         "--rollout-chunk", "8", "--micro-batch", "4", "--score-batch", "8",
         "--total-steps", "2", "--save-every", "0",
@@ -313,18 +331,19 @@ def prewarm():
     print(f"[modal-prewarm] base model cached ({time.time() - t0:.0f}s)", flush=True)
 
 
-# ---- paper-run auto-resume supervisor: Modal caps functions at 24h, but the 1000-step paper run
-# needs ~50h (2048 rollouts/step @ ~180s). This scheduled function respawns `train` in RESUME mode
-# (latest ckpt + optim.pt + --ref-adapter /data/sft_init + --step-offset + same wandb run)
-# whenever the trainer is dead and the newest /data/ckpts_v2 step is < PAPER_TOTAL_STEPS. ----
-PAPER_TOTAL_STEPS = 1000
-PAPER_DIV_COEF = 1000.0
-PAPER_CKPT_DIR = "/data/ckpts_v2"
-PAPER_WANDB_ID = "uxglv0vr"          # maemm-8xb200-paper-v3 (kl-0.1 leash era) — wall-resumes
-                                     # continue this run; buoi7l3k = the collapsed v2 series
-RESUME_STATE = "/data/resume_state.json"
-SPAWN_COOLDOWN_S = 2 * 3600          # never double-spawn while a fresh leg warms up
-STALE_CKPT_S = 110 * 60              # save-every 25 steps ≈ 75 min; older = trainer presumed dead
+# ---- auto-resume supervisor: Modal caps functions at 24h; this scheduled function respawns
+# `train` in RESUME mode (latest ckpt + optim.pt + --ref-adapter SFT_INIT + --step-offset + the
+# wandb id from /data/ckpts_last5/wandb_id.txt when present) whenever the trainer is dead and the
+# newest CKPT_DIR step is < RL_TOTAL_STEPS. Pointed EXCLUSIVELY at the last5 run — its state/pause
+# files are distinct from the paper run's (/data/resume_state.json, /data/resume_paused). ----
+RL_TOTAL_STEPS = 400                       # keep in sync with the launch --total-steps
+RL_DIV_COEF = 1.0                          # paper 1000 at x1000 scale -> 1 at raw-cosine scale
+WANDB_ID_FILE = f"{CKPT_DIR}/wandb_id.txt"  # write the first leg's wandb run id here
+RESUME_STATE = "/data/resume_state_last5.json"
+RESUME_PAUSED = "/data/resume_paused_last5"
+RESUME_OVERRIDE = "/data/resume_override_last5.json"
+SPAWN_COOLDOWN_S = 60 * 60           # v6: ~280s/step, save-every 10 -> first ckpt ~52min. cooldown must exceed that so a warming leg isn't double-spawned.
+STALE_CKPT_S = 90 * 60               # v6: save-every 10 @ ~280s/step ≈ 47min cadence; >90min w/ no live runner = dead (eviction). MUST be > save-cadence (v5's 45min was too tight -> false-positive resume spawn).
 
 
 @app.function(schedule=modal.Period(minutes=20), volumes={"/data": vol}, timeout=600)
@@ -335,18 +354,15 @@ def supervisor():
     import time
 
     vol.reload()
-    if os.path.exists("/data/resume_paused"):
-        # HOLD: resuming with the current (inert, 5e-6 reparam) kl_coef would re-collapse the same
-        # way — the inert KL leash is the diagnosed root cause of the step-330+ gate collapse.
-        # The go comes with a REAL kl value (~0.1 at cosine scale); until then: NO auto-spawn.
-        print("[supervisor] auto-resume PAUSED (/data/resume_paused present) — awaiting explicit "
-              "go with a finalized KL leash; no spawn will happen", flush=True)
+    if os.path.exists(RESUME_PAUSED):
+        print(f"[supervisor] auto-resume PAUSED ({RESUME_PAUSED} present) — no spawn will happen",
+              flush=True)
         return
-    steps = sorted(int(p.rsplit("_", 1)[-1]) for p in glob.glob(f"{PAPER_CKPT_DIR}/step_*")
+    steps = sorted(int(p.rsplit("_", 1)[-1]) for p in glob.glob(f"{CKPT_DIR}/step_*")
                    if p.rsplit("_", 1)[-1].isdigit())
     latest = steps[-1] if steps else 0
-    if os.path.exists(f"{PAPER_CKPT_DIR}/final") or latest >= PAPER_TOTAL_STEPS:
-        print(f"[supervisor] paper run COMPLETE (latest step_{latest}) — nothing to do", flush=True)
+    if os.path.exists(f"{CKPT_DIR}/final") or latest >= RL_TOTAL_STEPS:
+        print(f"[supervisor] last5 run COMPLETE (latest step_{latest}) — nothing to do", flush=True)
         return
     if not steps:
         print("[supervisor] no ckpts yet — first leg is launched manually, not spawning", flush=True)
@@ -355,13 +371,13 @@ def supervisor():
     # save_every*step_s ≈ 76 min). get_current_stats is scoped to the LATEST function version, so a
     # live container from an older deploy reads as 0 runners: stats may only CONFIRM life, never death.
     newest_m = max((os.path.getmtime(p) for p in
-                    glob.glob(f"{PAPER_CKPT_DIR}/step_*/adapter_model.safetensors")), default=0.0)
+                    glob.glob(f"{CKPT_DIR}/step_*/adapter_model.safetensors")), default=0.0)
     age_min = (time.time() - newest_m) / 60
     if age_min * 60 < STALE_CKPT_S:
         print(f"[supervisor] trainer alive (newest ckpt step_{latest}, {age_min:.0f} min old)", flush=True)
         return
     try:
-        runners = modal.Function.from_name("maemm-rl-8xb200", "train").get_current_stats().num_total_runners
+        runners = modal.Function.from_name("maemm-rl-last5-8xb200", "train").get_current_stats().num_total_runners
         if runners > 0:
             print(f"[supervisor] ckpts stale ({age_min:.0f} min) but {runners} runner(s) live — waiting", flush=True)
             return
@@ -373,21 +389,24 @@ def supervisor():
     if time.time() - st.get("last_spawn_ts", 0) < SPAWN_COOLDOWN_S:
         print(f"[supervisor] in post-spawn cooldown (last spawn {st.get('call')}) — waiting", flush=True)
         return
-    train_fn = modal.Function.from_name("maemm-rl-8xb200", "train")
+    train_fn = modal.Function.from_name("maemm-rl-last5-8xb200", "train")
     resume_step = latest
-    if os.path.exists("/data/resume_override.json"):
+    if os.path.exists(RESUME_OVERRIDE):
         # human-pinned resume point (e.g. latest ckpts are from a degraded/collapsing policy)
-        ov = json.load(open("/data/resume_override.json"))
+        ov = json.load(open(RESUME_OVERRIDE))
         if ov.get("step") in steps:
             resume_step = ov["step"]
             print(f"[supervisor] resume OVERRIDE active: step_{resume_step} "
                   f"(reason: {ov.get('reason', 'n/a')}) instead of latest step_{latest}", flush=True)
-    ck = f"{PAPER_CKPT_DIR}/step_{resume_step}"
+    ck = f"{CKPT_DIR}/step_{resume_step}"
     offset = resume_step + 1  # step_N is saved after iteration N completes
-    print(f"[supervisor] trainer DEAD at step_{latest} < {PAPER_TOTAL_STEPS} — resuming: "
-          f"init={ck} ref=/data/sft_init offset={offset} wandb={PAPER_WANDB_ID}", flush=True)
-    call = train_fn.spawn(backend="gloo", total_steps=PAPER_TOTAL_STEPS, div_coef=PAPER_DIV_COEF,
-                          resume_from=ck, step_offset=offset, wandb_id=PAPER_WANDB_ID)
+    wid = ""
+    if os.path.exists(WANDB_ID_FILE):
+        wid = open(WANDB_ID_FILE).read().strip()
+    print(f"[supervisor] trainer DEAD at step_{latest} < {RL_TOTAL_STEPS} — resuming: "
+          f"init={ck} ref={SFT_INIT} offset={offset} wandb={wid or '(new run)'}", flush=True)
+    call = train_fn.spawn(backend="gloo", total_steps=RL_TOTAL_STEPS, div_coef=RL_DIV_COEF,
+                          resume_from=ck, step_offset=offset, wandb_id=wid)
     json.dump({"last_spawn_ts": time.time(), "call": call.object_id, "from_step": latest},
               open(RESUME_STATE, "w"))
     vol.commit()
@@ -395,7 +414,7 @@ def supervisor():
 
 
 @app.local_entrypoint()
-def main(backend: str = "gloo", total_steps: int = 400, div_coef: float = 0.0):
+def main(backend: str = "gloo", total_steps: int = 400, div_coef: float = 1.0):
     train.remote(backend=backend, total_steps=total_steps, div_coef=div_coef)
 
 

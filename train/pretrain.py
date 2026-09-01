@@ -109,6 +109,11 @@ def main():
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--n-ckpts", type=int, default=0,
                     help=">0: save this many evenly-spaced checkpoints (every 100/N %% of training); else every 2000 steps")
+    ap.add_argument("--skip-steps", type=int, default=0,
+                    help="crash-resume: fast-forward N optimizer steps (scheduler + step counter advance, no "
+                         "compute). Batch order is deterministic (seeded shuffle over identical data/world), so "
+                         "pairing with --init-adapter <save-dir>/step_{N-1} resumes exactly; AdamW moments reset.")
+    ap.add_argument("--wandb-id", default="", help="crash-resume: continue this wandb run id (resume='allow')")
     a = ap.parse_args()
 
     world = int(os.environ.get("WORLD_SIZE", 1)); rank = int(os.environ.get("RANK", 0))
@@ -137,6 +142,13 @@ def main():
         model = get_peft_model(model, LoraConfig(
             r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=0.0, use_rslora=True,
             target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
+    # 27B/64-layer OOMs on the 178GB B200 without activation checkpointing (~176GB resident at any
+    # batch). enable_input_require_grads() above is the prerequisite; recompute activations in the
+    # backward to fit. use_reentrant=False is required for LoRA/frozen-base + checkpointing.
+    # use_reentrant=True: the layer-1 injection forward-hook modifies activations, which breaks
+    # non-reentrant checkpointing's forward-vs-recompute tensor-count determinism check. Reentrant
+    # mode re-runs the forward without that check and tolerates the hook.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
     model.train()
     n_params = sum(p.numel() for p in model.parameters())  # ~8.19B; LoRA adds <0.2%, fine for MFU
     submodule = get_layer(model, INJECT_LAYER)
@@ -183,7 +195,8 @@ def main():
     if is_main:
         print(f"steps_total {steps_total}, checkpoint every {save_every} steps", flush=True)
     if is_main and not a.no_wandb:
-        wandb.init(project="maxact-fast", name=a.run_name, config=vars(a))
+        wandb.init(project="maxact-fast", name=a.run_name, config=vars(a),
+                   id=a.wandb_id or None, resume="allow" if a.wandb_id else None)
     os.makedirs(a.save_dir, exist_ok=True)
     save_examples = sorted({int(x) for x in a.save_examples.split(",") if x.strip()})
     saved_examples = set()
@@ -198,6 +211,9 @@ def main():
             batches = [toks_cache[s : s + a.batch_size] for s in range(0, len(toks_cache), a.batch_size)]
             np.random.default_rng(ep).shuffle(batches)
         for batch in batches:
+            if step < a.skip_steps:  # crash-resume fast-forward (see --skip-steps help)
+                sched.step(); step += 1
+                continue
             t0 = time.time()
             if a.pack_len:
                 input_ids, labels, pos_ids, seg, rows, cols, n_real = pack_batch(

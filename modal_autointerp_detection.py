@@ -8,6 +8,13 @@ Run (from this box, profile safety-sahan; keep the client attached or use --deta
 Then pull the testbed locally:
     MODAL_PROFILE=safety-sahan modal volume get maemm-data eval_autointerp/testbed.json .
 and continue with the local judge/score stages of eval/autointerp_detection.py.
+
+Adapter-vs-adapter comparison (e.g. last-5 ckpt vs baseline; ON-POLICY rollouts per adapter,
+same seed => identical held-out features/positives/negatives, only the rollouts differ):
+    MODAL_PROFILE=safety-sahan modal run modal_autointerp_detection.py::compare \
+        --adapters last5_step75=/data/ckpts_last5/step_75,v2_step225=/data/ckpts_v2/step_225
+Outputs land at /data/eval_autointerp/testbed_<name>.json; then per testbed run the local
+judge + score stages, and merge with eval/autointerp_compare.py.
 """
 from pathlib import Path
 
@@ -108,6 +115,26 @@ def augment(testbed: str = "/data/eval_autointerp/testbed.json",
 @app.local_entrypoint()
 def main(n_features: int = 64):
     build.remote(n_features=n_features)
+
+
+@app.local_entrypoint()
+def compare(adapters: str = ("last5_step75=/data/ckpts_last5/step_75,"
+                             "v2_step225=/data/ckpts_v2/step_225"),
+            n_features: int = 64, seed: int = 0):
+    """Spawn one on-policy build per name=adapter_dir spec (parallel, one B200 each) and wait.
+    Same seed for every arm => the testbeds share features/positives/negatives verbatim (the
+    numpy RNG never sees the adapter; rollouts use a forked torch RNG) — paired by construction.
+    Outputs land at /data/eval_autointerp/testbed_<name>.json on the maemm-data volume."""
+    calls = []
+    for spec in adapters.split(","):
+        name, path = spec.split("=", 1)
+        out = f"/data/eval_autointerp/testbed_{name}.json"
+        calls.append((name, out, build.spawn(adapter=path, n_features=n_features,
+                                             seed=seed, out=out)))
+        print(f"[compare] spawned {name}: adapter={path} -> {out}")
+    for name, out, c in calls:
+        c.get()
+        print(f"[compare] DONE {name} -> {out}")
 
 
 @app.local_entrypoint()

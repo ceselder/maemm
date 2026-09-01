@@ -37,6 +37,9 @@ import time
 
 import numpy as np
 
+GEN_SEED = 20260829    # same forked-RNG seed as eval/autointerp_detection.py — deterministic,
+                       # and identical across adapters so A-vs-B comparisons are apples-to-apples
+
 METRICS = ["peak_share", "win3_share", "win5_share", "gini", "spread_half"]
 # for every metric, the direction that means MORE localized (for readable paired-diff signs)
 MORE_LOCAL_IS = {"peak_share": +1, "win3_share": +1, "win5_share": +1, "gini": +1,
@@ -69,6 +72,55 @@ def profile_metrics(a):
 # stage 1: build (GPU) — per-token clean-base feature profiles for rollouts + real examples
 # ===============================================================================================
 
+def _gen_rollouts(a, tok, base, sae, cfg, feats, dev):
+    """ON-POLICY rollouts for `feats` under the given PEFT adapter — the exact SFT/RL/autointerp
+    inject recipe (unit(W_enc[:,f]) norm-matched at INJECT_LAYER on the trailing ' ?' marker),
+    gen params (temp/max_new/min_new/n_max) taken from the testbed config so only the adapter
+    differs. Returns (greedy [F][1], sampled [F][n_max]); the adapter is unloaded afterwards so
+    `base` is a clean base again for the profile read path."""
+    import torch
+    from peft import PeftModel
+
+    from mxf.config import INJECT_LAYER, STEER_COEFF
+    from mxf.inject import get_layer, hooked, make_inject_hook
+    from mxf.prompts import build_prompt_ids
+
+    actor = PeftModel.from_pretrained(base, a.adapter, is_trainable=False)
+    actor.eval()
+    sub = get_layer(actor, INJECT_LAYER)
+    prompt_ids, mpos = build_prompt_ids(tok)
+    marker = mpos[0]
+    dirs = sae.enc_dirs(feats).float().cpu()
+
+    @torch.no_grad()
+    def gen(reps, do_sample):
+        rows_all = [i for i in range(len(feats)) for _ in range(reps)]
+        out = [[] for _ in feats]
+        for s in range(0, len(rows_all), a.gen_chunk):
+            rows = rows_all[s:s + a.gen_chunk]
+            hook = make_inject_hook([dirs[i:i + 1] for i in rows], [[marker]] * len(rows),
+                                    STEER_COEFF, dev, torch.bfloat16, mode="add")
+            ids = torch.tensor([list(prompt_ids)] * len(rows), device=dev)
+            with hooked(sub, hook):
+                g = actor.generate(ids, do_sample=do_sample, max_new_tokens=cfg["max_new"],
+                                   min_new_tokens=cfg["min_new"], pad_token_id=tok.pad_token_id,
+                                   **(dict(temperature=cfg["temp"], top_p=1.0, top_k=0,
+                                           min_p=0.0) if do_sample else {}))
+            for i, t in zip(rows, tok.batch_decode(g[:, len(prompt_ids):],
+                                                   skip_special_tokens=True)):
+                out[i].append(t.strip() or " ")
+            print(f"  [gen {'temp' if do_sample else 'greedy'}] "
+                  f"{min(s + a.gen_chunk, len(rows_all))}/{len(rows_all)}", flush=True)
+        return out
+
+    with torch.random.fork_rng(devices=[dev] if str(dev).startswith("cuda") else []):
+        torch.manual_seed(GEN_SEED)
+        greedy = gen(1, False)
+        sampled = gen(cfg["n_max"], True)
+    actor.unload()                       # strip LoRA modules in place -> clean base restored
+    return greedy, sampled
+
+
 def cmd_build(a):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -92,6 +144,16 @@ def cmd_build(a):
     sae = load_sae(path=a.sae_path or cfg["sae_path"], device=dev, dtype=torch.float32)
     bos = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
     print(f"[locality] base+sae ready ({time.time() - t0:.0f}s)", flush=True)
+
+    if a.adapter:                        # regenerate the rollouts ON-POLICY for this adapter
+        t1 = time.time()
+        feats_all = [r["feature"] for r in tb["features"]]
+        greedy, sampled = _gen_rollouts(a, tok, base, sae, cfg, feats_all, dev)
+        for fi, r in enumerate(tb["features"]):
+            r["rollout_greedy"] = greedy[fi][0]
+            r["rollouts_temp"] = sampled[fi]
+        print(f"[locality] on-policy rollouts regenerated for {len(feats_all)} features "
+              f"with adapter {a.adapter} ({time.time() - t1:.0f}s)", flush=True)
 
     @torch.no_grad()
     def profiles(texts, feat):
@@ -152,6 +214,9 @@ def cmd_build(a):
 
     out = {"config": {"testbed": os.path.abspath(a.testbed), "model": MODEL,
                       "read_layer": READ_LAYER, "sae_path": a.sae_path or cfg["sae_path"],
+                      "adapter": a.adapter or cfg.get("adapter"),
+                      "rollout_source": ("on-policy regen" if a.adapter else "testbed"),
+                      "gen_seed": GEN_SEED if a.adapter else cfg.get("gen_seed"),
                       "fire": fire, "n_features": len(recs),
                       "read_path": "bos-sink-skip + right-pad-mask + 10x-median norm filter, "
                                    "clean base, ReLU SAE encode",
@@ -317,6 +382,14 @@ def build_parser():
     b = sp.add_parser("build", help="GPU: per-token clean-base feature profiles + metrics")
     b.add_argument("--testbed", default="/data/eval_autointerp/testbed_v2.json")
     b.add_argument("--sae-path", default=None, help="default: the testbed config's sae_path")
+    b.add_argument("--adapter", default=None,
+                   help="PEFT adapter dir/repo: REGENERATE the testbed's rollouts on-policy for "
+                        "this adapter before profiling (locality is an on-policy metric — the "
+                        "testbed's stored rollouts belong to the adapter that built it). Real "
+                        "examples + feature set + gen seed are reused verbatim, so runs with "
+                        "different adapters are directly comparable. Default: score the "
+                        "testbed's stored rollouts as-is")
+    b.add_argument("--gen-chunk", type=int, default=128)
     b.add_argument("--out", default="/data/eval_autointerp/locality.json")
     b.add_argument("--device", default="cuda:0")
     b.set_defaults(fn=cmd_build)
