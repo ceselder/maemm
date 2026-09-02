@@ -63,6 +63,7 @@ image = (
     )
     .add_local_file(REPO / "train" / "rl.py", "/pmx/RL/rl_hf.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
+    .add_local_file(REPO / "MAEMMBench" / "eval_universal.py", "/pmx/eval/eval_universal.py")   # inline eval scoring
 )
 
 vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
@@ -110,7 +111,9 @@ TRAIN_ARGS = [
     "--vllm-gpu-mem", "0.36",
     # micro-batch 4 (box used 8): update() peaked OOM on 178GB B200s at gen len ~42. Pure grad-
     # accumulation slicing — global-token-normalized loss makes gradients identical to mb=8.
-    "--micro-batch", "3",   # v11: mb=2 peaked 82-86G, mb=4 110G next to the 64G vLLM engine (178G B200); 3 = ~98G, fewer micro-steps
+    "--micro-batch", "8",   # v15b: gradient checkpointing ON -> activations no longer the peak; 8 = EasyNLA's proven mb next to a vLLM engine
+    "--grad-ckpt",          # v15b: non-reentrant HF checkpointing; update() keeps the inject hook armed through backward
+    "--inline-eval-every", "10",   # v15b: held-out eval suite INSIDE the trainer on all 8 GPUs every save (no separate runner)
     "--ref-micro-batch", "16",   # KL ref logps in one no-grad pass (2 adapter switches/step instead of 2/micro-batch)
     "--score-batch", "64",  # gates off -> score() is a read_resid early-exit pass; bigger batch = fewer forwards
     "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.
@@ -201,7 +204,7 @@ def train(backend: str = "gloo", total_steps: int = 400,
     threading.Thread(target=_committer, daemon=True).start()
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/pmx/helpers"
+    env["PYTHONPATH"] = "/pmx/helpers:/pmx/eval"
     env["DDP_BACKEND"] = backend
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["WANDB_DIR"] = "/tmp/wandb"          # /pmx is a read-only mount; wandb writes to cwd otherwise
@@ -288,7 +291,7 @@ def smoke():
     print("[modal-smoke] pool staged", flush=True)
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = "/pmx/helpers"
+    env["PYTHONPATH"] = "/pmx/helpers:/pmx/eval"
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["WANDB_DIR"] = "/tmp/wandb"
     os.makedirs("/tmp/wandb", exist_ok=True)

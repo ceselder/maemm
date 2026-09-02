@@ -25,6 +25,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")   # collective_rpc(callable) for the steer counter
@@ -464,6 +465,136 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
 # ----------------------------------------------------------------------------------------------
 # advantages + update
 # ----------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
+# inline eval (ALL ranks, no separate runner): the frozen held-out eval sets are generated with each
+# rank's vLLM engine + the LoRA it already published this step (== the weights just saved as
+# step_{ckpt}), sharded over ranks, and scored on the clean base with the SAME eval_universal
+# functions the daemon uses (score_probe_cos / score_sae_peaks). vLLM sampling (not HF generate) is
+# the only protocol difference -> distribution-identical, not bitwise, vs the daemon's numbers.
+# ---------------------------------------------------------------------------------------------
+def load_eval_assets(a, device, is_main):
+    """Held-out eval sets + SAE, once per rank. Returns None (inline eval off) if anything is missing."""
+    try:
+        if "/pmx/eval" not in sys.path:
+            sys.path.insert(0, "/pmx/eval")
+        import eval_universal as EU
+        from mxf.sae import load_sae
+        es = torch.load(a.eval_cache, map_location="cpu", weights_only=False)
+        sae = load_sae(path=a.eval_sae, device=device, dtype=torch.float32)
+        assert es["meta"]["d_sae"] == sae.d_sae, f"cache d_sae {es['meta']['d_sae']} != SAE {sae.d_sae}"
+        fams = list(es["meta"].get("cos_families", EU.COS_FAMILIES))
+        for fam in fams:
+            assert f"{fam}_dirs" in es, f"eval cache lacks {fam}_dirs"
+        ev = {"EU": EU, "es": es, "sae": sae, "fams": fams, "feats": list(es["sae_feats"]),
+              "cp": es["corpus_peak"].numpy().astype(np.float64)}
+        if is_main:
+            print(f"[inline-eval] ready: families {fams} n={es['meta'].get('n')} | sae feats {len(ev['feats'])} "
+                  f"| bo={a.eval_bo} temp={a.eval_temp} tokens {a.eval_min_new}-{a.eval_max_new} | every {a.inline_eval_every} steps",
+                  flush=True)
+        return ev
+    except Exception as e:  # noqa
+        if is_main:
+            print(f"[inline-eval] DISABLED ({type(e).__name__}: {e})", flush=True)
+        return None
+
+
+@torch.no_grad()
+def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_step, lora_step, rank, world, EV):
+    """Best-of-bo eval of every held-out family, rows i % world == rank on this rank, generation by
+    this rank's vLLM engine with the LoRA published at loop step `lora_step` (weights == step_{ckpt_step}).
+    Every rank ALWAYS joins the gather (errors travel as data) so a failure can't deadlock DDP.
+    Rank 0 returns the reduced metrics dict (or {"error": ...}); other ranks return {}."""
+    from vllm import SamplingParams
+    from vllm.lora.request import LoRARequest
+    EU, es, sae = EV["EU"], EV["es"], EV["sae"]
+    t0 = time.time()
+    local = {}
+    try:
+        prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        eos_ids = _eos_ids(tok, actor)
+        hnorm = _marker_norm(actor, submodule, prompt, marker, device, adapter=True)
+        lora_req = LoRARequest(lora_name=f"step{lora_step}", lora_int_id=lora_step + 1,
+                               lora_path=f"/tmp/rl_lora/rank{rank}/step{lora_step}")
+        bo = a.eval_bo
+
+        def gen(dirs_unit):
+            rows = list(range(rank, len(dirs_unit), world))
+            if not rows:
+                return rows, []
+            reqs, params = [], []
+            for i in rows:
+                sv = _steer_vec(F.normalize(dirs_unit[i].float(), dim=-1), hnorm, marker)
+                reqs.append({"prompt_token_ids": list(prompt_ids)})
+                params.append(SamplingParams(n=bo, temperature=a.eval_temp, top_p=1.0, top_k=0, min_p=0.0,
+                                             repetition_penalty=1.0, max_tokens=a.eval_max_new,
+                                             min_tokens=a.eval_min_new, stop_token_ids=sorted(eos_ids),
+                                             seed=EU.GEN_SEED * 1000 + i,
+                                             extra_args={"apply_steering_vectors": [sv]}))
+            outs = llm.generate(reqs, params, lora_request=lora_req, use_tqdm=False)
+            texts = []
+            for out in outs:                                   # row-major: rows[j] * bo + k
+                assert len(out.outputs) == bo
+                for o in out.outputs:
+                    texts.append(tok.decode(_trim_at_stop(list(o.token_ids), eos_ids), skip_special_tokens=True))
+            return rows, texts
+
+        for fam in EV["fams"]:
+            du = es[f"{fam}_dirs"]
+            rows, texts = gen(du)
+            if rows:
+                rd = F.normalize(torch.stack([du[i] for i in rows for _ in range(bo)]).float(), dim=-1)
+                cos = EU.score_probe_cos(texts, rd, actor, tok, device).view(len(rows), bo).max(1).values
+                local[fam] = {int(i): float(c) for i, c in zip(rows, cos.tolist())}
+            else:
+                local[fam] = {}
+        du, feats = es["sae_dirs"], EV["feats"]
+        rows, texts = gen(du)
+        if rows:
+            fl = [feats[i] for i in rows for _ in range(bo)]
+            acts, _ = EU.score_sae_peaks(texts, fl, sae, actor, tok, device)
+            acts = acts.view(len(rows), bo).max(1).values
+            local["sae"] = {int(i): float(v) for i, v in zip(rows, acts.tolist())}
+        else:
+            local["sae"] = {}
+    except Exception as e:  # noqa
+        local = {"error": f"rank{rank}: {type(e).__name__}: {str(e)[:300]}"}
+    gathered = [None] * world
+    if world > 1:
+        dist.all_gather_object(gathered, local)
+    else:
+        gathered = [local]
+    if rank != 0:
+        return {}
+    errs = [g["error"] for g in gathered if "error" in g]
+    if errs:
+        return {"error": " | ".join(errs)}
+    merged = {}
+    for g in gathered:
+        for k, d in g.items():
+            merged.setdefault(k, {}).update(d)
+    out = {}
+    for fam in EV["fams"]:
+        vals = np.array([merged[fam][i] for i in sorted(merged[fam])], dtype=np.float64)
+        out[f"eval/{fam}/cos"] = float(vals.mean())
+    idx = sorted(merged["sae"])
+    best = np.array([merged["sae"][i] for i in idx], dtype=np.float64)
+    cp = EV["cp"][idx]
+    na = best / np.maximum(cp, 1e-6)
+    out["eval/sae/norm_act"] = float(na.mean())
+    out["eval/sae/fired"] = float(np.mean(best > EU.SAE_FIRE))
+    out["eval/sae/beat_corpus"] = float(np.mean(best > cp))
+    out["eval/sae/unverbalized_frac"] = float(np.mean(best <= EU.SAE_FIRE))
+    out["eval/sae/unverbalized_p10"] = float(np.mean(na < 0.10))
+    cos_keys = [k for k in out if k.startswith("eval/") and k.endswith("/cos") and k.split("/")[1] not in EU.CONTROL_FAMS]
+    out["eval/mean_all"] = float(np.mean([out[k] for k in cos_keys]))
+    for fam in EV["fams"]:
+        out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
+    out["eval/all/sae_norm_act"] = out["eval/sae/norm_act"]
+    out["eval/all/sae_unverbalized"] = out["eval/sae/unverbalized_frac"]
+    out["time/inline_eval_s"] = time.time() - t0
+    return out
+
+
 def compute_advantages(r, n_groups, group_size, mode="none"):
     """GRPO advantages for group-major rewards r [n_groups*group_size].
     mode 'none'  = Dr. GRPO: r - group_mean (no /std);
@@ -547,28 +678,28 @@ def update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_re
         b_ids, b_attn = ids[s:e].to(device), attn[s:e].to(device)
         hook = make_inject_hook([dirs_rep[i : i + 1] for i in range(s, e)], [[marker]] * (e - s),
                                 STEER_COEFF, device, torch.bfloat16)
-        with hooked(submodule, hook):
+        with hooked(submodule, hook):      # hook stays armed through backward: grad-ckpt recompute re-runs the injection
             logits = actor(input_ids=b_ids, attention_mask=b_attn).logits[:, p_len - 1 : -1]
-        logp_full = torch.log_softmax(logits.float(), -1)
-        del logits
-        new_lp = logp_full.gather(-1, b_ids[:, p_len:, None]).squeeze(-1)
-        m = gen_mask[s:e].to(device)
-        w = w_all[s:e].to(device)
-        ratio = torch.exp(new_lp - old_lp[s:e].to(device)).clamp(max=a.tis_cap)
-        A = adv[s:e, None].to(device)
-        loss = (-torch.minimum(ratio * A, ratio.clamp(lo, hi) * A) * w).sum()
-        ent = -(logp_full.exp() * logp_full).sum(-1)                    # per-token entropy (logged always)
-        ent_sum += float((ent.detach() * m).sum())
-        if a.entropy_coef > 0:
-            loss = loss - a.entropy_coef * (ent * w).sum()
-        if a.kl_coef > 0:  # capped KL-to-init: ref logps (precomputed above) from the FROZEN init adapter
-            ref_lp = ref_lp_all[s:e].to(device)
-            delta = ref_lp - new_lp                                    # log(pi_ref / pi)
-            kl = (torch.exp(delta) - delta - 1).clamp(0.0, a.kl_cap)   # k3 estimator, capped per token
-            loss = loss + a.kl_coef * (kl * w).sum()
-            kl_sum += float((kl.detach() * m).sum())
-        del logp_full
-        loss.backward()                              # micro-losses share the global normalizer
+            logp_full = torch.log_softmax(logits.float(), -1)
+            del logits
+            new_lp = logp_full.gather(-1, b_ids[:, p_len:, None]).squeeze(-1)
+            m = gen_mask[s:e].to(device)
+            w = w_all[s:e].to(device)
+            ratio = torch.exp(new_lp - old_lp[s:e].to(device)).clamp(max=a.tis_cap)
+            A = adv[s:e, None].to(device)
+            loss = (-torch.minimum(ratio * A, ratio.clamp(lo, hi) * A) * w).sum()
+            ent = -(logp_full.exp() * logp_full).sum(-1)                    # per-token entropy (logged always)
+            ent_sum += float((ent.detach() * m).sum())
+            if a.entropy_coef > 0:
+                loss = loss - a.entropy_coef * (ent * w).sum()
+            if a.kl_coef > 0:  # capped KL-to-init: ref logps (precomputed above) from the FROZEN init adapter
+                ref_lp = ref_lp_all[s:e].to(device)
+                delta = ref_lp - new_lp                                    # log(pi_ref / pi)
+                kl = (torch.exp(delta) - delta - 1).clamp(0.0, a.kl_cap)   # k3 estimator, capped per token
+                loss = loss + a.kl_coef * (kl * w).sum()
+                kl_sum += float((kl.detach() * m).sum())
+            del logp_full
+            loss.backward()                              # micro-losses share the global normalizer
         loss_sum += loss.item()
         clipped_tok += int((((ratio < lo) | (ratio > hi)) & m).sum())
         ratio_sum += float((ratio.detach() * m).sum())
@@ -664,6 +795,16 @@ def parse_args():
                     help="fixed shaped reward for rollouts that hit --max-new-tokens without EOS (EasyNLA: -2); "
                          "they stay in the group baseline and train")
     ap.add_argument("--adam-betas", type=float, nargs=2, default=(0.9, 0.999), metavar=("B1", "B2"))
+    ap.add_argument("--grad-ckpt", action="store_true", help="HF gradient checkpointing (non-reentrant); allows a much bigger --micro-batch")
+    ap.add_argument("--inline-eval-every", type=int, default=0,
+                    help="run the held-out eval suite INSIDE the trainer on all ranks every N steps (vLLM gen + clean-base "
+                         "scoring, logged into this run with x-axis ckpt_step). 0 = off. vllm engine only.")
+    ap.add_argument("--eval-cache", default="/data/eval_universal_ho/eval_sets_heldout.pt")
+    ap.add_argument("--eval-sae", default="/data/sae/ae.pt")
+    ap.add_argument("--eval-bo", type=int, default=4)
+    ap.add_argument("--eval-temp", type=float, default=1.0)
+    ap.add_argument("--eval-max-new", type=int, default=64)
+    ap.add_argument("--eval-min-new", type=int, default=16)
     ap.add_argument("--std-norm", action="store_true", help="advantage / per-group std (standard GRPO)")
     ap.add_argument("--batch-norm", action="store_true",
                     help="advantage / ONE global-batch std, zero-variance groups dropped (ScaleRL)")
@@ -739,6 +880,12 @@ def main():
         actor = get_peft_model(actor, LoraConfig(
             r=tr.lora_r, lora_alpha=tr.lora_alpha, lora_dropout=0.0, use_rslora=True,
             target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
+    if a.grad_ckpt:   # safe now: update() keeps the inject hook armed through backward, so the recompute re-injects
+        actor.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        actor.enable_input_require_grads()
+        actor.base_model.model.config.use_cache = False
+        if is_main:
+            print("[rl] gradient checkpointing ON (non-reentrant); hook armed through backward", flush=True)
     actor.train()
     opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr,
                             weight_decay=0.0, eps=a.adam_eps, betas=tuple(a.adam_betas))
@@ -792,12 +939,16 @@ def main():
 
     adv_mode = a.adv_mode or ("batch" if a.batch_norm else ("group" if a.std_norm else "none"))
     use_gates = a.fluency_floor is not None or a.distinct_floor is not None
+    # ---- inline eval assets (held-out sets + SAE) — after the engine, so a load failure just disables eval ----
+    EV = load_eval_assets(a, device, is_main) if (a.inline_eval_every > 0 and a.rollout_engine == "vllm") else None
     if is_main:
         print(f"[rl] {n_vecs} directions (eval-reserved rows [0,{eval_rows})) | prompt {p_len} toks, "
               f"marker @{marker} | world {world} | adv {adv_mode} | gates {use_gates} | engine {a.rollout_engine}", flush=True)
         if not a.no_wandb:
             wandb.init(project="maxact-fast", name=a.run_name, config=vars(a),
                        id=a.wandb_id or None, resume="must" if a.wandb_id else None)
+            wandb.define_metric("ckpt_step")
+            wandb.define_metric("eval/*", step_metric="ckpt_step")
         os.makedirs(a.save_dir, exist_ok=True)
     for _ in range(a.step_offset if a.direction_source == "cluster" else 0):
         rng.choice(n_vecs - eval_rows, size=B, replace=False)   # fast-forward the direction rng on resume
@@ -847,6 +998,19 @@ def main():
             texts, gen_ids, old_lps = rollout(actor, submodule, tok, prompt_ids, marker, dirs, a, device)
             rstats = {}
         t_roll = time.time() - t0
+        # ---- inline eval of the checkpoint saved at the END of the previous step: the LoRA this rank just
+        # published for the rollout IS those weights, so no extra save; every rank evals its shard ----
+        if EV is not None and step > a.step_offset and (step - 1) % a.inline_eval_every == 0:
+            ev = inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, step - 1, step, rank, world, EV)
+            if is_main:
+                if "error" in ev:
+                    print(f"  [inline-eval] FAILED for ckpt {step - 1}: {ev['error']}", flush=True)
+                else:
+                    print(f"  [inline-eval] ckpt {step - 1}: mean_all {ev['eval/mean_all']:.4f} | sae norm_act "
+                          f"{ev['eval/sae/norm_act']:.4f} unverb {ev['eval/sae/unverbalized_frac']:.3f} | realact "
+                          f"{ev.get('eval/realact/cos', float('nan')):.4f} | {ev['time/inline_eval_s']:.0f}s", flush=True)
+                    if not a.no_wandb:
+                        wandb.log({**ev, "ckpt_step": step - 1}, step=step - 1)
         dirs_rep = dirs.repeat_interleave(G, 0).to(device)             # [Bl*G, d]
 
         # ---- reward + shaping ----
