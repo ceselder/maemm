@@ -108,8 +108,9 @@ TRAIN_ARGS = [
     "--vllm-gpu-mem", "0.36",
     # micro-batch 4 (box used 8): update() peaked OOM on 178GB B200s at gen len ~42. Pure grad-
     # accumulation slicing — global-token-normalized loss makes gradients identical to mb=8.
-    "--micro-batch", "2",   # v11: HF peak was 110 GB at mb=4 next to the 64 GB vLLM engine (178 GB B200) — halve the update activation peak
-    "--score-batch", "24",
+    "--micro-batch", "3",   # v11: mb=2 peaked 82-86G, mb=4 110G next to the 64G vLLM engine (178G B200); 3 = ~98G, fewer micro-steps
+    "--ref-micro-batch", "16",   # KL ref logps in one no-grad pass (2 adapter switches/step instead of 2/micro-batch)
+    "--score-batch", "64",  # gates off -> score() is a read_resid early-exit pass; bigger batch = fewer forwards
     "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.
     "--save-dir", CKPT_DIR,
     "--run-name", "last5_rp_rl_v11",

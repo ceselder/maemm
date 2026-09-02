@@ -507,6 +507,26 @@ def update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_re
     total_tok = max(int(gen_mask.sum()), 1)
     lo, hi = 1 - a.clip_eps, 1 + a.clip_eps
     loss_sum, clipped_tok, ent_sum, kl_sum, ratio_sum = 0.0, 0, 0.0, 0.0, 0.0
+    # ---- KL reference logps: ONE no-grad pass over the whole batch at a large micro-batch (2 PEFT
+    # adapter switches per step instead of 2 per micro-batch, and full GPU utilization) ----
+    ref_lp_all = None
+    if a.kl_coef > 0:
+        ref_lp_all = torch.zeros_like(old_lp)
+        actor.set_adapter("ref")
+        try:
+            with torch.no_grad():
+                for s in range(0, n, a.ref_micro_batch):
+                    e = min(s + a.ref_micro_batch, n)
+                    b_ids, b_attn = ids[s:e].to(device), attn[s:e].to(device)
+                    hook = make_inject_hook([dirs_rep[i : i + 1] for i in range(s, e)], [[marker]] * (e - s),
+                                            STEER_COEFF, device, torch.bfloat16)
+                    with hooked(submodule, hook):
+                        ref_logits = actor(input_ids=b_ids, attention_mask=b_attn).logits[:, p_len - 1 : -1]
+                    ref_lp_all[s:e] = torch.log_softmax(ref_logits.float(), -1).gather(
+                        -1, b_ids[:, p_len:, None]).squeeze(-1).cpu()
+                    del ref_logits
+        finally:
+            actor.set_adapter("default")                 # MUST restore before the trainable pass
     opt.zero_grad(set_to_none=True)
     for s in range(0, n, a.micro_batch):
         e = min(s + a.micro_batch, n)
@@ -526,14 +546,8 @@ def update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_re
         ent_sum += float((ent.detach() * m).sum())
         if a.entropy_coef > 0:
             loss = loss - a.entropy_coef * (ent * m).sum() / total_tok
-        if a.kl_coef > 0:  # capped KL-to-init: ref logps from the FROZEN init adapter, same inject hook
-            with torch.no_grad():
-                actor.set_adapter("ref")
-                with hooked(submodule, hook):
-                    ref_logits = actor(input_ids=b_ids, attention_mask=b_attn).logits[:, p_len - 1 : -1]
-                ref_lp = torch.log_softmax(ref_logits.float(), -1).gather(-1, b_ids[:, p_len:, None]).squeeze(-1)
-                del ref_logits
-                actor.set_adapter("default")
+        if a.kl_coef > 0:  # capped KL-to-init: ref logps (precomputed above) from the FROZEN init adapter
+            ref_lp = ref_lp_all[s:e].to(device)
             delta = ref_lp - new_lp                                    # log(pi_ref / pi)
             kl = (torch.exp(delta) - delta - 1).clamp(0.0, a.kl_cap)   # k3 estimator, capped per token
             loss = loss + a.kl_coef * (kl * m).sum() / total_tok
@@ -597,6 +611,7 @@ def parse_args():
                     help="max allowed MEAN |vLLM logp - HF logp| per sampled token; exceeding it aborts "
                          "(the sampler is not the training policy: LoRA/steering/tokenization drift)")
     ap.add_argument("--micro-batch", type=int, default=8)
+    ap.add_argument("--ref-micro-batch", type=int, default=16, help="sequences per KL reference (no-grad) forward")
     ap.add_argument("--score-batch", type=int, default=64)
     # reward
     ap.add_argument("--reward-metric", choices=("proj", "cosine"), default="proj",
