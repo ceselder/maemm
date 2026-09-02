@@ -87,7 +87,9 @@ CONTROL_FAMS = {"random"}  # lower-is-better controls: logged per-family, EXCLUD
 )
 def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0,
            max_new: int = 64, min_new: int = 16, gen_chunk: int = 128,
-           min_ckpt_mtime: float = 0.0):
+           min_ckpt_mtime: float = 0.0, shard: int = 0, nshards: int = 1):
+    # shard/nshards: run several daemons in parallel, each owning the ckpt steps with
+    # step % nshards == shard (own state file + own wandb run; the pre-shard state is read too).
     # min_ckpt_mtime: ignore ckpt dirs whose adapter mtime predates this (stale artifacts from a
     # cancelled leg). When the resumed leg OVERWRITES such a dir, its mtime refreshes past the
     # cutoff and it gets evaled as new — no deletion needed, no stale evals, no skipped re-saves.
@@ -98,6 +100,7 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
     import time
 
     os.environ["HF_HOME"] = "/data/hf_cache"
+    _shard_state = STATE if nshards == 1 else STATE.replace(".json", f"_s{shard}of{nshards}.json")
     os.environ["HF_HUB_OFFLINE"] = "1"          # load purely from the volume cache
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -141,7 +144,7 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
           f"| n={es['meta'].get('n')} | bo={bo} temp={temp} max_new={max_new} "
           f"gen_chunk={gen_chunk} | LATEST-FIRST, SAE rank metric ON", flush=True)
 
-    wandb.init(project=WANDB_PROJECT, name=WANDB_RUN, id=WANDB_RUN_ID, resume="allow",
+    wandb.init(project=WANDB_PROJECT, name=(WANDB_RUN if nshards == 1 else f"{WANDB_RUN}_s{shard}"), id=(WANDB_RUN_ID if nshards == 1 else f"{WANDB_RUN_ID}_s{shard}"), resume="allow",
                config={"families": fams, "n": es["meta"].get("n"), "bo": bo, "temp": temp,
                        "max_new_tokens": max_new, "min_new_tokens": min_new,
                        "cache": CACHE, "ckpt_dir": CKPT_DIR, "gpu": "B200:1",
@@ -197,14 +200,18 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
         return out
 
     def load_state():
-        try:
-            return set(json.load(open(STATE))["done"])
-        except Exception:
-            return set()
+        done = set()
+        for path in ({STATE} | {_shard_state}):
+            if os.path.exists(path):
+                try:
+                    done |= set(json.load(open(path)).get("done", []))
+                except Exception:
+                    pass
+        return done
 
     def save_state(done):
-        os.makedirs(os.path.dirname(STATE), exist_ok=True)
-        json.dump({"done": sorted(done)}, open(STATE, "w"))
+        os.makedirs(os.path.dirname(_shard_state), exist_ok=True)
+        json.dump({"done": sorted(done)}, open(_shard_state, "w"))
         vol.commit()
 
     done = load_state()
@@ -229,7 +236,7 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
         fw = f"{CKPT_DIR}/final/adapter_model.safetensors"
         if os.path.exists(fw) and os.path.getmtime(fw) >= min_ckpt_mtime:
             avail[(max(avail) + 1) if avail else FINAL_STEP] = f"{CKPT_DIR}/final"   # SFT: final = last step + 1
-        todo = sorted(k for k in avail if k not in done)
+        todo = sorted(k for k in avail if k not in done and k % nshards == shard)
         if not todo:
             if once:
                 print("[eval-daemon] --once: nothing pending, exiting", flush=True)
