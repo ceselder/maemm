@@ -855,7 +855,7 @@ def main():
         else:
             r = score(texts, dirs_rep, actor, tok, device, a)
         r = r * a.reward_scale
-        eos_set = set(_eos_ids(tok))
+        eos_set = set(_eos_ids(tok, actor))
         trunc = torch.tensor([len(g) >= a.max_new_tokens and (not g or g[-1] not in eos_set) for g in gen_ids])
         trunc_frac = trunc.float().mean().item()
         if a.trunc_reward is not None and bool(trunc.any()):   # EasyNLA: cap-hit rollouts score a fixed failure reward and still train
