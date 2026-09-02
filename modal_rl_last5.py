@@ -69,7 +69,7 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
 
 POOL_DIR = "/data/pool_rl_last5"                 # built by modal_pool_last5.py
 SFT_INIT = "/data/sft_mix/last5_rp/final"        # SFT-final adapter (init AND frozen KL ref)
-CKPT_DIR = "/data/ckpts_last5_v11"  # v11 = v10 recipe (log-reward, batch-norm, adam-eps 1e-15) + a SMALL KL leash (0.01: v10 kl=0 collapsed @~110 via entropy loss, v9 kl=0.04 held but capped fidelity ~0.71) + big batch 64x32=2048 (true GLOBAL batch-norm now) + vLLM rollouts. From v9/step_50 (has optim.pt).
+CKPT_DIR = "/data/ckpts_last5_v12"  # v12 = v11 recipe (16x64, no gate, log-reward, global batch-norm, vLLM rollouts, from v9/step_50) + KL 0.01 — "let the RL rip" (400 steps)
 
 TRAIN_ARGS = [
     "--bank-file", "vecs.f32",
@@ -88,7 +88,7 @@ TRAIN_ARGS = [
     "--len-penalty-per-tok", "0.2",              # v10: x0.8 (log-reward compresses cosine-part log1p(cos)x1000 vs cos x1000 → restore v9 relative weight)
     "--gate-penalty", "20",                      # v10: x0.8 (same log-reward proportional rescale; was 25)
     "--no-gates",                                # v11: NO fluency/distinct gate (user call; the collapse analysis showed the gate is not the stabilizer — KL is). len-penalty stays.
-    "--kl-coef", "0",                            # v11 (user 02:00Z Sep 2): NO KL ("turn it off"). Record: v5/v7/v10 (kl<=0.005) all collapsed ~step 50-110 via entropy loss; the monitor's entropy watch is the safety net (stop + keep best ckpt).
+    "--kl-coef", "0.01",                         # v12 (user: "maybe we do need some KL term and let the RL rip"): v11 (kl 0) peaked .761@40 then collapsed @67; v9 (kl .04) never collapsed but capped .709 → 0.01 = 4x weaker leash
     "--batch-norm",                              # v10/ScaleRL: batch-level advantage std-norm + zero-variance-group filtering (vs v9's per-group --std-norm)
     "--log-reward",                              # v10: log1p-compress the cosine reward — diminishing returns at high end → less over-optimization pressure
     "--adam-eps", "1e-15",                       # v10/ScaleRL (avoids grad-clip underflow)
@@ -113,7 +113,7 @@ TRAIN_ARGS = [
     "--score-batch", "64",  # gates off -> score() is a read_resid early-exit pass; bigger batch = fewer forwards
     "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.
     "--save-dir", CKPT_DIR,
-    "--run-name", "last5_rp_rl_v11",
+    "--run-name", "last5_rp_rl_v12",
 ]
 
 
