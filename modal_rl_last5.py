@@ -69,7 +69,7 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
 
 POOL_DIR = "/data/pool_rl_last5"                 # built by modal_pool_last5.py
 SFT_INIT = "/data/sft_mix/last5_rp/final"        # SFT-final adapter (init AND frozen KL ref)
-CKPT_DIR = "/data/ckpts_last5_v13_kl0.01"  # v13 = overnight KL sweep (UNLOGGED cos x1000 reward, len 0.25/tok from 16, no gate, 16x64, from v9/step_50); per-arm save_dir/run_name/extra_args at spawn
+CKPT_DIR = "/data/ckpts_last5_v14_kl0.04"  # v14 = 2nd overnight KL sweep {0.02,0.03,0.04}: v13 (kl .0025/.005/.01, unlogged reward) all peaked .75-.76 @30-50 then collapsed ~step 70; min_new_tokens 8; per-arm save_dir/run_name/extra_args at spawn
 
 TRAIN_ARGS = [
     "--bank-file", "vecs.f32",
@@ -88,7 +88,7 @@ TRAIN_ARGS = [
     "--len-penalty-per-tok", "0.25",             # v13 sweep (user ratio): 1 extra token = 0.00025 cosine = 0.25 reward units at the x1000 UNLOGGED scale
     "--gate-penalty", "20",                      # v10: x0.8 (same log-reward proportional rescale; was 25)
     "--no-gates",                                # v11: NO fluency/distinct gate (user call; the collapse analysis showed the gate is not the stabilizer — KL is). len-penalty stays.
-    "--kl-coef", "0.01",                         # v13 overnight sweep: per-arm override via train(extra_args="--kl-coef X"); arms 0.0025 / 0.005 / 0.01 — "lowest KL we can get away with"
+    "--kl-coef", "0.04",                         # v14 sweep default (control = v9's stable value); arms 0.02 / 0.03 / 0.04 via train(extra_args)
     "--batch-norm",                              # v10/ScaleRL: batch-level advantage std-norm + zero-variance-group filtering (vs v9's per-group --std-norm)
     "--adam-eps", "1e-15",                       # v10/ScaleRL (avoids grad-clip underflow)
     "--max-grad-norm", "1",                      # paper (clips the ~x1000 grads; Adam handles it)
@@ -97,7 +97,7 @@ TRAIN_ARGS = [
     # feature across every token). topk 1 = plain max within the window. ----
     "--reward-window-last", "5",
     "--reward-topk", "1",
-    "--min-new-tokens", "16",
+    "--min-new-tokens", "8",     # v14 (user): min generation 8 tokens (len penalty also from 8)
     "--max-new-tokens", "96",
     "--groups-per-step", "16",   # v11 (user): 16 groups (2/rank) x 64 = 1024 rollouts/step — "we never want group size 32; 16x64 should already be stable". batch-norm std is GLOBAL (all_reduce)
     "--group-size", "64",        # v11 (user): 64 samples/group
@@ -112,7 +112,7 @@ TRAIN_ARGS = [
     "--score-batch", "64",  # gates off -> score() is a read_resid early-exit pass; bigger batch = fewer forwards
     "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.
     "--save-dir", CKPT_DIR,
-    "--run-name", "last5_rp_rl_v13_kl0.01",
+    "--run-name", "last5_rp_rl_v14_kl0.04",
 ]
 
 
