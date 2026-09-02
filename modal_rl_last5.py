@@ -296,7 +296,7 @@ def smoke():
         "--init-adapter", SFT_INIT,
         "--lr", "1e-5", "--reward-metric", "cosine", "--reward-scale", "1",
         "--min-new-tokens", "16", "--max-new-tokens", "96",
-        "--len-penalty-start", "8",               # v13 (user): length penalty active from 8 tokens (min_new_tokens 16 → tokens 8-16 are a constant offset, cancels in the group mean) "--len-penalty-per-tok", "0.00025",
+        "--len-penalty-start", "8", "--len-penalty-per-tok", "0.00025",
         "--gate-penalty", "0.025", "--max-grad-norm", "0.001",
         "--reward-window-last", "5", "--reward-topk", "1",
         "--kl-coef", "0.1",
