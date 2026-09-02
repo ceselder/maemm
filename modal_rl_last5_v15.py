@@ -43,7 +43,19 @@ import os  # noqa: E402  (N_GPU below reads the env at import time)
 app = modal.App("maemm-rl-last5-v15")
 # GPUs per arm: Modal has only handed us ~8 B200 at a time today; two 8-GPU arms never scheduled together.
 # RL_NGPU=4 at deploy time -> each arm on 4xB200 (groups/rank doubles, ~2x step time, both arms run in parallel).
-N_GPU = int(os.environ.get("RL_NGPU", "8"))
+N_GPU = int(os.environ.get("RL_NGPU", "8"))   # deploy-time value -> the @app.function gpu= request below
+
+
+def _visible_gpus():
+    """GPUs actually attached to THIS container (N_GPU is only trustworthy at deploy time: the module is
+    re-imported inside the container without RL_NGPU, so torchrun's nproc must come from the hardware)."""
+    import subprocess
+    try:
+        out = subprocess.check_output(["nvidia-smi", "-L"], text=True)
+        n = sum(1 for l in out.splitlines() if l.startswith("GPU "))
+        return n or N_GPU
+    except Exception:  # noqa
+        return N_GPU
 
 # torch 2.10.0+cu128 == the box venv; cu128 wheels carry sm_100 (B200) kernels.
 image = (
@@ -248,7 +260,7 @@ def train(backend: str = "gloo", total_steps: int = 400,
         args += extra_args.split()
 
     cmd = [
-        "torchrun", f"--nproc_per_node={N_GPU}", "--master_port=29531", "RL/rl_hf.py",
+        "torchrun", f"--nproc_per_node={_visible_gpus()}", "--master_port=29531", "RL/rl_hf.py",
         "--data-dir", local_pool,
         "--total-steps", str(total_steps),
     ] + args
