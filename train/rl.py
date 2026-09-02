@@ -643,6 +643,11 @@ def parse_args():
     ap.add_argument("--entropy-coef", type=float, default=cfg.entropy_coef, help="beta in r + beta*H(pi)")
     ap.add_argument("--kl-coef", type=float, default=0.0, help="capped-k3 KL-to-init anchor (0=off)")
     ap.add_argument("--kl-cap", type=float, default=10.0, help="per-token KL clamp (nats)")
+    # transcript logging (rank 0): a few rollouts per step with their target spans + rewards, so a
+    # breaking policy can be read, not just measured
+    ap.add_argument("--transcript-every", type=int, default=5, help="log rollout transcripts every N steps (0=off)")
+    ap.add_argument("--transcript-groups", type=int, default=4, help="directions per transcript log")
+    ap.add_argument("--transcript-samples", type=int, default=4, help="samples per direction per transcript log")
     # removed reward-shaping terms — fail loudly rather than silently ignore an old launcher
     ap.add_argument("--div-coef", type=float, default=0.0, help="REMOVED (must be 0)")
     ap.add_argument("--firsttok-coef", type=float, default=0.0, help="REMOVED (must be 0)")
@@ -744,6 +749,20 @@ def main():
                   f"| ||h|| vllm/hf = {chk['hnorm_agree']:.3f} ({chk['hnorm_vllm']:.1f}/{chk['hnorm_hf']:.1f}) "
                   f"| max |delta| pre-marker rows = {chk['max_other_row_delta']:.2e}", flush=True)
 
+    # ---- transcript targets: vec_idx -> (family, target_text) from the pool's records.jsonl ----
+    tgt_map = {}
+    if is_main and a.transcript_every > 0 and a.direction_source == "cluster" and os.path.exists(f"{a.data_dir}/records.jsonl"):
+        with open(f"{a.data_dir}/records.jsonl") as f:
+            for i, line in enumerate(f):
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                vi = rec.get("vec_idx", i)
+                if vi not in tgt_map and rec.get("target_text") is not None:
+                    tgt_map[vi] = (rec.get("family"), rec["target_text"][:240])
+        print(f"[transcripts] {len(tgt_map)} target spans loaded; logging {a.transcript_groups}x{a.transcript_samples} rollouts every {a.transcript_every} steps", flush=True)
+
     adv_mode = "batch" if a.batch_norm else ("group" if a.std_norm else "none")
     use_gates = a.fluency_floor is not None or a.distinct_floor is not None
     if is_main:
@@ -823,6 +842,24 @@ def main():
             r = r - a.len_penalty_per_tok * over * gate.float()
         adv = compute_advantages(r, Bl, G, adv_mode)
 
+        # ---- transcripts (rank 0): what the policy is actually writing, next to the span that fired the direction ----
+        _table = None
+        if is_main and a.transcript_every > 0 and step % a.transcript_every == 0:
+            rows_t = []
+            for g in range(min(a.transcript_groups, Bl)):
+                vi = int(idx[g]) if (a.direction_source == "cluster" and idx is not None) else -1
+                fam, tgt = tgt_map.get(vi, (None, None))
+                for j in range(min(a.transcript_samples, G)):
+                    i = g * G + j
+                    rows_t.append({"step": step, "group": g, "vec_idx": vi, "family": fam, "target": tgt,
+                                   "text": texts[i], "cos": float(raw_r[i]) / a.reward_scale, "reward": float(r[i]),
+                                   "adv": float(adv[i]), "n_tok": len(gen_ids[i])})
+            with open(f"{a.save_dir}/transcripts.jsonl", "a") as f:
+                for row in rows_t:
+                    f.write(json.dumps(row) + "\n")
+            if not a.no_wandb:
+                _table = wandb.Table(columns=list(rows_t[0].keys()), data=[list(x.values()) for x in rows_t])
+
         # ---- pad the batch (shared prompt -> constant p_len) and update ----
         L = p_len + max(len(g) for g in gen_ids)
         ids = torch.full((Bl * G, L), tok.pad_token_id, dtype=torch.long)
@@ -864,6 +901,8 @@ def main():
                "rollout/len_mean": n_gen / (B * G), "tokens_per_sec": n_gen / secs,
                "time/rollout_s": t_roll, "time/step_s": secs,
                "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, **rstats}
+        if _table is not None:
+            log["rollouts/samples"] = _table
         if is_main:
             print(f"step {step:05d} | r {log['reward/mean']:.2f} (max {log['reward/max']:.1f}) | gate {gate_frac:.0%} "
                   f"| ent {log['policy/entropy']:.2f} | ratio {log['ratio/mean']:.3f} clip {log['ratio/clipfrac']:.2%} "
