@@ -111,7 +111,7 @@ TRAIN_ARGS = [
     "--vllm-gpu-mem", "0.36",
     # micro-batch 4 (box used 8): update() peaked OOM on 178GB B200s at gen len ~42. Pure grad-
     # accumulation slicing — global-token-normalized loss makes gradients identical to mb=8.
-    "--micro-batch", "8",   # v15b: gradient checkpointing ON -> activations no longer the peak; 8 = EasyNLA's proven mb next to a vLLM engine
+    "--micro-batch", "4",   # v15c: mb 8 + grad-ckpt OOM'd at step 0 (rank3 112 GB in the GDN torch_chunk_gated_delta_rule forward next to the 64 GB vLLM engine) — the per-layer GDN transient scales with mb even under checkpointing; 4 = safe (mb3 no-ckpt peaked 99 GB)
     "--grad-ckpt",          # v15b: non-reentrant HF checkpointing; update() keeps the inject hook armed through backward
     "--inline-eval-every", "10",   # v15b: held-out eval suite INSIDE the trainer on all 8 GPUs every save (no separate runner)
     "--ref-micro-batch", "16",   # KL ref logps in one no-grad pass (2 adapter switches/step instead of 2/micro-batch)
