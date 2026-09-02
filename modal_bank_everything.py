@@ -45,7 +45,10 @@ every pool_heldout row.
 
 Run (MODAL_PROFILE=safety-sahan):
     modal run modal_bank_everything.py::run_smoke                 # 1k/family -> banks/everything_smoke (~10 min)
-    modal run --detach modal_bank_everything.py::run_build        # 100k/family -> banks/everything (~1 h, 1x L40S)
+    modal deploy modal_bank_everything.py && python -c "import modal; print(modal.Function.from_name(
+        'maemm-bank-everything', 'build').spawn(n_per_family=100000, bsf_scan_seqs=20000, seed=7).object_id)"
+                                                                  # 100k/family -> banks/everything (~1 h, 1 GPU);
+                                                                  # deploy+spawn survives the launching client
     modal run modal_bank_everything.py::run_verify                # re-verify the FINAL artifacts on the volume
     modal run modal_bank_everything.py::run_peek                  # CPU: stats + sample rows
 Trainer: --data-dir /data/banks/everything --bank-file vecs.f32 --direction-source cluster
@@ -116,7 +119,12 @@ def _max_cos_vs(bank_rows_iter, ref, dev):
 # ----------------------------------------------------------------------------------------------------------------
 # build
 # ----------------------------------------------------------------------------------------------------------------
-@app.function(image=image, gpu="L40S", cpu=16, memory=98304, ephemeral_disk=512 * 1024, volumes={"/data": vol},
+# GPU: any of these is plenty (peak ~14 GB: SASA encoder 5.4 GB fp32 + a 4096x262144 block-code chunk); a fallback
+# list schedules far faster than a single type. CPU/RAM kept modest for the same reason (peak RSS ~25 GB).
+BUILD_GPUS = ["H100", "A100-80GB", "L40S", "A100-40GB"]
+
+
+@app.function(image=image, gpu=BUILD_GPUS, cpu=8, memory=65536, ephemeral_disk=512 * 1024, volumes={"/data": vol},
               secrets=[modal.Secret.from_name("maemm-hf")], timeout=8 * 3600)
 def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 7, threads: int = 48,
           chunk: int = 50_000, doc_cap: int = 8, bsf_scan_seqs: int = 20_000, bsf_cap: int = 4, bsf_ranks: int = 8,
@@ -737,7 +745,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
 # ----------------------------------------------------------------------------------------------------------------
 # verify (from the FINAL artifacts on the volume)
 # ----------------------------------------------------------------------------------------------------------------
-@app.function(image=image, gpu="L40S", cpu=8, memory=65536, volumes={"/data": vol}, timeout=3600)
+@app.function(image=image, gpu=BUILD_GPUS, cpu=8, memory=49152, volumes={"/data": vol}, timeout=3600)
 def verify(out_name: str = OUT_DEFAULT):
     import json, os, sys, time
     import numpy as np
