@@ -68,7 +68,7 @@ image = (
 
 vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
 
-POOL_DIR = "/data/pool_rl_last5"                 # built by modal_pool_last5.py
+POOL_DIR = "/data/banks/everything"              # v15 (user, Sep 2): "train on LITERALLY EVERYTHING" — 5 x 100k even mix (short-ctx acts, long-ctx acts, SAE enc features, BSF subspace projections, probes), eval ids excluded + leakage-asserted (modal_bank_everything.py). Was /data/pool_rl_last5 (realact+probes; contains 128/512 eval cluster dirs!)
 SFT_INIT = "/data/sft_mix/last5_rp/final"        # SFT-final adapter (init AND frozen KL ref)
 CKPT_DIR = "/data/ckpts_last5_v15_g8"  # v15 = 8 rollouts/prompt x 128 prompts (user: "8x128"), inline eval, grad-ckpt, EasyNLA-matched recipe (per-group std adv, kl .01, raw cosine, hinged len pen, cap-hit -2, seq-mean), lr 1e-5
 
