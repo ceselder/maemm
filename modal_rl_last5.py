@@ -69,7 +69,7 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
 
 POOL_DIR = "/data/pool_rl_last5"                 # built by modal_pool_last5.py
 SFT_INIT = "/data/sft_mix/last5_rp/final"        # SFT-final adapter (init AND frozen KL ref)
-CKPT_DIR = "/data/ckpts_last5_v12"  # v12 = v11 recipe (16x64, no gate, log-reward, global batch-norm, vLLM rollouts, from v9/step_50) + KL 0.01 — "let the RL rip" (400 steps)
+CKPT_DIR = "/data/ckpts_last5_v13_kl0.01"  # v13 = overnight KL sweep (UNLOGGED cos x1000 reward, len 0.25/tok from 16, no gate, 16x64, from v9/step_50); per-arm save_dir/run_name/extra_args at spawn
 
 TRAIN_ARGS = [
     "--bank-file", "vecs.f32",
@@ -84,13 +84,12 @@ TRAIN_ARGS = [
     # kl 0.005 ≈ 5e-6 at cosine scale was inert). Baking them here (instead of modal_rl.py's
     # resume-time re-param) means the first leg never runs the collapse-prone inert-KL config. ----
     "--reward-scale", "1000",                    # v5: PROVEN paper scale (v4 std-norm+scale1 collapsed ~step28: KL 0.22->9.5, gate->0)
-    "--len-penalty-start", "16",
-    "--len-penalty-per-tok", "0.2",              # v10: x0.8 (log-reward compresses cosine-part log1p(cos)x1000 vs cos x1000 → restore v9 relative weight)
+    "--len-penalty-start", "8",               # v13 (user): length penalty active from 8 tokens (min_new_tokens 16 → tokens 8-16 are a constant offset, cancels in the group mean)
+    "--len-penalty-per-tok", "0.25",             # v13 sweep (user ratio): 1 extra token = 0.00025 cosine = 0.25 reward units at the x1000 UNLOGGED scale
     "--gate-penalty", "20",                      # v10: x0.8 (same log-reward proportional rescale; was 25)
     "--no-gates",                                # v11: NO fluency/distinct gate (user call; the collapse analysis showed the gate is not the stabilizer — KL is). len-penalty stays.
-    "--kl-coef", "0.01",                         # v12 (user: "maybe we do need some KL term and let the RL rip"): v11 (kl 0) peaked .761@40 then collapsed @67; v9 (kl .04) never collapsed but capped .709 → 0.01 = 4x weaker leash
+    "--kl-coef", "0.01",                         # v13 overnight sweep: per-arm override via train(extra_args="--kl-coef X"); arms 0.0025 / 0.005 / 0.01 — "lowest KL we can get away with"
     "--batch-norm",                              # v10/ScaleRL: batch-level advantage std-norm + zero-variance-group filtering (vs v9's per-group --std-norm)
-    "--log-reward",                              # v10: log1p-compress the cosine reward — diminishing returns at high end → less over-optimization pressure
     "--adam-eps", "1e-15",                       # v10/ScaleRL (avoids grad-clip underflow)
     "--max-grad-norm", "1",                      # paper (clips the ~x1000 grads; Adam handles it)
     # ---- the LAST-5 reward: max per-token cosine over only the last 5 kept content tokens
@@ -113,7 +112,7 @@ TRAIN_ARGS = [
     "--score-batch", "64",  # gates off -> score() is a read_resid early-exit pass; bigger batch = fewer forwards
     "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.
     "--save-dir", CKPT_DIR,
-    "--run-name", "last5_rp_rl_v12",
+    "--run-name", "last5_rp_rl_v13_kl0.01",
 ]
 
 
@@ -129,7 +128,9 @@ TRAIN_ARGS = [
 )
 def train(backend: str = "gloo", total_steps: int = 400,
           resume_from: str = "", step_offset: int = 0, wandb_id: str = "",
-          save_dir: str = "", run_name: str = "", groups_per_step: int = 0, save_every: int = 0):
+          save_dir: str = "", run_name: str = "", groups_per_step: int = 0, save_every: int = 0,
+          extra_args: str = ""):
+    # extra_args: whitespace-split, appended LAST (argparse last-wins) — per-arm overrides for sweeps, e.g. "--kl-coef 0.005".
     # resume_from: path to a step_N ckpt dir -> becomes --init-adapter, with --ref-adapter kept at
     # the SFT init (KL anchor NEVER re-anchors to the resume ckpt) + --step-offset for global-step
     # continuity + optional --wandb-id to continue the same wandb run. The trainer auto-loads
@@ -232,6 +233,8 @@ def train(backend: str = "gloo", total_steps: int = 400,
         _set("--groups-per-step", groups_per_step)
     if save_every:
         _set("--save-every", save_every)
+    if extra_args:
+        args += extra_args.split()
 
     cmd = [
         "torchrun", "--nproc_per_node=8", "--master_port=29531", "RL/rl_hf.py",
@@ -293,7 +296,7 @@ def smoke():
         "--init-adapter", SFT_INIT,
         "--lr", "1e-5", "--reward-metric", "cosine", "--reward-scale", "1",
         "--min-new-tokens", "16", "--max-new-tokens", "96",
-        "--len-penalty-start", "16", "--len-penalty-per-tok", "0.00025",
+        "--len-penalty-start", "8",               # v13 (user): length penalty active from 8 tokens (min_new_tokens 16 → tokens 8-16 are a constant offset, cancels in the group mean) "--len-penalty-per-tok", "0.00025",
         "--gate-penalty", "0.025", "--max-grad-norm", "0.001",
         "--reward-window-last", "5", "--reward-topk", "1",
         "--kl-coef", "0.1",

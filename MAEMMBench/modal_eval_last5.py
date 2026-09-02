@@ -35,7 +35,7 @@ import modal
 
 REPO = Path(__file__).parent.parent   # repo root (this file lives in MAEMMBench/)
 
-app = modal.App("maemm-eval-last5-heldout-v12")
+app = modal.App("maemm-eval-last5-sweep")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -87,7 +87,8 @@ CONTROL_FAMS = {"random"}  # lower-is-better controls: logged per-family, EXCLUD
 )
 def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0,
            max_new: int = 64, min_new: int = 16, gen_chunk: int = 128,
-           min_ckpt_mtime: float = 0.0):
+           min_ckpt_mtime: float = 0.0, tag: str = "v12"):
+    # tag: which /data/ckpts_last5_<tag> run to evaluate (state file + wandb run names follow it)
     # min_ckpt_mtime: ignore ckpt dirs whose adapter mtime predates this (stale artifacts from a
     # cancelled leg). When the resumed leg OVERWRITES such a dir, its mtime refreshes past the
     # cutoff and it gets evaled as new — no deletion needed, no stale evals, no skipped re-saves.
@@ -98,6 +99,10 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
     import time
 
     os.environ["HF_HOME"] = "/data/hf_cache"
+    global CKPT_DIR, STATE, WANDB_RUN, WANDB_RUN_ID
+    CKPT_DIR = f"/data/ckpts_last5_{tag}"
+    STATE = f"/data/eval_state/evaled_last5_{tag}.json"
+    WANDB_RUN = WANDB_RUN_ID = f"last5_rp_rl_eval_{tag}"
     os.environ["HF_HUB_OFFLINE"] = "1"          # load purely from the volume cache
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
