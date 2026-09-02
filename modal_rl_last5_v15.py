@@ -118,7 +118,7 @@ TRAIN_ARGS = [
     "--score-batch", "64",  # gates off -> score() is a read_resid early-exit pass; bigger batch = fewer forwards
     "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.
     "--save-dir", CKPT_DIR,
-    "--run-name", "last5_rp_rl_v15_g8",
+    "--run-name", "rl_everything_8x128_last5win",
 ]
 
 
