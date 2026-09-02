@@ -75,6 +75,9 @@ def _eos_ids(tok, actor):
     return ids
 
 
+SCORE_STATS = {}   # side-stats from the last score() call (peak position etc.), picked up by the step log
+
+
 def _trim_at_stop(g, eos_ids):
     """Keep tokens up to and INCLUDING the first stop token; drop any pad tail."""
     trimmed = []
@@ -382,6 +385,7 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
     token (bos, or eos=<|endoftext|> for Qwen) is PREPENDED, add_special_tokens=False, position 0
     dropped from the reward. Returns r [n] (+ mean clean-base logp/token and distinct fraction when
     with_fluency, the gate inputs) — one forward per batch does reward and gates together."""
+    SCORE_STATS.clear()
     r = torch.zeros(len(texts))
     logp = torch.full((len(texts),), -20.0) if with_fluency else None
     dis = torch.zeros(len(texts)) if with_fluency else None
@@ -421,10 +425,16 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
             hh = F.normalize(h, dim=-1) if a.reward_metric == "cosine" else h
             proj = torch.einsum("btd,bd->bt", hh, dirs_rep[idxs])
             sel = keep
-            if a.reward_window_last > 0:                                  # anti-smear: last N kept tokens only
-                revcnt = sel.flip(1).cumsum(1).flip(1)                    # kept tokens from here to the end
+            revcnt = sel.flip(1).cumsum(1).flip(1)                        # kept tokens from here to the end (last kept = 1)
+            if a.reward_window_last > 0:                                  # HARD anti-smear: last N kept tokens only
                 sel = sel & (revcnt <= a.reward_window_last)
+            if a.reward_pos_penalty > 0:                                  # SOFT anti-smear: cos_t - lambda * (distance of t from the end)
+                proj = proj - a.reward_pos_penalty * (revcnt - 1).clamp(min=0).to(proj.dtype)   # inside the max -> no argmax-flip discontinuity
             pf = proj.masked_fill(~sel, torch.finfo(proj.dtype).min)
+            if k_stats := (a.reward_topk <= 1):
+                _pk = pf.argmax(1)                                        # where the (position-adjusted) peak sits
+                _d = (revcnt.gather(1, _pk[:, None]).squeeze(1) - 1).clamp(min=0).float()
+                SCORE_STATS.setdefault("peak_dist", []).append(torch.where(keep.any(1), _d, torch.zeros_like(_d)).cpu())
             k = max(1, a.reward_topk)
             if k == 1:
                 best = pf.max(1).values
@@ -626,6 +636,9 @@ def parse_args():
     ap.add_argument("--reward-window-last", type=int, default=0,
                     help="reward over only the LAST N kept tokens (0 = all tokens)")
     ap.add_argument("--reward-topk", type=int, default=1, help="mean of the top-K cosines in the window (1=max)")
+    ap.add_argument("--reward-pos-penalty", type=float, default=0.0,
+                    help="soft window: reward = max_t [cos_t - lambda*(kept tokens after t)] over ALL kept tokens "
+                         "(lambda in cosine units/token, e.g. 0.01). 0 = off. Can combine with --reward-window-last.")
     ap.add_argument("--fluency-floor", type=float, default=cfg.fluency_floor,
                     help="min clean-base mean logp/token; below it the rollout fails the gate")
     ap.add_argument("--distinct-floor", type=float, default=cfg.distinct_floor,
@@ -932,6 +945,9 @@ def main():
                "time/rollout_s": t_roll, "time/step_s": secs,
                "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, **rstats}
         log["reward/trunc_frac"] = trunc_frac
+        if SCORE_STATS.get("peak_dist"):
+            _pd = torch.cat(SCORE_STATS["peak_dist"]); log["reward/peak_dist_mean"] = _pd.mean().item()
+            log["reward/peak_in_last5_frac"] = (_pd <= 4).float().mean().item()
         log.update({"var/within_group_std_raw": float(var_stats[0]), "var/between_group_std_raw": float(var_stats[1]),
                     "var/zero_var_group_frac": float(var_stats[2]), "var/adv_std": float(var_stats[3]),
                     "var/adv_abs_mean": float(var_stats[4]), "var/group_std_min": float(var_stats[5]),
