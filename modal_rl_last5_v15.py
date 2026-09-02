@@ -70,7 +70,7 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
 
 POOL_DIR = "/data/pool_rl_last5"                 # built by modal_pool_last5.py
 SFT_INIT = "/data/sft_mix/last5_rp/final"        # SFT-final adapter (init AND frozen KL ref)
-CKPT_DIR = "/data/ckpts_last5_v15_easynla"  # v15 = EasyNLA-matched hypers (per-group std adv, G=16 x 128 groups, lr 1e-5 (user), betas .9/.95, eps 1e-8, kl .01, raw cosine, hinged len pen .01/tok past 32, cap-hit = -2, seq-mean loss)
+CKPT_DIR = "/data/ckpts_last5_v15_g8"  # v15 = 8 rollouts/prompt x 128 prompts (user: "8x128"), inline eval, grad-ckpt, EasyNLA-matched recipe (per-group std adv, kl .01, raw cosine, hinged len pen, cap-hit -2, seq-mean), lr 1e-5
 
 TRAIN_ARGS = [
     "--bank-file", "vecs.f32",
@@ -104,7 +104,7 @@ TRAIN_ARGS = [
     "--min-new-tokens", "8",     # v14 (user): min generation 8 tokens (len penalty also from 8)
     "--max-new-tokens", "96",
     "--groups-per-step", "128", # user (Sep 2): 128 prompts/step (16/rank) x 16 = 2048 rollouts/step
-    "--group-size", "16",        # user (Sep 2): 16 rollouts per group (EasyNLA uses 8; not adopted)
+    "--group-size", "8",         # user (Sep 2): 8 rollouts per prompt ("8x128"; 16x128 killed at step 5 to make room)
     "--rollout-chunk", "64",
     "--logp-chunk", "16",        # old_logp recompute chunk (fp32 248k-vocab logits: 64 seqs ~13 GB peak OOM'd next to the vLLM engine)
     "--rollout-engine", "vllm",  # v11: per-rank vLLM engine + vllm_lens steering; HF only recomputes old_logp
@@ -118,7 +118,7 @@ TRAIN_ARGS = [
     "--score-batch", "64",  # gates off -> score() is a read_resid early-exit pass; bigger batch = fewer forwards
     "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.
     "--save-dir", CKPT_DIR,
-    "--run-name", "last5_rp_rl_v15",
+    "--run-name", "last5_rp_rl_v15_g8",
 ]
 
 
