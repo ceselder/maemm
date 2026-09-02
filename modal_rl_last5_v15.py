@@ -130,6 +130,7 @@ TRAIN_ARGS = [
     # accumulation slicing — global-token-normalized loss makes gradients identical to mb=8.
     "--micro-batch", "3",   # v15d: mb 4 + grad-ckpt OOM'd in loss.backward() (112 GB HF + 64 GB vLLM); checkpointing did NOT lower the peak on this model -> back to the measured-safe mb 3 (99 GB peak), no grad-ckpt
     "--inline-eval-every", "10",   # v15b: held-out eval suite INSIDE the trainer on all 8 GPUs every save (no separate runner)
+    "--eval-n-per-family", "128",  # v15e: 512/family (=daemon protocol) cost 1474 s at step 1 on 4 ranks (~25 min/ckpt); 128 -> ~6 min (noisier per-ckpt means, same subset every ckpt)
     "--ref-micro-batch", "16",   # KL ref logps in one no-grad pass (2 adapter switches/step instead of 2/micro-batch)
     "--score-batch", "64",  # gates off -> score() is a read_resid early-exit pass; bigger batch = fewer forwards
     "--save-every", "10",   # legs die at ~step 22 (B200 eviction on shared ws); 25 never saved -> resume-chain never bootstrapped. 10 => step_10/step_20 land within a leg.

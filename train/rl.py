@@ -486,10 +486,16 @@ def load_eval_assets(a, device, is_main):
         fams = list(es["meta"].get("cos_families", EU.COS_FAMILIES))
         for fam in fams:
             assert f"{fam}_dirs" in es, f"eval cache lacks {fam}_dirs"
+        if a.eval_n_per_family > 0:   # cost control: first n rows of every family (frozen order -> same subset every ckpt)
+            n = a.eval_n_per_family
+            for fam in fams:
+                es[f"{fam}_dirs"] = es[f"{fam}_dirs"][:n]
+            es["sae_dirs"], es["sae_feats"] = es["sae_dirs"][:n], list(es["sae_feats"])[:n]
+            es["corpus_peak"] = es["corpus_peak"][:n]
         ev = {"EU": EU, "es": es, "sae": sae, "fams": fams, "feats": list(es["sae_feats"]),
               "cp": es["corpus_peak"].numpy().astype(np.float64)}
         if is_main:
-            print(f"[inline-eval] ready: families {fams} n={es['meta'].get('n')} | sae feats {len(ev['feats'])} "
+            print(f"[inline-eval] ready: families {fams} n={len(es[fams[0] + '_dirs'])} (cache n={es['meta'].get('n')}) | sae feats {len(ev['feats'])} "
                   f"| bo={a.eval_bo} temp={a.eval_temp} tokens {a.eval_min_new}-{a.eval_max_new} | every {a.inline_eval_every} steps",
                   flush=True)
         return ev
@@ -816,6 +822,9 @@ def parse_args():
     ap.add_argument("--eval-temp", type=float, default=1.0)
     ap.add_argument("--eval-max-new", type=int, default=64)
     ap.add_argument("--eval-min-new", type=int, default=16)
+    ap.add_argument("--eval-n-per-family", type=int, default=0,
+                    help="inline eval: use only the first N directions of each family (0 = the whole cache). "
+                         "512/family x 12 families x Bo4 took ~25 min per ckpt on 4 ranks; 128 -> ~6 min")
     ap.add_argument("--std-norm", action="store_true", help="advantage / per-group std (standard GRPO)")
     ap.add_argument("--batch-norm", action="store_true",
                     help="advantage / ONE global-batch std, zero-variance groups dropped (ScaleRL)")
