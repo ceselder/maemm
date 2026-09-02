@@ -88,7 +88,7 @@ TRAIN_ARGS = [
     "--len-penalty-per-tok", "0.2",              # v10: x0.8 (log-reward compresses cosine-part log1p(cos)x1000 vs cos x1000 → restore v9 relative weight)
     "--gate-penalty", "20",                      # v10: x0.8 (same log-reward proportional rescale; was 25)
     "--no-gates",                                # v11: NO fluency/distinct gate (user call; the collapse analysis showed the gate is not the stabilizer — KL is). len-penalty stays.
-    "--kl-coef", "0.01",                         # v11: small leash — v10 (0) collapsed at ~step 110 (objective-driven entropy loss, gnorm creep), v9 (0.04) was stable but capped ~0.71; 0.01 = 4x weaker than v9 on unit-scale advantages
+    "--kl-coef", "0",                            # v11 (user 02:00Z Sep 2): NO KL ("turn it off"). Record: v5/v7/v10 (kl<=0.005) all collapsed ~step 50-110 via entropy loss; the monitor's entropy watch is the safety net (stop + keep best ckpt).
     "--batch-norm",                              # v10/ScaleRL: batch-level advantage std-norm + zero-variance-group filtering (vs v9's per-group --std-norm)
     "--log-reward",                              # v10: log1p-compress the cosine reward — diminishing returns at high end → less over-optimization pressure
     "--adam-eps", "1e-15",                       # v10/ScaleRL (avoids grad-clip underflow)
