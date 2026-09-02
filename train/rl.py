@@ -482,6 +482,7 @@ def load_eval_assets(a, device, is_main):
         es = torch.load(a.eval_cache, map_location="cpu", weights_only=False)
         sae = load_sae(path=a.eval_sae, device=device, dtype=torch.float32)
         assert es["meta"]["d_sae"] == sae.d_sae, f"cache d_sae {es['meta']['d_sae']} != SAE {sae.d_sae}"
+        sae.W_dec = None   # decoder unused by encode_features / sae_rank_at_peaks -> free 2.7 GB next to the actor + vLLM
         fams = list(es["meta"].get("cos_families", EU.COS_FAMILIES))
         for fam in fams:
             assert f"{fam}_dirs" in es, f"eval cache lacks {fam}_dirs"

@@ -125,11 +125,10 @@ TRAIN_ARGS = [
     "--rollout-chunk", "64",
     "--logp-chunk", "16",        # old_logp recompute chunk (fp32 248k-vocab logits: 64 seqs ~13 GB peak OOM'd next to the vLLM engine)
     "--rollout-engine", "vllm",  # v11: per-rank vLLM engine + vllm_lens steering; HF only recomputes old_logp
-    "--vllm-gpu-mem", "0.36",
+    "--vllm-gpu-mem", "0.33",   # v15d: 59 GB engine (was 64) -> headroom for the inline-eval SAE (2.7 GB, decoder dropped) next to the 99 GB update peak
     # micro-batch 4 (box used 8): update() peaked OOM on 178GB B200s at gen len ~42. Pure grad-
     # accumulation slicing — global-token-normalized loss makes gradients identical to mb=8.
-    "--micro-batch", "4",   # v15c: mb 8 + grad-ckpt OOM'd at step 0 (rank3 112 GB in the GDN torch_chunk_gated_delta_rule forward next to the 64 GB vLLM engine) — the per-layer GDN transient scales with mb even under checkpointing; 4 = safe (mb3 no-ckpt peaked 99 GB)
-    "--grad-ckpt",          # v15b: non-reentrant HF checkpointing; update() keeps the inject hook armed through backward
+    "--micro-batch", "3",   # v15d: mb 4 + grad-ckpt OOM'd in loss.backward() (112 GB HF + 64 GB vLLM); checkpointing did NOT lower the peak on this model -> back to the measured-safe mb 3 (99 GB peak), no grad-ckpt
     "--inline-eval-every", "10",   # v15b: held-out eval suite INSIDE the trainer on all 8 GPUs every save (no separate runner)
     "--ref-micro-batch", "16",   # KL ref logps in one no-grad pass (2 adapter switches/step instead of 2/micro-batch)
     "--score-batch", "64",  # gates off -> score() is a read_resid early-exit pass; bigger batch = fewer forwards
