@@ -56,7 +56,10 @@ def _pread_full(fd, n, off):
 @app.function(image=image, cpu=32, memory=98304, ephemeral_disk=512 * 1024, volumes={"/data": vol},
               secrets=[modal.Secret.from_name("maemm-hf")], timeout=8 * 3600)
 def build(out_name: str = OUT_DEFAULT, n_realact: int = 600_000, probe_dup: int = 2, seed: int = 1,
-          threads: int = 48, chunk: int = 100_000, p_lo: int = 14, p_hi: int = 91, max_per_doc: int = 14):
+          threads: int = 48, chunk: int = 100_000, p_lo: int = 14, p_hi: int = 91, max_per_doc: int = 14,
+          n_window: int = 0, win_p_lo: int = 16, win_p_hi: int = 511, w_lo: int = 16, w_hi: int = 64):
+    # n_window > 0: that many of the n_realact real-acts use the eval-matched WINDOW harvest (p~U[win_p_lo,win_p_hi],
+    # target = a W~U[w_lo,w_hi]-token window ENDING at p, the last5_rp recipe); the rest use the ARB-doc PREFIX harvest.
     import json, os, random, shutil, time
     from concurrent.futures import ThreadPoolExecutor
     import numpy as np
@@ -108,52 +111,69 @@ def build(out_name: str = OUT_DEFAULT, n_realact: int = 600_000, probe_dup: int 
     thr = NORM_FILTER_MULT * med
     print(f"[bank] norm filter: median {med:.1f} thr {thr:.1f} ({time.time() - t0:.0f}s)", flush=True)
 
-    # ---- realact: candidates = (doc, prefill index p in [p_lo, p_hi]) without replacement, streamed ----
-    n_pos = p_hi - p_lo + 1
-    assert n_train * min(n_pos, max_per_doc) >= n_realact, "not enough (doc, p) pairs under --max-per-doc"
-    n_cand = min(int(n_realact * 1.6) + 4096, n_train * n_pos)
-    flat = nrng.choice(n_train * n_pos, size=n_cand, replace=False)
-    cand_s = (flat // n_pos).astype(np.int64); cand_p = (p_lo + flat % n_pos).astype(np.int64)
-    del flat
+    # ---- realact: up to two harvests, each streamed in chunks; a shared <= max_per_doc cap ----
+    #   prefix: p~U[p_lo,p_hi], target = the doc's text from its start through p + 1-4 tokens after (ARB doc)
+    #   window: p~U[win_p_lo,win_p_hi], target = W~U[w_lo,w_hi]-token window ENDING at p (eval positions are
+    #           uniform over the document, so this half keeps mid/late-position coverage)
+    n_prefix = n_realact - n_window
+    assert n_prefix >= 0
     recs = []
     per_doc = np.zeros(n_train, np.int32)
-    kept = drop_norm = drop_txt = drop_cap = 0
-    t0 = time.time()
+    drop_norm = drop_txt = drop_cap = 0
+    kept_total = 0
     raw = np.empty((chunk, D_MODEL), np.float16)
-    for c0 in range(0, n_cand, chunk):
-        if kept >= n_realact:
-            break
-        c1 = min(c0 + chunk, n_cand)
-        m = c1 - c0
-        with ThreadPoolExecutor(threads) as ex:
-            list(ex.map(lambda k: read_act(int(cand_s[c0 + k]), int(cand_p[c0 + k]), raw[k]), range(m), chunksize=256))
-        d = raw[:m].astype(np.float32) - mu
-        norms = np.linalg.norm(d, axis=1)
-        for k in range(m):
-            if kept >= n_realact:
+    for mode, n_target, lo, hi in (("prefix", n_prefix, p_lo, p_hi), ("window", n_window, win_p_lo, win_p_hi)):
+        if n_target <= 0:
+            continue
+        n_pos = hi - lo + 1
+        n_cand = min(int(n_target * 1.6) + 4096, n_train * n_pos)
+        flat = nrng.choice(n_train * n_pos, size=n_cand, replace=False)
+        cand_s = (flat // n_pos).astype(np.int64); cand_p = (lo + flat % n_pos).astype(np.int64)
+        del flat
+        kept = 0
+        t0 = time.time()
+        for c0 in range(0, n_cand, chunk):
+            if kept >= n_target:
                 break
-            if not (1e-6 < norms[k] <= thr):
-                drop_norm += 1
-                continue
-            s, p = int(cand_s[c0 + k]), int(cand_p[c0 + k])
-            if per_doc[s] >= max_per_doc:
-                drop_cap += 1
-                continue
-            extra = wrng.randint(1, 4)                       # 1-4 tokens AFTER the firing token (doc: "for diversity")
-            end = min(p + 1 + extra, T)
-            ids = toks[s, 0:end].tolist()                    # the document's actual text from its start through p+extra
-            txt = tok.decode(ids)
-            if len(txt.strip()) < 3:
-                drop_txt += 1
-                continue
-            vecs[kept] = d[k] / norms[k]
-            recs.append({"vec_idx": kept, "target_text": txt, "family": "realact", "seq": s, "pos": p,
-                         "extra": extra, "n_tok": end, "fire_from_end": end - 1 - p})
-            per_doc[s] += 1
-            kept += 1
-        print(f"[bank] realact {kept}/{n_realact} (cands {c1}/{n_cand}, {kept / max(time.time() - t0, 1):.0f}/s, "
-              f"drops norm={drop_norm} txt={drop_txt} cap={drop_cap})", flush=True)
-    assert kept == n_realact, f"realact quota missed: {kept} (drops norm={drop_norm} txt={drop_txt} cap={drop_cap})"
+            c1 = min(c0 + chunk, n_cand)
+            m = c1 - c0
+            with ThreadPoolExecutor(threads) as ex:
+                list(ex.map(lambda k: read_act(int(cand_s[c0 + k]), int(cand_p[c0 + k]), raw[k]), range(m), chunksize=256))
+            d = raw[:m].astype(np.float32) - mu
+            norms = np.linalg.norm(d, axis=1)
+            for k in range(m):
+                if kept >= n_target:
+                    break
+                if not (1e-6 < norms[k] <= thr):
+                    drop_norm += 1
+                    continue
+                s, p = int(cand_s[c0 + k]), int(cand_p[c0 + k])
+                if per_doc[s] >= max_per_doc:
+                    drop_cap += 1
+                    continue
+                if mode == "prefix":
+                    extra = wrng.randint(1, 4)                   # 1-4 tokens AFTER the firing token
+                    start_tok, end = 0, min(p + 1 + extra, T)
+                else:
+                    extra = 0
+                    W = wrng.randint(w_lo, w_hi)
+                    start_tok, end = max(0, p - W + 1), p + 1     # window ends AT the firing token
+                ids = toks[s, start_tok:end].tolist()
+                txt = tok.decode(ids)
+                if len(txt.strip()) < 3:
+                    drop_txt += 1
+                    continue
+                vecs[kept_total] = d[k] / norms[k]
+                recs.append({"vec_idx": kept_total, "target_text": txt, "family": "realact", "harvest": mode,
+                             "seq": s, "pos": p, "start": start_tok, "extra": extra, "n_tok": len(ids),
+                             "fire_from_end": end - 1 - p})
+                per_doc[s] += 1
+                kept += 1
+                kept_total += 1
+            print(f"[bank] realact/{mode} {kept}/{n_target} (cands {c1}/{n_cand}, {kept / max(time.time() - t0, 1):.0f}/s, "
+                  f"drops norm={drop_norm} txt={drop_txt} cap={drop_cap})", flush=True)
+        assert kept == n_target, f"realact/{mode} quota missed: {kept} (drops norm={drop_norm} txt={drop_txt} cap={drop_cap})"
+    assert kept_total == n_realact
     n_realact_tok = sum(r["n_tok"] for r in recs)
 
     # ---- probes: copy vectors once (rows n_realact..), records x probe_dup ----
@@ -181,7 +201,8 @@ def build(out_name: str = OUT_DEFAULT, n_realact: int = 600_000, probe_dup: int 
             rf.write(json.dumps(r) + "\n")
     vecs.flush(); del vecs
     stats = {"kind": "big_rp: ARB-doc harvest — realact = doc prefix through index p in [p_lo,p_hi] + 1-4 tokens after (lengths 16-96), <= max_per_doc per document; probes = last5_rp re-anchored cluster rows x dup",
-             "harvest": {"p_lo": p_lo, "p_hi": p_hi, "extra_after": [1, 4], "max_per_doc": max_per_doc, "drop_cap": drop_cap,
+             "harvest": {"prefix": n_prefix, "window": n_window, "p_lo": p_lo, "p_hi": p_hi, "extra_after": [1, 4],
+                         "win_p_lo": win_p_lo, "win_p_hi": win_p_hi, "w_range": [w_lo, w_hi], "max_per_doc": max_per_doc, "drop_cap": drop_cap,
                          "docs_used": int((per_doc > 0).sum()), "n_train_docs": int(n_train)},
              "n_examples": len(recs), "n_vecs": n_total,
              "families": {"realact": n_realact, "cluster": n_probe * probe_dup},

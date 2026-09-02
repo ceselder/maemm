@@ -87,7 +87,8 @@ CONTROL_FAMS = {"random"}  # lower-is-better controls: logged per-family, EXCLUD
 )
 def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0,
            max_new: int = 64, min_new: int = 16, gen_chunk: int = 128,
-           min_ckpt_mtime: float = 0.0, shard: int = 0, nshards: int = 1):
+           min_ckpt_mtime: float = 0.0, shard: int = 0, nshards: int = 1, run: str = "big_rp"):
+    # run: which /data/sft_mix/<run> to evaluate (state file + wandb run names follow it)
     # shard/nshards: run several daemons in parallel, each owning the ckpt steps with
     # step % nshards == shard (own state file + own wandb run; the pre-shard state is read too).
     # min_ckpt_mtime: ignore ckpt dirs whose adapter mtime predates this (stale artifacts from a
@@ -100,6 +101,11 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
     import time
 
     os.environ["HF_HOME"] = "/data/hf_cache"
+    global CKPT_DIR, STATE, WANDB_RUN, WANDB_RUN_ID
+    if run != "big_rp":
+        CKPT_DIR = f"/data/sft_mix/{run}"
+        STATE = f"/data/eval_state/evaled_sft_{run}.json"
+        WANDB_RUN = WANDB_RUN_ID = f"sft_{run}_eval"
     _shard_state = STATE if nshards == 1 else STATE.replace(".json", f"_s{shard}of{nshards}.json")
     os.environ["HF_HUB_OFFLINE"] = "1"          # load purely from the volume cache
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
