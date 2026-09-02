@@ -38,6 +38,8 @@ import modal
 
 REPO = Path(__file__).parent
 
+import os  # noqa: E402  (N_GPU below reads the env at import time)
+
 app = modal.App("maemm-rl-last5-v15")
 # GPUs per arm: Modal has only handed us ~8 B200 at a time today; two 8-GPU arms never scheduled together.
 # RL_NGPU=4 at deploy time -> each arm on 4xB200 (groups/rank doubles, ~2x step time, both arms run in parallel).
