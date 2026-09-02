@@ -613,7 +613,9 @@ def parse_args():
     ap.add_argument("--gate-penalty", type=float, default=cfg.gate_penalty)
     ap.add_argument("--len-penalty-start", type=int, default=cfg.len_penalty_start)
     ap.add_argument("--len-penalty-per-tok", type=float, default=cfg.len_penalty_per_tok)
-    ap.add_argument("--no-gates", action="store_true", help="disable fluency/distinct/len shaping")
+    ap.add_argument("--no-gates", action="store_true",
+                    help="disable the fluency + distinct-token gates (no gate penalty); the length penalty stays")
+    ap.add_argument("--no-len-penalty", action="store_true", help="disable the length penalty")
     # optimization
     ap.add_argument("--lr", type=float, default=cfg.lr)
     ap.add_argument("--adam-eps", type=float, default=1e-8)
@@ -634,7 +636,9 @@ def parse_args():
     assert not (a.std_norm and a.batch_norm), "pick one of --std-norm / --batch-norm"
     assert a.temperature == 1.0, "sampling temp must be 1.0 so the behaviour policy == the policy old_logp measures"
     if a.no_gates:
-        a.fluency_floor = a.distinct_floor = a.len_penalty_start = None
+        a.fluency_floor = a.distinct_floor = None
+    if a.no_len_penalty:
+        a.len_penalty_start = None
     return a
 
 
