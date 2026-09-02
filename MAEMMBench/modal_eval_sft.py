@@ -209,7 +209,8 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
         # union of EVERY state file for this run (base + all shard configs ever used), so the shard
         # count can be changed mid-run without re-scoring checkpoints another daemon already did
         done = set()
-        for path in {STATE, _shard_state} | set(glob.glob(STATE.replace(".json", "*.json"))):
+        # exact run scoping: <stem>.json + <stem>_s*of*.json (a bare "<stem>*" also matched big_rp_v2's files)
+        for path in {STATE, _shard_state} | set(glob.glob(STATE[:-5] + "_s*of*.json")):
             if os.path.exists(path):
                 try:
                     done |= set(json.load(open(path)).get("done", []))
