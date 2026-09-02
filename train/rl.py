@@ -899,6 +899,13 @@ def main():
         torch.cuda.reset_peak_memory_stats(device)
         n_gen = float(sum(len(g) for g in gen_ids))
         rg_std = r.view(Bl, G).std(1).mean().item()
+        # ---- variance tracking (user): where does the learning signal live? ----
+        _rg = raw_r.view(Bl, G)
+        var_stats = torch.tensor([_rg.std(1).mean().item(),                      # mean within-group std of the RAW reward
+                                  _rg.mean(1).std().item() if Bl > 1 else 0.0,   # between-group std (of group means)
+                                  (_rg.std(1) < 1e-6).float().mean().item(),     # zero-variance groups (no signal)
+                                  adv.std().item(), adv.abs().mean().item(),      # advantage spread actually fed to the update
+                                  _rg.std(1).min().item(), _rg.std(1).max().item()], dtype=torch.float64)
         if world > 1:
             gath = [torch.zeros_like(raw_r) for _ in range(world)]
             dist.all_gather(gath, raw_r); raw_r_all = torch.cat(gath)
@@ -907,6 +914,10 @@ def main():
             aux = torch.tensor([n_gen, gate_frac, rg_std], dtype=torch.float64)
             dist.all_reduce(aux)                                       # equal rollouts/rank -> means are exact
             n_gen, gate_frac, rg_std = float(aux[0]), float(aux[1] / world), float(aux[2] / world)
+            vmin, vmax = var_stats[5].clone(), var_stats[6].clone()
+            dist.all_reduce(var_stats); var_stats /= world
+            dist.all_reduce(vmin, op=dist.ReduceOp.MIN); dist.all_reduce(vmax, op=dist.ReduceOp.MAX)
+            var_stats[5], var_stats[6] = vmin, vmax
         else:
             raw_r_all, r_all = raw_r, r
         log = {"reward/mean": raw_r_all.mean().item(), "reward/std": raw_r_all.std().item(),
@@ -921,6 +932,11 @@ def main():
                "time/rollout_s": t_roll, "time/step_s": secs,
                "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, **rstats}
         log["reward/trunc_frac"] = trunc_frac
+        log.update({"var/within_group_std_raw": float(var_stats[0]), "var/between_group_std_raw": float(var_stats[1]),
+                    "var/zero_var_group_frac": float(var_stats[2]), "var/adv_std": float(var_stats[3]),
+                    "var/adv_abs_mean": float(var_stats[4]), "var/group_std_min": float(var_stats[5]),
+                    "var/group_std_max": float(var_stats[6]),
+                    "var/signal_ratio": float(var_stats[0] / (var_stats[1] + 1e-9))})   # within/between: >1 = groups overlap, per-direction contrast dominates
         if _table is not None:
             log["rollouts/samples"] = _table
         if is_main:

@@ -69,7 +69,7 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
 
 POOL_DIR = "/data/pool_rl_last5"                 # built by modal_pool_last5.py
 SFT_INIT = "/data/sft_mix/last5_rp/final"        # SFT-final adapter (init AND frozen KL ref)
-CKPT_DIR = "/data/ckpts_last5_v15_easynla"  # v15 = EasyNLA-matched hypers (per-group std adv, G=8 x 128 groups, lr 1e-4, betas .9/.95, eps 1e-8, kl .01, raw cosine, hinged len pen .01/tok past 32, cap-hit = -2, seq-mean loss)
+CKPT_DIR = "/data/ckpts_last5_v15_easynla"  # v15 = EasyNLA-matched hypers (per-group std adv, G=16 x 128 groups, lr 1e-5 (user), betas .9/.95, eps 1e-8, kl .01, raw cosine, hinged len pen .01/tok past 32, cap-hit = -2, seq-mean loss)
 
 TRAIN_ARGS = [
     "--bank-file", "vecs.f32",
@@ -77,7 +77,7 @@ TRAIN_ARGS = [
     # deep-RL ckpt collapsed even at LP 1.0 (fresh optimizer + weak KL anchor + policy already
     # near the reward-hack cliff). SFT-init is the proven-stable pattern.
     "--init-adapter", SFT_INIT,
-    "--lr", "1e-4",                              # v15: EasyNLA AV/policy lr (10x ours; their LoRA rl_vllm run: gnorm ~0.03, entropy 1.3-1.5 for 400 steps)
+    "--lr", "1e-5",                              # user (Sep 2): keep 1e-5 (EasyNLA runs 1e-4; not adopted)
     "--reward-metric", "cosine",
     # ---- RAW-COSINE units from step 0 (paper run's post-resume re-param values, ABSOLUTE).
     # The kl 0.1 leash is the fix for the paper run's step-330+ gate collapse (the x1000-era
@@ -102,8 +102,8 @@ TRAIN_ARGS = [
     "--reward-topk", "1",
     "--min-new-tokens", "8",     # v14 (user): min generation 8 tokens (len penalty also from 8)
     "--max-new-tokens", "96",
-    "--groups-per-step", "128", # v15: EasyNLA G=8 -> 128 groups (16/rank) x 8 = 1024 rollouts/step (same rollouts/step as v14)
-    "--group-size", "8",         # v15: EasyNLA group_size 8
+    "--groups-per-step", "128", # user (Sep 2): 128 prompts/step (16/rank) x 16 = 2048 rollouts/step
+    "--group-size", "16",        # user (Sep 2): 16 rollouts per group (EasyNLA uses 8; not adopted)
     "--rollout-chunk", "64",
     "--logp-chunk", "16",        # old_logp recompute chunk (fp32 248k-vocab logits: 64 seqs ~13 GB peak OOM'd next to the vLLM engine)
     "--rollout-engine", "vllm",  # v11: per-rank vLLM engine + vllm_lens steering; HF only recomputes old_logp

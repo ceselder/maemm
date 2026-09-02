@@ -99,8 +99,8 @@ TRAIN_ARGS = [
     "--reward-topk", "1",
     "--min-new-tokens", "8",     # v14 (user): min generation 8 tokens (len penalty also from 8)
     "--max-new-tokens", "96",
-    "--groups-per-step", "16",   # v11 (user): 16 groups (2/rank) x 64 = 1024 rollouts/step — "we never want group size 32; 16x64 should already be stable". batch-norm std is GLOBAL (all_reduce)
-    "--group-size", "64",        # v11 (user): 64 samples/group
+    "--groups-per-step", "128", # user (Sep 2): "I want 16 rollouts per group and 128 prompts per step" (v11-v14 ran 16 groups x 64 — a misread of "16x64")
+    "--group-size", "16",        # user (Sep 2): 16 rollouts per group
     "--rollout-chunk", "64",
     "--logp-chunk", "16",        # old_logp recompute chunk (fp32 248k-vocab logits: 64 seqs ~13 GB peak OOM'd next to the vLLM engine)
     "--rollout-engine", "vllm",  # v11: per-rank vLLM engine + vllm_lens steering; HF only recomputes old_logp
