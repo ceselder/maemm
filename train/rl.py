@@ -431,7 +431,7 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
             if a.reward_pos_penalty > 0:                                  # SOFT anti-smear: cos_t - lambda * (distance of t from the end)
                 proj = proj - a.reward_pos_penalty * (revcnt - 1).clamp(min=0).to(proj.dtype)   # inside the max -> no argmax-flip discontinuity
             pf = proj.masked_fill(~sel, torch.finfo(proj.dtype).min)
-            if k_stats := (a.reward_topk <= 1):
+            if a.reward_topk <= 1:
                 _pk = pf.argmax(1)                                        # where the (position-adjusted) peak sits
                 _d = (revcnt.gather(1, _pk[:, None]).squeeze(1) - 1).clamp(min=0).float()
                 SCORE_STATS.setdefault("peak_dist", []).append(torch.where(keep.any(1), _d, torch.zeros_like(_d)).cpu())
@@ -823,7 +823,7 @@ def main():
             if not (rstats["rollout/vllm_hf_logp_absdiff_mean"] <= a.vllm_logp_tol):
                 # ---- diagnose WHICH policy the engine is running before dying ----
                 prompt_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
-                conds = _hf_logp_conditions(actor, submodule, prompt_t, gen_ids, dirs_rep, marker, tok, device, a.logp_chunk)
+                conds = _hf_logp_conditions(actor, submodule, prompt_t, gen_ids, dirs.repeat_interleave(G, 0).to(device), marker, tok, device, a.logp_chunk)
                 table = {f"adapter={'on' if ad else 'off'},hook={'on' if hk else 'off'}": round(_absdiff(l, rstats["_vllm_lps"]), 4)
                          for (ad, hk), l in conds.items()}
                 # LoRA-only probe: greedy vLLM WITH the adapter, NO steering -> HF adapter-on/no-hook logps
