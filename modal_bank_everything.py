@@ -31,7 +31,7 @@ Families (train/rl.py samples rows uniformly, so equal row counts == an even mix
                 orthonormal basis of the block's decoder columns — it lives in WHITENED space); map the component back
                 through the INVERSE whitening x_b = y_b @ zca^-1 (zca is symmetric) so x_b is a genuine additive
                 component of (x - mu) in residual space; direction = unit(x_b). cos(direction, x - mu) is recorded per
-                row ("cos_x") and summarized in meta.json. <= --bsf-cap rows per block, --doc-cap rows per document.
+                row ("cos_x") and summarized in meta.json. <= --bsf-cap rows per block, --doc-cap rows per document (bsf keeps its own per-document counter).
                 EXCLUDES (a) the literal block ids of the eval's bsf family (pool_heldout bsf "block" — NB those ids
                 index the ORIGINAL Aug-21 BSF, a different training run, so this is a formality) and (b) the top-1
                 block, under THIS BSF, of every one of the 512 eval bsf directions (the meaningful exclusion).
@@ -46,7 +46,7 @@ every pool_heldout row.
 Run (MODAL_PROFILE=safety-sahan):
     modal run modal_bank_everything.py::run_smoke                 # 1k/family -> banks/everything_smoke (~10 min)
     modal deploy modal_bank_everything.py && python -c "import modal; print(modal.Function.from_name(
-        'maemm-bank-everything', 'build').spawn(n_per_family=100000, bsf_scan_seqs=20000, seed=7).object_id)"
+        'maemm-bank-everything', 'build').spawn(n_per_family=100000, bsf_scan_seqs=30000, seed=7).object_id)"
                                                                   # 100k/family -> banks/everything (~1 h, 1 GPU);
                                                                   # deploy+spawn survives the launching client
     modal run modal_bank_everything.py::run_verify                # re-verify the FINAL artifacts on the volume
@@ -127,7 +127,7 @@ BUILD_GPUS = ["H100", "A100-80GB", "L40S", "A100-40GB"]
 @app.function(image=image, gpu=BUILD_GPUS, cpu=8, memory=65536, ephemeral_disk=512 * 1024, volumes={"/data": vol},
               secrets=[modal.Secret.from_name("maemm-hf")], timeout=8 * 3600)
 def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 7, threads: int = 48,
-          chunk: int = 50_000, doc_cap: int = 8, bsf_scan_seqs: int = 20_000, bsf_cap: int = 4, bsf_ranks: int = 8,
+          chunk: int = 50_000, doc_cap: int = 8, bsf_scan_seqs: int = 30_000, bsf_cap: int = 4, bsf_ranks: int = 8,
           short_p_lo: int = 14, short_p_hi: int = 91, long_p_lo: int = 256, long_p_hi: int = 511,
           w_lo: int = 16, w_hi: int = 64, overwrite_smoke: bool = False):
     import json, os, random, shutil, time
@@ -196,7 +196,8 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     afd = os.open(f"{ACTS}/acts.f16", os.O_RDONLY)
     nrng = np.random.default_rng(seed)
     wrng = random.Random(seed)
-    per_doc = np.zeros(n_train, np.int32)            # shared document cap across realact / realact_long / bsf
+    per_doc = np.zeros(n_train, np.int32)            # document cap shared by realact + realact_long (big_bank convention)
+    per_doc_bsf = np.zeros(n_train, np.int32)        # bsf gets its OWN counter: a shared cap starved it (76k/100k in run 1)
 
     def read_act(s, p, dst):
         dst[:] = np.frombuffer(_pread_full(afd, D_MODEL * 2, ((s * T) + p) * D_MODEL * 2), np.float16)
@@ -511,27 +512,27 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
             if total >= n_per_family:
                 break
             bl = ti_flat[:, r]
-            cand = ok_flat & ~used & (block_cnt[bl] == level) & ~excl_blk[bl] & (per_doc[seq_of] < doc_cap)
+            cand = ok_flat & ~used & (block_cnt[bl] == level) & ~excl_blk[bl] & (per_doc_bsf[seq_of] < doc_cap)
             idx = np.flatnonzero(cand)
             if len(idx) == 0:
                 continue
             nrng.shuffle(idx)
             _, first = np.unique(bl[idx], return_index=True)            # one random token per block
             picks = idx[np.sort(first)]
-            # per-document cap within this pass: keep the first (doc_cap - per_doc[s]) picks of each document
+            # per-document cap (bsf's own counter) within this pass: keep the first (doc_cap - per_doc_bsf[s]) picks per document
             order = nrng.permutation(len(picks)); picks = picks[order]
             s_p = seq_of[picks]
             so = np.argsort(s_p, kind="stable"); s_sorted = s_p[so]
             starts = np.r_[0, np.flatnonzero(np.diff(s_sorted)) + 1]
             grp = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(s_sorted)]))
             within = np.arange(len(s_sorted)) - starts[grp]
-            keep = within < (doc_cap - per_doc[s_sorted])
+            keep = within < (doc_cap - per_doc_bsf[s_sorted])
             picks = picks[so[keep]]
             if total + len(picks) > n_per_family:
                 picks = picks[: n_per_family - total]
             used[picks] = True
             np.add.at(block_cnt, bl[picks], 1)
-            np.add.at(per_doc, seq_of[picks], 1)
+            np.add.at(per_doc_bsf, seq_of[picks], 1)
             sel_tok.append(picks); sel_rank.append(np.full(len(picks), r + 1, np.int8))
             total += len(picks)
             log(f"bsf select level {level + 1}/{bsf_cap} rank {r + 1}: +{len(picks)} -> {total}/{n_per_family} "
@@ -704,7 +705,8 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
                 "family_recipes": fam_stats,
                 "whitening_mu": {"realact/realact_long": f"{ACTS}/whiten_mu.npy", "bsf": f"{BSF_DIR}/whiten_mu.npy (+ whiten_zca.npy)"},
                 "norm_filter": {"mult": NORM_FILTER_MULT, "median": med, "thr": thr, "presample": NORM_PRESAMPLE},
-                "doc_cap": doc_cap, "acts_train_rows": [0, n_train - 1], "acts_held_out_rows": [n_train, NS - 1],
+                "doc_cap": {"value": doc_cap, "counters": "realact+realact_long shared; bsf separate"},
+                "acts_train_rows": [0, n_train - 1], "acts_held_out_rows": [n_train, NS - 1],
                 "exclusions_summary": {
                     "sae_features": {"n": len(excl_sae), "sources": [f"{POOL_HELDOUT}/records.jsonl family=sae 'feature' (13107)",
                                                                     f"{EVAL_CACHE} sae_feats (512, subset)",
@@ -857,7 +859,7 @@ def run_smoke(out_name: str = "banks/everything_smoke", n: int = 1000, bsf_scan_
 
 
 @app.local_entrypoint()
-def run_build(out_name: str = OUT_DEFAULT, n: int = 100_000, bsf_scan_seqs: int = 20_000, seed: int = 7):
+def run_build(out_name: str = OUT_DEFAULT, n: int = 100_000, bsf_scan_seqs: int = 30_000, seed: int = 7):
     print(build.remote(out_name=out_name, n_per_family=n, bsf_scan_seqs=bsf_scan_seqs, seed=seed))
     print(verify.remote(out_name=out_name))
 
