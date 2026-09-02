@@ -822,6 +822,7 @@ def parse_args():
     ap.add_argument("--eval-temp", type=float, default=1.0)
     ap.add_argument("--eval-max-new", type=int, default=64)
     ap.add_argument("--eval-min-new", type=int, default=16)
+    ap.add_argument("--no-extra-evals", action="store_true", help="skip the autointerp/locality/WildChat/adversarial inline evals")
     ap.add_argument("--eval-n-per-family", type=int, default=0,
                     help="inline eval: use only the first N directions of each family (0 = the whole cache). "
                          "512/family x 12 families x Bo4 took ~25 min per ckpt on 4 ranks; 128 -> ~6 min")
@@ -961,6 +962,17 @@ def main():
     use_gates = a.fluency_floor is not None or a.distinct_floor is not None
     # ---- inline eval assets (held-out sets + SAE) — after the engine, so a load failure just disables eval ----
     EV = load_eval_assets(a, device, is_main) if (a.inline_eval_every > 0 and a.rollout_engine == "vllm") else None
+    # ---- extra inline evals (autointerp AUC, snippet locality, WildChat fire-prediction, adversarial confirmation):
+    # GPU stage every eval period on all ranks, LLM-judge stage in a background thread on rank 0 ----
+    EX, IX = None, None
+    if EV is not None and not a.no_extra_evals:
+        try:
+            import inline_extra_evals as IX
+            EX = IX.prepare_extra_eval_assets(a, device, rank, world, is_main, sae=EV["sae"])
+        except Exception as e:  # noqa
+            EX, IX = None, None
+            if is_main:
+                print(f"[extra-eval] DISABLED ({type(e).__name__}: {e})", flush=True)
     if is_main:
         print(f"[rl] {n_vecs} directions (eval-reserved rows [0,{eval_rows})) | prompt {p_len} toks, "
               f"marker @{marker} | world {world} | adv {adv_mode} | gates {use_gates} | engine {a.rollout_engine}", flush=True)
@@ -969,6 +981,7 @@ def main():
                        id=a.wandb_id or None, resume="must" if a.wandb_id else None)
             wandb.define_metric("ckpt_step")
             wandb.define_metric("eval/*", step_metric="ckpt_step")
+            wandb.define_metric("extra/*", step_metric="ckpt_step")
         os.makedirs(a.save_dir, exist_ok=True)
     for _ in range(a.step_offset if a.direction_source == "cluster" else 0):
         rng.choice(n_vecs - eval_rows, size=B, replace=False)   # fast-forward the direction rng on resume
@@ -1031,6 +1044,22 @@ def main():
                           f"{ev.get('eval/realact/cos', float('nan')):.4f} | {ev['time/inline_eval_s']:.0f}s", flush=True)
                     if not a.no_wandb:
                         wandb.log({**ev, "ckpt_step": step - 1}, step=step - 1)
+        if EX is not None and step > a.step_offset and (step - 1) % a.inline_eval_every == 0:
+            ex = IX.run_extra_evals_gpu(llm, actor, submodule, tok, prompt_ids, marker, a, device, step - 1, step, rank, world, EX,
+                                        _steer_vec, _marker_norm, _eos_ids(tok, actor), _trim_at_stop)
+            if is_main:
+                if "error" in ex:
+                    print(f"  [extra-eval] FAILED for ckpt {step - 1}: {ex['error']}", flush=True)
+                else:
+                    print(f"  [extra-eval] ckpt {step - 1}: locality win5 {ex.get('extra/locality/win5_share', float('nan')):.3f} "
+                          f"fire {ex.get('extra/locality/fire_frac', float('nan')):.3f} peak_pos {ex.get('extra/locality/peak_pos_median', float('nan')):.2f} "
+                          f"| {ex.get('time/extra_eval_gpu_s', float('nan')):.0f}s -> judge stage launched", flush=True)
+                    if not a.no_wandb:
+                        wandb.log({**ex, "ckpt_step": step - 1}, step=step - 1)
+                    try:
+                        IX.launch_judge_stage(None, step - 1, EX, a)
+                    except Exception as e:  # noqa
+                        print(f"  [extra-eval] judge launch failed: {type(e).__name__}: {e}", flush=True)
         dirs_rep = dirs.repeat_interleave(G, 0).to(device)             # [Bl*G, d]
 
         # ---- reward + shaping ----
@@ -1149,6 +1178,12 @@ def main():
                 print(f"  sample r={raw_r[0]:.2f}: {texts[0][:110]!r}", flush=True)
             if not a.no_wandb:
                 wandb.log(log, step=step)
+            if IX is not None and EX is not None:
+                for cs, m in IX.poll_judge_results():          # judge results arrive minutes later; x-axis = ckpt_step
+                    print(f"  [extra-eval] judge results for ckpt {cs}: " + " ".join(
+                        f"{k.split('/')[-1]}={v:.3f}" for k, v in m.items() if k.startswith("extra/") and "auc" in k), flush=True)
+                    if not a.no_wandb:
+                        wandb.log({**m, "ckpt_step": cs}, step=step)
             if a.save_every and step and step % a.save_every == 0:
                 actor.save_pretrained(f"{a.save_dir}/step_{step}")
                 torch.save(opt.state_dict(), f"{a.save_dir}/step_{step}/optim.pt")   # keep newest two
@@ -1159,6 +1194,11 @@ def main():
         actor.save_pretrained(f"{a.save_dir}/final")
         if a.save_every:
             torch.save(opt.state_dict(), f"{a.save_dir}/final/optim.pt")
+        if IX is not None and EX is not None:
+            IX.wait_for_judge_stages(900)
+            for cs, m in IX.poll_judge_results():
+                if not a.no_wandb:
+                    wandb.log({**m, "ckpt_step": cs}, step=a.total_steps)
         print("RL_DONE", flush=True)
     if world > 1:
         dist.barrier()

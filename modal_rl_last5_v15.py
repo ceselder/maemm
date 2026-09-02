@@ -81,6 +81,9 @@ image = (
     .add_local_file(REPO / "train" / "rl.py", "/pmx/RL/rl_hf.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
     .add_local_file(REPO / "MAEMMBench" / "eval_universal.py", "/pmx/eval/eval_universal.py")   # inline eval scoring
+    .add_local_file(REPO / "train" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")   # autointerp/locality/WildChat/adversarial inline
+    .add_local_file(REPO / "MAEMMBench" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
+    .add_local_file(REPO / "eval" / "autointerp_detection.py", "/pmx/eval/autointerp_detection.py")
 )
 
 vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
@@ -146,6 +149,7 @@ TRAIN_ARGS = [
     secrets=[
         modal.Secret.from_name("maemm-hf"),
         modal.Secret.from_name("maemm-wandb"),
+        modal.Secret.from_name("maemm-openrouter"),   # judge key for the inline extra evals (Anthropic keys blocked: workspace id)
     ],
     timeout=86400,
 )
