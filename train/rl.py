@@ -505,6 +505,10 @@ def update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_re
     n = ids.shape[0]
     gen_mask = attn[:, p_len:].bool()
     total_tok = max(int(gen_mask.sum()), 1)
+    if a.loss_agg == "seq":   # each rollout weighs 1/n regardless of its length (GRPO / EasyNLA)
+        w_all = gen_mask.float() / gen_mask.sum(1, keepdim=True).clamp(min=1).float() / n
+    else:                     # every completion token weighs 1/total_tok (DAPO-style token-mean)
+        w_all = gen_mask.float() / total_tok
     lo, hi = 1 - a.clip_eps, 1 + a.clip_eps
     loss_sum, clipped_tok, ent_sum, kl_sum, ratio_sum = 0.0, 0, 0.0, 0.0, 0.0
     # ---- KL reference logps: ONE no-grad pass over the whole batch at a large micro-batch (2 PEFT
@@ -539,18 +543,19 @@ def update(actor, opt, submodule, ids, attn, p_len, marker, old_lp, adv, dirs_re
         del logits
         new_lp = logp_full.gather(-1, b_ids[:, p_len:, None]).squeeze(-1)
         m = gen_mask[s:e].to(device)
+        w = w_all[s:e].to(device)
         ratio = torch.exp(new_lp - old_lp[s:e].to(device)).clamp(max=a.tis_cap)
         A = adv[s:e, None].to(device)
-        loss = (-torch.minimum(ratio * A, ratio.clamp(lo, hi) * A) * m).sum() / total_tok
+        loss = (-torch.minimum(ratio * A, ratio.clamp(lo, hi) * A) * w).sum()
         ent = -(logp_full.exp() * logp_full).sum(-1)                    # per-token entropy (logged always)
         ent_sum += float((ent.detach() * m).sum())
         if a.entropy_coef > 0:
-            loss = loss - a.entropy_coef * (ent * m).sum() / total_tok
+            loss = loss - a.entropy_coef * (ent * w).sum()
         if a.kl_coef > 0:  # capped KL-to-init: ref logps (precomputed above) from the FROZEN init adapter
             ref_lp = ref_lp_all[s:e].to(device)
             delta = ref_lp - new_lp                                    # log(pi_ref / pi)
             kl = (torch.exp(delta) - delta - 1).clamp(0.0, a.kl_cap)   # k3 estimator, capped per token
-            loss = loss + a.kl_coef * (kl * m).sum() / total_tok
+            loss = loss + a.kl_coef * (kl * w).sum()
             kl_sum += float((kl.detach() * m).sum())
         del logp_full
         loss.backward()                              # micro-losses share the global normalizer
@@ -637,6 +642,15 @@ def parse_args():
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--clip-eps", type=float, default=cfg.clip_eps)
     ap.add_argument("--tis-cap", type=float, default=cfg.tis_cap, help="upper cap on the importance ratio")
+    ap.add_argument("--adv-mode", choices=["none", "group", "batch"], default=None,
+                    help="explicit advantage mode; overrides --std-norm/--batch-norm (sweep-arm override)")
+    ap.add_argument("--loss-agg", choices=["token", "seq"], default="token",
+                    help="token: sum over all completion tokens / total tokens (DAPO-style, long rollouts weigh more); "
+                         "seq: per-rollout mean over its tokens, then mean over rollouts (GRPO / EasyNLA)")
+    ap.add_argument("--trunc-reward", type=float, default=None,
+                    help="fixed shaped reward for rollouts that hit --max-new-tokens without EOS (EasyNLA: -2); "
+                         "they stay in the group baseline and train")
+    ap.add_argument("--adam-betas", type=float, nargs=2, default=(0.9, 0.999), metavar=("B1", "B2"))
     ap.add_argument("--std-norm", action="store_true", help="advantage / per-group std (standard GRPO)")
     ap.add_argument("--batch-norm", action="store_true",
                     help="advantage / ONE global-batch std, zero-variance groups dropped (ScaleRL)")
@@ -714,7 +728,7 @@ def main():
             target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
     actor.train()
     opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr,
-                            weight_decay=0.0, eps=a.adam_eps)
+                            weight_decay=0.0, eps=a.adam_eps, betas=tuple(a.adam_betas))
     optim_p = os.path.join(a.init_adapter or "", "optim.pt")
     if a.init_adapter and os.path.exists(optim_p):                  # resume AdamW moments (same param order)
         opt.load_state_dict(torch.load(optim_p, map_location="cpu"))
@@ -763,7 +777,7 @@ def main():
                     tgt_map[vi] = (rec.get("family"), rec["target_text"][:240])
         print(f"[transcripts] {len(tgt_map)} target spans loaded; logging {a.transcript_groups}x{a.transcript_samples} rollouts every {a.transcript_every} steps", flush=True)
 
-    adv_mode = "batch" if a.batch_norm else ("group" if a.std_norm else "none")
+    adv_mode = a.adv_mode or ("batch" if a.batch_norm else ("group" if a.std_norm else "none"))
     use_gates = a.fluency_floor is not None or a.distinct_floor is not None
     if is_main:
         print(f"[rl] {n_vecs} directions (eval-reserved rows [0,{eval_rows})) | prompt {p_len} toks, "
@@ -828,6 +842,11 @@ def main():
         else:
             r = score(texts, dirs_rep, actor, tok, device, a)
         r = r * a.reward_scale
+        eos_set = set(_eos_ids(tok))
+        trunc = torch.tensor([len(g) >= a.max_new_tokens and (not g or g[-1] not in eos_set) for g in gen_ids])
+        trunc_frac = trunc.float().mean().item()
+        if a.trunc_reward is not None and bool(trunc.any()):   # EasyNLA: cap-hit rollouts score a fixed failure reward and still train
+            r[trunc] = a.trunc_reward
         raw_r, gate_frac = r.clone(), 1.0
         gate = torch.ones(Bl * G, dtype=torch.bool)
         if use_gates:
@@ -901,6 +920,7 @@ def main():
                "rollout/len_mean": n_gen / (B * G), "tokens_per_sec": n_gen / secs,
                "time/rollout_s": t_roll, "time/step_s": secs,
                "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, **rstats}
+        log["reward/trunc_frac"] = trunc_frac
         if _table is not None:
             log["rollouts/samples"] = _table
         if is_main:
