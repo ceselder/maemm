@@ -551,11 +551,14 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
         rows, texts = gen(du)
         if rows:
             fl = [feats[i] for i in rows for _ in range(bo)]
-            acts, _ = EU.score_sae_peaks(texts, fl, sae, actor, tok, device)
-            acts = acts.view(len(rows), bo).max(1).values
-            local["sae"] = {int(i): float(v) for i, v in zip(rows, acts.tolist())}
+            acts, peaks = EU.score_sae_peaks(texts, fl, sae, actor, tok, device)      # acts [n*bo], peaks [n*bo, d]
+            acts = acts.view(len(rows), bo)
+            best, arg = acts.max(1)
+            pk = peaks.view(len(rows), bo, -1)[torch.arange(len(rows)), arg]          # peak hidden of the best sample
+            local["sae"] = {int(i): float(v) for i, v in zip(rows, best.tolist())}
+            local["sae_peak"] = {int(i): pk[j].half().numpy().tobytes() for j, i in enumerate(rows)}   # fp16 bytes (≈10 KB/row)
         else:
-            local["sae"] = {}
+            local["sae"], local["sae_peak"] = {}, {}
     except Exception as e:  # noqa
         local = {"error": f"rank{rank}: {type(e).__name__}: {str(e)[:300]}"}
     gathered = [None] * world
@@ -581,6 +584,13 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
     cp = EV["cp"][idx]
     na = best / np.maximum(cp, 1e-6)
     out["eval/sae/norm_act"] = float(na.mean())
+    if merged.get("sae_peak"):   # full-SAE rank of the target feature at its best sample's peak token (the ARB "rank-1 fraction")
+        peak_h = torch.from_numpy(np.stack([np.frombuffer(merged["sae_peak"][i], dtype=np.float16) for i in idx]).astype(np.float32))
+        ranks = EU.sae_rank_at_peaks(sae, peak_h, [EV["feats"][i] for i in idx]).astype(np.float64)
+        out["eval/sae/rank1_frac"] = float(np.mean(ranks == 1))
+        out["eval/sae/rank_le5"] = float(np.mean(ranks <= 5))
+        out["eval/sae/mean_rank"] = float(ranks.mean())
+        out["eval/sae/mrr"] = float(np.mean(1.0 / ranks))
     out["eval/sae/fired"] = float(np.mean(best > EU.SAE_FIRE))
     out["eval/sae/beat_corpus"] = float(np.mean(best > cp))
     out["eval/sae/unverbalized_frac"] = float(np.mean(best <= EU.SAE_FIRE))
