@@ -39,6 +39,9 @@ import modal
 REPO = Path(__file__).parent
 
 app = modal.App("maemm-rl-last5-v15")
+# GPUs per arm: Modal has only handed us ~8 B200 at a time today; two 8-GPU arms never scheduled together.
+# RL_NGPU=4 at deploy time -> each arm on 4xB200 (groups/rank doubles, ~2x step time, both arms run in parallel).
+N_GPU = int(os.environ.get("RL_NGPU", "8"))
 
 # torch 2.10.0+cu128 == the box venv; cu128 wheels carry sm_100 (B200) kernels.
 image = (
@@ -124,7 +127,7 @@ TRAIN_ARGS = [
 
 @app.function(
     image=image,
-    gpu="B200:8",
+    gpu=f"B200:{N_GPU}",
     volumes={"/data": vol},
     secrets=[
         modal.Secret.from_name("maemm-hf"),
@@ -243,7 +246,7 @@ def train(backend: str = "gloo", total_steps: int = 400,
         args += extra_args.split()
 
     cmd = [
-        "torchrun", "--nproc_per_node=8", "--master_port=29531", "RL/rl_hf.py",
+        "torchrun", f"--nproc_per_node={N_GPU}", "--master_port=29531", "RL/rl_hf.py",
         "--data-dir", local_pool,
         "--total-steps", str(total_steps),
     ] + args
