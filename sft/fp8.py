@@ -35,6 +35,21 @@ Inductor fuses them into the GEMM prologue) and with torch.autocast(bf16) (input
 Float8Linear does). Not touched: LoRA A/B (bf16/fp32 as before), the loss (fp32 logits upcast in HF), attention kernels.
 
 Usage (pretrain.py): `--fp8-base` -> convert_frozen_base_to_fp8(model) right after PEFT wrapping, before compile/DDP.
+
+Measured 2026-09-03, 1x B200, torch 2.10.0+cu128, torchao 0.16.0, Qwen3.6-27B + r64 LoRA, batch 16 x <=192 tokens,
+--compile --grad-ckpt 0 --autocast-bf16 (sft/fp8_eval.py, sft/fp8_microbench.py; JSONs on the maemm-data volume under
+/data/sft_mix/_fp8_eval/):
+  * raw GEMMs at M=3072: bf16 1.2-1.6 PFLOP/s; fp8 tensorwise 2.2-3.0 (2.0x); fp8 rowwise 2.2-2.6 (1.7x). fast_accum: no-op.
+  * whole step, both phases fully compiled (use_cache=False): bf16 434 ms -> fp8 rowwise 396 ms (-9%) at batch 16;
+    828 -> 725 ms (-12%) at batch 32; 300 training steps: median 469 -> 424 ms (-10%). Memory identical (+1.8 GB scales).
+    tensorwise was a wash in the same harness (-2% / +5%) despite -16% in an isolated synthetic profile -- unexplained.
+  * fidelity, identical weights, 1664 target tokens: KL(bf16||fp8) mean 0.013 (init) / 0.006 (trained LoRA), p99 0.10 /
+    0.04, max 1.4 / 0.4; top-1 agreement 93.6% / 95.7% (bf16 run-to-run floor: KL 1e-5..1e-4, top-1 99.7-100%).
+    tensorwise: 0.011 / 0.005, top-1 93.9% / 96.5%. Target-token NLL unchanged to 3 decimals.
+  * 300 steps from one seeded init, same batches: loss over the last 100 steps 2.7957 (bf16) vs 2.7972 (rowwise) vs
+    2.7948/2.7945 (tensorwise vs its bf16) -- gaps <= 0.0015, step-to-step loss noise 0.27.
+  * pretrain.py smoke as-is (cache built, no use_cache=False): bf16 684 TFLOP/s by mxf.mfu's meter -> --fp8-base 898 (+31%);
+    most of that is the recompile-limit fix, which bf16 also gets from use_cache=False (545 -> 461 ms/step, -12 GB).
 """
 import os
 
