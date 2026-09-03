@@ -87,8 +87,7 @@ TRAIN_ARGS = [
     "--score-batch", "128",
     "--ref-micro-batch", "32",
     "--vllm-gpu-mem", "0.85",
-    "--inline-eval-every", "10",   # held-out eval suite per saved ckpt: rollout ranks generate in their idle slots, trainer ranks score sharded
-    "--eval-n-per-family", "128",  # = v15 (512/family costs 4x the generation)
+    "--inline-eval-every", "0",    # in-trainer eval OFF (user, Sep 3): checkpoints are evaluated by the separate 1-GPU daemon modal_eval_ckpt.py
     "--save-every", "10",
     "--save-dir", CKPT_DIR,
     "--run-name", "rl_everything_8x128_disagg_dev",
