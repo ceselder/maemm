@@ -5,7 +5,7 @@ The trainer lives at train/pretrain.py in this repo; it is mounted into the cont
 PYTHONPATH=/pmx/helpers. Same image/volume as modal_rl.py (no vllm — pretrain is pure HF).
 Data lives on the `maemm-data` Volume:
     /data/<bank>            SFT bank: records.jsonl ({"vec_idx", "target_text"} per line)
-                            + vecs.f32 (N x 5120 f32 memmap, N >= max(vec_idx)+1)
+                            + vecs.f32 or vecs.f16 (N x 5120 f32/f16 memmap, N >= max(vec_idx)+1)
     /data/hf_cache          HF_HOME (Qwen/Qwen3.6-27B downloads once, persists)
     /data/sft_mix/<run>/    output: run_meta.json + heartbeat + step_* ckpts + final
 
@@ -75,6 +75,19 @@ STALE_HEARTBEAT_S = 30 * 60   # live legs touch+commit the heartbeat every <=5 m
 SPAWN_COOLDOWN_S = 3600       # never double-spawn while a fresh leg pulls image/model (~15-30 min)
 
 
+VEC_BANK_FILES = (("vecs.f32", 4), ("vecs.f16", 2))   # (filename, bytes per element); same as pretrain.py
+
+
+def _vec_bank_file(data_dir: str):
+    """(filename, itemsize) of the vector bank in data_dir -- vecs.f32 preferred, else vecs.f16."""
+    import os
+
+    for fname, itemsize in VEC_BANK_FILES:
+        if os.path.exists(f"{data_dir}/{fname}"):
+            return fname, itemsize
+    raise AssertionError(f"bank incomplete: neither vecs.f32 nor vecs.f16 in {data_dir}")
+
+
 def _preflight(run_name: str, data_dir: str, n_ckpts: int, resume_from: str):
     """Shared guardrails + bank staging for train/smoke. Returns (save_dir, local_bank, d_model)."""
     import glob
@@ -119,13 +132,14 @@ def _preflight(run_name: str, data_dir: str, n_ckpts: int, resume_from: str):
     # ---- bank schema guard, then stage onto container-local NVMe: memmap over the volume FUSE
     # mount is the one thing we don't trust, and per-batch random row reads are faster locally. ----
     assert os.path.isdir(data_dir), f"bank not found on volume: {data_dir}"
-    for fname in ("records.jsonl", "vecs.f32"):
-        assert os.path.exists(f"{data_dir}/{fname}"), f"bank incomplete: {data_dir}/{fname} missing"
+    assert os.path.exists(f"{data_dir}/records.jsonl"), f"bank incomplete: {data_dir}/records.jsonl missing"
+    vec_file, itemsize = _vec_bank_file(data_dir)   # vecs.f32 or vecs.f16 (pretrain.py reads either)
     rec0 = json.loads(open(f"{data_dir}/records.jsonl").readline())
     assert "vec_idx" in rec0 and "target_text" in rec0, f"records.jsonl schema: got {sorted(rec0)}"
-    vsize = os.path.getsize(f"{data_dir}/vecs.f32")
-    assert vsize % (D_MODEL * 4) == 0, f"vecs.f32 = {vsize} B, not a multiple of one {D_MODEL}-f32 row"
-    print(f"[modal] bank OK: {vsize // (D_MODEL * 4)} vecs x {D_MODEL} f32 + records.jsonl", flush=True)
+    vsize = os.path.getsize(f"{data_dir}/{vec_file}")
+    assert vsize % (D_MODEL * itemsize) == 0, \
+        f"{vec_file} = {vsize} B, not a multiple of one {D_MODEL}-x-{itemsize}B row"
+    print(f"[modal] bank OK: {vsize // (D_MODEL * itemsize)} vecs x {D_MODEL} ({vec_file}) + records.jsonl", flush=True)
 
     t0 = time.time()
     local_bank = f"/root/bank_{os.path.basename(data_dir.rstrip('/'))}"
@@ -277,14 +291,16 @@ def train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
 )
 def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: str = ""):
     """1xB200 pipeline validation: pre-warms /data/hf_cache, carves a tiny bank (first n_records
-    of records.jsonl + the full vecs.f32) and runs world=1 SFT over it (no wandb, ckpts to /tmp,
-    including the --n-ckpts intermediate-save path)."""
+    of records.jsonl + the full vecs.f32 / vecs.f16) and runs world=1 SFT over it (no wandb, ckpts
+    to /tmp, including the --n-ckpts intermediate-save path). extra_args reach pretrain.py verbatim,
+    e.g. "--compile --grad-ckpt 0 --autocast-bf16 --head-on-labels --parity-check --log-steps 10"."""
     import os
     import shutil
 
     if not data_dir.startswith("/"):
         data_dir = f"/data/{data_dir}"
     _, local_bank, _ = _preflight("smoke", data_dir, n_ckpts=2, resume_from="")
+    vec_file, _ = _vec_bank_file(local_bank)
 
     tiny = "/root/bank_smoke"
     if not os.path.exists(tiny):
@@ -294,7 +310,7 @@ def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: 
                 if i >= n_records:
                     break
                 fout.write(line)
-        shutil.copy(f"{local_bank}/vecs.f32", f"{tiny}/vecs.f32")
+        shutil.copy(f"{local_bank}/{vec_file}", f"{tiny}/{vec_file}")
     print(f"[modal-smoke] tiny bank: first {n_records} records", flush=True)
 
     cmd = [
