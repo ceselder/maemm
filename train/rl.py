@@ -558,6 +558,9 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
         rows, texts = gen(du)
         if rows:
             fl = [feats[i] for i in rows for _ in range(bo)]
+            rd = F.normalize(torch.stack([du[i] for i in rows for _ in range(bo)]).float(), dim=-1)
+            sc = EU.score_probe_cos(texts, rd, actor, tok, device).view(len(rows), bo).max(1).values   # cosine view of the SAE family
+            local["sae_cos"] = {int(i): float(c) for i, c in zip(rows, sc.tolist())}
             acts, peaks = EU.score_sae_peaks(texts, fl, sae, actor, tok, device)      # acts [n*bo], peaks [n*bo, d]
             acts = acts.view(len(rows), bo)
             best, arg = acts.max(1)
@@ -591,6 +594,8 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
     cp = EV["cp"][idx]
     na = best / np.maximum(cp, 1e-6)
     out["eval/sae/norm_act"] = float(na.mean())
+    if merged.get("sae_cos"):
+        out["eval/sae/cos"] = float(np.mean([merged["sae_cos"][i] for i in sorted(merged["sae_cos"])]))   # best-of-bo max-token cosine to the unit encoder column
     if merged.get("sae_peak"):   # full-SAE rank of the target feature at its best sample's peak token (the ARB "rank-1 fraction")
         peak_h = torch.from_numpy(np.stack([np.frombuffer(merged["sae_peak"][i], dtype=np.float16) for i in idx]).astype(np.float32))
         ranks = EU.sae_rank_at_peaks(sae, peak_h, [EV["feats"][i] for i in idx]).astype(np.float64)
