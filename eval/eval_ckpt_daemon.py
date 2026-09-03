@@ -66,6 +66,8 @@ def parse_args(argv=None):
                     help="prefill token budget per engine step; 512 x 207 = 106k made the profiling run leave only 11 GB of KV (238 concurrent seqs). "
                          "24k still prefills ~115 whole prompts per step; a prompt is only chunked when the budget is exhausted mid-prompt (rare at 512 seqs)")
     ap.add_argument("--no-cuda-graphs", action="store_true")
+    ap.add_argument("--gdn-prefill-backend", choices=("triton", "flashinfer", "auto"), default="triton",
+                    help="vLLM GDN prefill kernel (see rl_disagg): 'triton' runs on H200 and B200 alike; vLLM's 'auto' would JIT flashinfer on sm90 (needs nvcc)")
     ap.add_argument("--stock-lens-hook", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)

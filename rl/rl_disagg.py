@@ -188,6 +188,11 @@ def parse_args(argv=None):
     ap.add_argument("--rollout-block-groups", type=int, default=0,
                     help="directions per rollout block (per generate call); 0 = groups_per_step / n_rollout")
     ap.add_argument("--max-num-seqs", type=int, default=0, help="vLLM max_num_seqs; 0 = block_groups*group_size")
+    ap.add_argument("--gdn-prefill-backend", choices=("triton", "flashinfer", "auto"), default="triton",
+                    help="vLLM GatedDeltaNet PREFILL kernel. vLLM 0.19's 'auto' picks flashinfer's gdn_prefill on sm90 (H100/H200) -- a "
+                         "JIT-compiled CUDA extension that needs nvcc/CUDA_HOME, absent from our image (EngineDeadError on 4xH200) -- and the "
+                         "vendored fla Triton kernel everywhere else (what every B200 measurement ran). 'triton' = the Triton kernel on all "
+                         "archs (default); 'auto' = vLLM's choice; 'flashinfer' = force the JIT kernel (needs nvcc in the image).")
     ap.add_argument("--cuda-graphs", action="store_true",
                     help="vLLM FULL_DECODE_ONLY cudagraphs (compilation mode NONE) instead of the plugin-forced eager")
     ap.add_argument("--stock-lens-hook", action="store_true", help="use vllm_lens' stock O(reqs x keys x layers) hook (for A/B timing)")
@@ -690,6 +695,9 @@ def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
                   # unless overridden (the eval daemon uses a smaller budget so the profiling run leaves KV memory for concurrency)
                   max_num_batched_tokens=int(getattr(a, "max_num_batched_tokens", 0) or 0) or max(8192, int(max_seqs) * max_len),
                   seed=a.seed * 1000 + 500 + rank, dtype="bfloat16")
+        gdn = str(getattr(a, "gdn_prefill_backend", "triton") or "triton").lower()
+        if gdn != "auto":   # EngineArgs.gdn_prefill_backend -> additional_config["gdn_prefill_backend"] -> ChunkGatedDeltaRule (sm90: flashinfer JIT unless 'triton')
+            kw["gdn_prefill_backend"] = gdn
         if use_graphs:
             kw["enforce_eager"] = False
             kw["compilation_config"] = {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY",
@@ -700,7 +708,7 @@ def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
         llm = LLM(**kw)
         llm.collective_rpc("install_hooks")
         _log(tag, f"engine up in {time.time() - t0:.0f}s | graphs={use_graphs} max_num_seqs={max_seqs} "
-                  f"mem={a.vllm_gpu_mem} ext={'stock' if a.stock_lens_hook else 'fast'}")
+                  f"mem={a.vllm_gpu_mem} ext={'stock' if a.stock_lens_hook else 'fast'} gdn_prefill={gdn}")
         return llm
     finally:
         os.environ.update(hidden)
