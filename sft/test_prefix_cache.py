@@ -98,11 +98,19 @@ def _env_report():
     from transformers import cache_utils
     fork = hasattr(cache_utils, "_write_cached_state") and hasattr(cache_utils.LinearAttentionLayer, "batch_repeat_interleave")
     import triton
-    rep = {"gpu": torch.cuda.get_device_name(0), "torch": torch.__version__, "transformers": transformers.__version__,
-           "transformers_fork": fork, "peft": peft.__version__, "fla": fla_v, "triton": triton.__version__,
+    # str(): torch.__version__ is a TorchVersion str-subclass, which the torch-less local client cannot unpickle
+    rep = {"gpu": str(torch.cuda.get_device_name(0)), "torch": str(torch.__version__), "transformers": str(transformers.__version__),
+           "transformers_fork": bool(fork), "peft": str(peft.__version__), "fla": str(fla_v), "triton": str(triton.__version__),
            "tf_spec": TF_SPEC}
     print("[env]", json.dumps(rep), flush=True)
     return rep
+
+
+def _plain(results):
+    """Round-trip through JSON so the return value holds only builtins (the local client has no torch)."""
+    out = json.loads(json.dumps(results, default=str))
+    print("RESULTS_JSON " + json.dumps(out), flush=True)   # log fallback if the client-side deserialization fails
+    return out
 
 
 def _random_batch(gen, B, d_model, vocab, min_tgt, max_tgt, eos):
@@ -270,7 +278,7 @@ def equiv_remote(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt:
         print(f"[{tag}] logits control(half-batches)-vs-naive: {json.dumps({k: round(v, 6) for k, v in r['control_logits'].items()})}")
         print(f"[{tag}] grads   cached-vs-naive: {json.dumps({k: round(v, 6) for k, v in r['grads'].items()})}")
         print(f"[{tag}] grads   control-vs-naive: {json.dumps({k: round(v, 6) for k, v in r['control_grads'].items()})}", flush=True)
-    return results
+    return _plain(results)
 
 
 @app.local_entrypoint()
@@ -389,7 +397,7 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
     if compile_:
         for B in (16, 64):
             fn, cl = make_cached(B, True); run_case("cached_compile", B, fn, cl)
-    return results
+    return _plain(results)
 
 
 @app.local_entrypoint()
