@@ -1,8 +1,8 @@
 """Checkpoint eval daemon (ONE GPU): the FULL held-out protocol of rl.py's inline_eval (every family, 512/family,
-Bo4, T=1, 16-64 new tokens, SAE norm_act + full-SAE rank metric) PLUS the extra evals of train/inline_extra_evals.py
+Bo4, T=1, 16-64 new tokens, SAE norm_act + full-SAE rank metric) PLUS the extra evals of eval/inline_extra_evals.py
 (snippet locality on the 64 testbed features, autointerp detection AUC random / emb-NN, WildChat fire-prediction AUC,
 adversarial confirmation; Sonnet 5 judge via Anthropic native, OpenRouter fallback) for every checkpoint an RL run
-saves -- decoupled from the trainer (train/rl_disagg.py runs with --inline-eval-every 0).
+saves -- decoupled from the trainer (rl/rl_disagg.py runs with --inline-eval-every 0).
 
 How it is the SAME eval. rl.py's `inline_eval` and inline_extra_evals' `run_extra_evals_gpu` are called as-is:
 they take (llm, actor, ...) and read the LoRA from /tmp/rl_lora/rank0/step<k>, which is where this daemon publishes
@@ -13,7 +13,7 @@ Scoring: the CLEAN HF base (adapter disabled) via eval_universal.score_probe_cos
 exactly as inside the trainer. Memory: HF base bf16 54 GB + adapter + SAE encoder (~60 GB) and the engine at
 --vllm-gpu-mem 0.5 of the card (89 GB on a 178 GB B200, 70 GB on a 141 GB H200; prefill budget 24k tokens keeps KV headroom).
 
-Loop (MAEMMBench/modal_eval_last5.py conventions): vol.reload -> newest un-evaled <ckpt_dir>/step_* (+ final as
+Loop (eval/modal_eval_last5.py conventions): vol.reload -> newest un-evaled <ckpt_dir>/step_* (+ final as
 --final-step) first -> load the adapter -> publish to vLLM layout -> inline_eval + run_extra_evals_gpu -> wandb.log
 ({..., "ckpt_step": k}, commit=True; define_metric makes ckpt_step the x-axis, so backfill lands out of order) ->
 judge stage in the background (results polled and logged under their ckpt_step) -> state file on the volume.

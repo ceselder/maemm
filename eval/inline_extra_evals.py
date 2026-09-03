@@ -1,4 +1,4 @@
-"""Inline EXTRA evals for train/rl.py — a standalone module (rl.py is untouched; the trainer wires
+"""Inline EXTRA evals for rl/rl.py — a standalone module (rl.py is untouched; the trainer wires
 these three calls in next to `inline_eval`). Everything a held-out checkpoint used to need an
 offline eval script for now runs INSIDE the trainer, per checkpoint:
 
@@ -10,7 +10,7 @@ offline eval script for now runs INSIDE the trainer, per checkpoint:
         mirrors inline_eval; features sharded i % world == rank.
       * snippet-locality metrics on the CLEAN base: per-token SAE-feature activation profile of
         every rollout on the shared read path (BOS sink prepended + skipped, right-pad masked,
-        10x-median norm filter, ReLU encode of the target feature) -> MAEMMBench/snippet_locality
+        10x-median norm filter, ReLU encode of the target feature) -> eval/snippet_locality
         .profile_metrics (win3/win5 share, peak share, Gini, tokens >= 50% peak) + peak position.
       * clean-base SAE scoring of the adversarial texts the judge wrote for the PREVIOUS
         checkpoint (rank 0 broadcasts them, every rank scores its shard, results are gathered and
@@ -52,7 +52,7 @@ ENV KNOBS (all optional):
   autointerp,wildchat,adversarial to switch judge sub-evals off)
 
 Smoke (no GPU; fakes the rollouts with the testbed's stored samples, runs the judge stage live):
-    OPENROUTER_API_KEY=... python train/inline_extra_evals.py --testbed eval/out/testbed_v2.json \
+    OPENROUTER_API_KEY=... python eval/inline_extra_evals.py --testbed eval/out/testbed_v2.json \
         --wildchat /path/windows.json --n-features 2 --n-tests 2
 """
 import json
@@ -70,10 +70,10 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-# ---- eval modules: repo layout (train/../MAEMMBench, train/../eval) or the Modal layout
+# ---- eval modules: repo layout (eval/ siblings) or the Modal layout
 # (/pmx/eval, /pmx/MAEMMBench). Appended, so the trainer's own sys.path entries win. ----
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.join(_HERE, ".."), os.path.join(_HERE, "..", "MAEMMBench"), os.path.join(_HERE, "..", "eval"),
+for _p in (_HERE, os.path.join(_HERE, ".."),
            "/pmx/eval", "/pmx/MAEMMBench", "/pmx/helpers"):
     _p = os.path.abspath(_p)
     if os.path.isdir(_p) and _p not in sys.path:
@@ -590,7 +590,7 @@ def prepare_extra_eval_assets(a, device, rank, world, is_main, sae=None):
     assets, err = None, None
     try:
         if _IMPORT_ERR is not None:
-            raise ImportError(f"eval modules not importable ({_IMPORT_ERR}); mount MAEMMBench/snippet_locality.py and "
+            raise ImportError(f"eval modules not importable ({_IMPORT_ERR}); mount eval/snippet_locality.py and "
                               "eval/autointerp_detection.py on sys.path (e.g. /pmx/eval)")
         tb_path = os.environ.get("EXTRA_EVAL_TESTBED") or getattr(a, "extra_testbed", None) or DEFAULT_TESTBED
         tb = _load_json(tb_path)

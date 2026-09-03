@@ -1,41 +1,36 @@
-"""Modal eval daemon for the LAST-5 RL run (app maemm-rl-last5-8xb200, wandb or0215ub).
-
-Variant of MAEMMBench/modal_eval.py (the paper-run daemon) with only the run-specific knobs
-changed: watches /data/ckpts_last5 (--total-steps 400 --save-every 25 -> step_25..step_400 +
-final), logs to project `maxact-fast` as run `last5_rp_rl_eval`. A SEPARATE wandb run — NOT a
-resume of the RL run or0215ub — because that run is being actively written by the live trainer,
-and two concurrent writers to one run id race on _step (rows overwrite; would corrupt the live
-RL curves). The RL run id is recorded in this run's config for cross-referencing.
+"""Modal eval daemon: held-out universal eval for the live 8xB200 RL run.
 
 Runs on ONE B200, mounts the same `maemm-data` volume as training, and loops:
-  vol.reload() -> pick the HIGHEST un-evaled /data/ckpts_last5/step_* (latest-first; when caught
-  up on the newest ckpt this naturally backfills the backlog newest-first) -> load base(+adapter)
-  -> fast held-out eval -> wandb.log (commit=True), with `ckpt_step` as the x-axis metric
-  (define_metric), so out-of-order backfill points still land (wandb's own _step stays monotonic).
+  vol.reload() -> pick the HIGHEST un-evaled /data/ckpts/step_* (latest-first; when caught up on
+  the newest ckpt this naturally backfills the backlog newest-first) -> load base(+adapter) ->
+  fast held-out eval -> wandb.log (commit=True) to project `uni-inverter`, run
+  `maemm-8xb200-paper-v2-heldout`, with `ckpt_step` as the x-axis metric (define_metric), so
+  out-of-order backfill points still land (wandb's own _step stays monotonic).
 
 FAST eval = eval_universal's cos families (bsf, realact, jlens, cluster, random, ctx buckets,
 indist_*) + a rank-free SAE family (best-of-bo target-feature act -> norm_act / fired /
-beat_corpus / unverbalized_*). `mean_all` averages the higher-is-better cos families only
-(the `random` control is EXCLUDED). The full-SAE rank-over-131k metric stays DROPPED.
+beat_corpus / unverbalized_*). The full-SAE rank-over-131k metric (mean_rank/rank1/mrr) is
+DROPPED — it required collecting peak hidden states and was entangled with the multi-hour slow
+path observed on the first pass. Per-family wall times are printed each pass.
 
 The frozen cache is torch.load'ed DIRECTLY (not via build_eval_sets): the cache validates
 meta["heldout_pool"] against the abspath it was built with (the dead box's path), which cannot
-match inside the container. Evaled-ckpt state persists at /data/eval_state/evaled_last5.json.
+match inside the container. Evaled-ckpt state persists at /data/eval_state/evaled.json.
 
 Deploy + run (profile safety-sahan) — deployed app + spawn, NOT `modal run --detach`
 (killing an ephemeral app's local client cancels the app):
-    MODAL_PROFILE=safety-sahan modal deploy MAEMMBench/modal_eval_sft.py
+    MODAL_PROFILE=safety-sahan modal deploy eval/modal_eval.py   # repo-root shim also works
     MODAL_PROFILE=safety-sahan python -c "import modal; \
-        modal.Function.from_name('maemm-eval-sft-big-rp', 'daemon').spawn()"
+        modal.Function.from_name('maemm-eval-heldout', 'daemon').spawn()"
 """
 
 from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent.parent   # repo root (this file lives in MAEMMBench/)
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives in eval/)
 
-app = modal.App("maemm-eval-sft-big-rp")  # SFT-only scaled run (big_rp) evaluator — separate app from the RL daemons
+app = modal.App("maemm-eval-heldout")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -54,10 +49,9 @@ image = (
         "tokenizers==0.22.2",
         "hf_xet",
     )
-    # MAEMMBench/ is mounted AT /pmx/eval so `import eval_universal` inside the container is
+    # eval/ is mounted AT /pmx/eval so `import eval_universal` inside the container is
     # unchanged (eval/ at the repo root is now a shim dir that needs the repo on sys.path).
-    .add_local_dir(REPO / "MAEMMBench", "/pmx/eval",
-                   ignore=["__pycache__", "README.md", "analysis", "analysis/**"])
+    .add_local_dir(REPO / "eval", "/pmx/eval", ignore=["__pycache__", "out", "analysis", "modal_*", "test_*"])
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 
@@ -65,13 +59,14 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
 
 CACHE = "/data/eval_universal_ho/eval_sets_heldout.pt"
 SAE_PATH = "/data/sae/ae.pt"
-CKPT_DIR = "/data/sft_mix/big_rp"     # scaled SFT-only run (2.0M realact + 2x249k probes), 20 evenly spaced ckpts + final
-STATE = "/data/eval_state/evaled_sft_big_rp.json"
-WANDB_PROJECT = "maxact-fast"                  # same project as the RL run
-WANDB_RUN = "sft_big_rp_eval"             # separate run (see module docstring for why
-WANDB_RUN_ID = "sft_big_rp_eval"          # the RL run is NOT resumed); fresh id
-RL_RUN_ID = "last5_rp_rl_v10"                  # the v10 RL run this eval tracks (config xref)
-FINAL_STEP = 400   # <CKPT_DIR>/final is logged as this step (last-5 run: --total-steps 400)
+CKPT_DIR = "/data/ckpts_v2"          # PAPER RUN dir (v1 run's /data/ckpts is retired)
+STATE = "/data/eval_state/evaled_v4.json"   # v4: fresh for the v3 leg (resume from step_250);
+                                            # pre-seeded with steps <=250 (shared prefix, already
+                                            # evaled in the v2-heldout run)
+WANDB_PROJECT = "uni-inverter"
+WANDB_RUN = "maemm-8xb200-paper-v3-heldout"        # display name (v3 = kl-0.1 leash era)
+WANDB_RUN_ID = "maemm-8xb200-paper-v3-heldout"     # fresh id, never used before
+FINAL_STEP = 1000  # <CKPT_DIR>/final is logged as this step (paper run: --total-steps 1000)
 CONTROL_FAMS = {"random"}  # lower-is-better controls: logged per-family, EXCLUDED from mean_all
 
 
@@ -87,10 +82,7 @@ CONTROL_FAMS = {"random"}  # lower-is-better controls: logged per-family, EXCLUD
 )
 def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0,
            max_new: int = 64, min_new: int = 16, gen_chunk: int = 128,
-           min_ckpt_mtime: float = 0.0, shard: int = 0, nshards: int = 1, run: str = "big_rp"):
-    # run: which /data/sft_mix/<run> to evaluate (state file + wandb run names follow it)
-    # shard/nshards: run several daemons in parallel, each owning the ckpt steps with
-    # step % nshards == shard (own state file + own wandb run; the pre-shard state is read too).
+           min_ckpt_mtime: float = 0.0):
     # min_ckpt_mtime: ignore ckpt dirs whose adapter mtime predates this (stale artifacts from a
     # cancelled leg). When the resumed leg OVERWRITES such a dir, its mtime refreshes past the
     # cutoff and it gets evaled as new — no deletion needed, no stale evals, no skipped re-saves.
@@ -101,12 +93,6 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
     import time
 
     os.environ["HF_HOME"] = "/data/hf_cache"
-    global CKPT_DIR, STATE, WANDB_RUN, WANDB_RUN_ID
-    if run != "big_rp":
-        CKPT_DIR = f"/data/sft_mix/{run}"
-        STATE = f"/data/eval_state/evaled_sft_{run}.json"
-        WANDB_RUN = WANDB_RUN_ID = f"sft_{run}_eval"
-    _shard_state = STATE if nshards == 1 else STATE.replace(".json", f"_s{shard}of{nshards}.json")
     os.environ["HF_HUB_OFFLINE"] = "1"          # load purely from the volume cache
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -145,17 +131,16 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
     fams = es["meta"].get("cos_families", EU.COS_FAMILIES)
     feats = es["sae_feats"]
     cp = es["corpus_peak"].numpy().astype(np.float64)
-    print(f"[eval-daemon] base+sae+cache ready ({time.time() - t0:.0f}s) | "
-          f"ckpt_dir={CKPT_DIR} final_step={FINAL_STEP} | families {fams} "
+    print(f"[eval-daemon] base+sae+cache ready ({time.time() - t0:.0f}s) | families {fams} "
           f"| n={es['meta'].get('n')} | bo={bo} temp={temp} max_new={max_new} "
-          f"gen_chunk={gen_chunk} | LATEST-FIRST, SAE rank metric ON", flush=True)
+          f"gen_chunk={gen_chunk} | LATEST-FIRST, rank metric OFF", flush=True)
 
-    wandb.init(project=WANDB_PROJECT, name=(WANDB_RUN if nshards == 1 else f"{WANDB_RUN}_s{shard}"), id=(WANDB_RUN_ID if nshards == 1 else f"{WANDB_RUN_ID}_s{shard}"), resume="allow",
+    wandb.init(project=WANDB_PROJECT, name=WANDB_RUN, id=WANDB_RUN_ID, resume="allow",
                config={"families": fams, "n": es["meta"].get("n"), "bo": bo, "temp": temp,
                        "max_new_tokens": max_new, "min_new_tokens": min_new,
                        "cache": CACHE, "ckpt_dir": CKPT_DIR, "gpu": "B200:1",
-                       "gen_chunk": gen_chunk, "sae_rank_metric": True,
-                       "schedule": "latest-first", "rl_run_id": RL_RUN_ID})
+                       "gen_chunk": gen_chunk, "sae_rank_metric": False,
+                       "schedule": "latest-first"})
     wandb.define_metric("ckpt_step")
     wandb.define_metric("eval/*", step_metric="ckpt_step")
 
@@ -175,10 +160,10 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
                 out[f"eval/{fam}/cos"] = float(best.mean())
                 times[fam] = time.time() - tf
             tf = time.time()
-            # FULL SAE rank metric ON for the SFT run (ARB doc: SAE_rank_1_fraction): best-of-bo
-            # target-feature act + the paired feature's rank among all 131k features at the best gen's peak token
-            best, ranks = EU.eval_sae_family(es["sae_dirs"], feats, sae, *gen_args)
-            best = np.asarray(best, dtype=np.float64); ranks = np.asarray(ranks, dtype=np.float64)
+            best = np.full(len(feats), -1e9)
+            for rows, texts in EU._gen_batches("sae", es["sae_dirs"], *gen_args):
+                acts, _ = EU.score_sae_peaks(texts, [feats[i] for i in rows], sae, actor, tok, dev)
+                np.maximum.at(best, rows, acts.numpy().astype(np.float64))
             times["sae"] = time.time() - tf
         na = best / np.maximum(cp, 1e-6)
         out["eval/sae/norm_act"] = float(na.mean())
@@ -186,10 +171,6 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
         out["eval/sae/beat_corpus"] = float(np.mean(best > cp))
         out["eval/sae/unverbalized_frac"] = float(np.mean(best <= EU.SAE_FIRE))
         out["eval/sae/unverbalized_p10"] = float(np.mean(na < 0.10))
-        out["eval/sae/rank1_frac"] = float(np.mean(ranks == 1))          # doc: SAE_rank_1_fraction
-        out["eval/sae/mean_rank"] = float(ranks.mean())
-        out["eval/sae/mrr"] = float(np.mean(1.0 / np.maximum(ranks, 1)))
-        out["eval/sae/rank_le5_frac"] = float(np.mean(ranks <= 5))        # doc's planned "kth feature" variant
         # mean_all = mean over the HIGHER-IS-BETTER cos families only. `random` is the control
         # (should stay ~0.03, LOWER is better) — folding it in dragged the mean down and would
         # move mean_all the WRONG way if the control ever degraded. It stays logged separately.
@@ -201,26 +182,18 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
             out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
         out["eval/all/sae_norm_act"] = out["eval/sae/norm_act"]
         out["eval/all/sae_unverbalized"] = out["eval/sae/unverbalized_frac"]
-        out["eval/all/sae_rank1_frac"] = out["eval/sae/rank1_frac"]
         print("  [timing] " + " ".join(f"{k}={v:.0f}s" for k, v in times.items()), flush=True)
         return out
 
     def load_state():
-        # union of EVERY state file for this run (base + all shard configs ever used), so the shard
-        # count can be changed mid-run without re-scoring checkpoints another daemon already did
-        done = set()
-        # exact run scoping: <stem>.json + <stem>_s*of*.json (a bare "<stem>*" also matched big_rp_v2's files)
-        for path in {STATE, _shard_state} | set(glob.glob(STATE[:-5] + "_s*of*.json")):
-            if os.path.exists(path):
-                try:
-                    done |= set(json.load(open(path)).get("done", []))
-                except Exception:
-                    pass
-        return done
+        try:
+            return set(json.load(open(STATE))["done"])
+        except Exception:
+            return set()
 
     def save_state(done):
-        os.makedirs(os.path.dirname(_shard_state), exist_ok=True)
-        json.dump({"done": sorted(done)}, open(_shard_state, "w"))
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        json.dump({"done": sorted(done)}, open(STATE, "w"))
         vol.commit()
 
     done = load_state()
@@ -244,8 +217,8 @@ def daemon(poll_s: int = 120, once: bool = False, bo: int = 4, temp: float = 1.0
                 avail[s] = p
         fw = f"{CKPT_DIR}/final/adapter_model.safetensors"
         if os.path.exists(fw) and os.path.getmtime(fw) >= min_ckpt_mtime:
-            avail[(max(avail) + 1) if avail else FINAL_STEP] = f"{CKPT_DIR}/final"   # SFT: final = last step + 1
-        todo = sorted(k for k in avail if k not in done and k % nshards == shard)
+            avail[FINAL_STEP] = f"{CKPT_DIR}/final"
+        todo = sorted(k for k in avail if k not in done)
         if not todo:
             if once:
                 print("[eval-daemon] --once: nothing pending, exiting", flush=True)

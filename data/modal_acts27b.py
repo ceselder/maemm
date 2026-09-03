@@ -35,7 +35,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 
 APP_NAME = "maemm-acts27b"
 app = modal.App(APP_NAME)
@@ -58,7 +58,7 @@ image = (
         "hf_xet",
         "datasets",
     )
-    .add_local_file(REPO / "collect" / "collect_acts27b_worker.py",
+    .add_local_file(REPO / "data" / "collect_acts27b_worker.py",
                     "/pmx/collect_acts27b_worker.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )

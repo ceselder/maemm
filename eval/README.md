@@ -23,8 +23,8 @@ SAE [`ceselder/qwen36-27b-sae-l42`](https://huggingface.co/ceselder/qwen36-27b-s
 |---|------|--------|-------|-------------|--------|
 | 1 | Held-out family cosine | [`eval_universal.py`](eval_universal.py) (`run_eval`) | frozen held-out directions, n=512/family | `eval/<fam>/cos` per family, `eval/mean_all` (control-excluded) | **live** |
 | 2 | SAE inversion | [`eval_universal.py`](eval_universal.py) (sae family) | held-out SAE encoder columns + corpus peaks | `sae/norm_act`, `fired`, `beat_corpus`, `rank1_frac`, `mean_rank`, `mrr`, `unverbalized_frac`, `unverbalized_p10` | **live** |
-| 3 | In-training greedy eval | [`training_evals.py`](training_evals.py) → `train/rl.py` `greedy_eval` | reserved bank directions (never trained on) | `eval/greedy_act_{mean,max}`, `greedy_beat_frac` | **live** (in RL loop) |
-| 4 | In-training SAE eval (greedy + best-of-N) | [`training_evals.py`](training_evals.py) → `train/rl.py` `sae_eval`/`sae_score` | held-out SAE feature split | `eval/sae_norm_act`, `sae_beat_frac`, `sae_bo{N}_*` | **live** (in RL loop) |
+| 3 | In-training greedy eval | [`training_evals.py`](training_evals.py) → `rl/rl.py` `greedy_eval` | reserved bank directions (never trained on) | `eval/greedy_act_{mean,max}`, `greedy_beat_frac` | **live** (in RL loop) |
+| 4 | In-training SAE eval (greedy + best-of-N) | [`training_evals.py`](training_evals.py) → `rl/rl.py` `sae_eval`/`sae_score` | held-out SAE feature split | `eval/sae_norm_act`, `sae_beat_frac`, `sae_bo{N}_*` | **live** (in RL loop) |
 | 5 | Context-bucket families | [`build_ctx_eval.py`](build_ctx_eval.py) → eval 1 | held-out long-ctx acts, bucketed by token position | `eval/realact_{early,mid,long}/cos` | **live** |
 | 6 | In-distribution held-out families | [`build_indist_eval.py`](build_indist_eval.py) → eval 1 | tail slice of the actual RL training pool | `eval/indist_{realact,probe,long}/cos` | **live** |
 | 7 | Per-checkpoint eval daemon | [`modal_eval.py`](modal_eval.py) | every saved RL checkpoint | all of 1+2+5+6 → wandb, keyed by `ckpt_step` | **live** |
@@ -92,7 +92,7 @@ floor tells you what "no signal" looks like.
 
 **How to run.**
 ```bash
-PYTHONPATH=$PWD python MAEMMBench/eval_universal.py \
+PYTHONPATH=$PWD python eval/eval_universal.py \
   --adapter ckpts/rl/final --sae-path ae.pt --maxacts-path max_acts.pt \
   --heldout-pool data/pool_heldout --n 512 --bo 4 \
   --out eval_universal.json --wandb uni-inverter
@@ -164,7 +164,7 @@ units, not cosine): `eval/greedy_act_mean`, `eval/greedy_act_max`, and `eval/gre
 `beat_frac` (absolute, 0–1) rather than the raw mean. Includes the identical-texts assert:
 identical rollouts across distinct directions = steering is not firing → crash loudly.
 
-**How to run.** Flags on `train/rl.py`: `--eval-every 25 --n-eval-dirs 64` (defaults on).
+**How to run.** Flags on `rl/rl.py`: `--eval-every 25 --n-eval-dirs 64` (defaults on).
 Import for reuse: `from MAEMMBench.training_evals import greedy_eval`.
 
 ---
@@ -182,7 +182,7 @@ cross-uplift number), `eval/sae_beat_frac`. Best-of-N arm (`--sae-eval-bo N --sa
 `eval/sae_bo{N}_{act_mean,norm_act,beat_frac}` — sampling is far more productive than greedy
 (the Bo16 curve sits well above greedy), so quote which arm a number comes from.
 
-**How to run.** `train/rl.py --sae-eval-every 50 --sae-split split.json --sae-eval-bo 16`.
+**How to run.** `rl/rl.py --sae-eval-every 50 --sae-split split.json --sae-eval-bo 16`.
 Import for reuse: `from MAEMMBench.training_evals import sae_eval, sae_score`.
 
 **Observed numbers.** On the 250k ProbeMaxxer precursor, held-out SAE features fired (greedy):
@@ -212,7 +212,7 @@ specifically to close it.
 **How to run** (one-shot, before starting the daemon):
 ```bash
 MAEMM_ACTS_LONG=data/acts_long MAEMM_EVAL_CACHE=data/eval_universal_ho/eval_sets_heldout.pt \
-  PYTHONPATH=$PWD python MAEMMBench/build_ctx_eval.py
+  PYTHONPATH=$PWD python eval/build_ctx_eval.py
 ```
 
 **Observed numbers.** early **0.556** / mid **0.502** / long **0.439** (paper run, step 25) —
@@ -243,7 +243,7 @@ learning general inversion.
 **How to run.**
 ```bash
 MAEMM_POOL=data/pool_rl_mix MAEMM_EVAL_CACHE=data/eval_universal_ho/eval_sets_heldout.pt \
-  PYTHONPATH=$PWD python MAEMMBench/build_indist_eval.py     # idempotent
+  PYTHONPATH=$PWD python eval/build_indist_eval.py     # idempotent
 ```
 
 **Observed numbers.** `indist_long/cos` **0.507** @ step 25 (vs off-dist `realact_long` 0.439 —
@@ -270,7 +270,7 @@ families, `random` (the control) excluded.
 
 **How to run.**
 ```bash
-MODAL_PROFILE=<profile> modal deploy MAEMMBench/modal_eval.py    # repo-root modal_eval.py shim also works
+MODAL_PROFILE=<profile> modal deploy eval/modal_eval.py    # repo-root modal_eval.py shim also works
 MODAL_PROFILE=<profile> python -c "import modal; modal.Function.from_name('maemm-eval-heldout','daemon').spawn()"
 ```
 Deploy + spawn, **not** `modal run --detach` — killing an ephemeral app's client cancels the app.
@@ -378,7 +378,7 @@ rollouts (≤64 new tokens) are ~2× longer than the 32-token max-act windows; `
 **How to run:**
 ```bash
 MODAL_PROFILE=<profile> modal run modal_snippet_locality.py      # GPU -> locality.json
-python MAEMMBench/snippet_locality.py score --locality locality.json \
+python eval/snippet_locality.py score --locality locality.json \
     --autointerp-results results.json --testbed testbed_v2.json --out locality_results.json
 ```
 
@@ -422,10 +422,10 @@ each, example-matched mixes of 179,919 spans, RL step 100):
 ## Layout & compatibility
 
 ```
-MAEMMBench/
+eval/
   README.md               this file
   eval_universal.py       evals 1+2 (canonical; moved from eval/eval_universal.py)
-  training_evals.py       evals 3+4 (re-exports greedy_eval/sae_eval/sae_score from train/rl.py)
+  training_evals.py       evals 3+4 (re-exports greedy_eval/sae_eval/sae_score from rl/rl.py)
   build_ctx_eval.py       eval 5 cache builder (context buckets)
   build_indist_eval.py    eval 6 cache builder (in-distribution held-out)
   modal_eval.py           eval 7, the per-checkpoint daemon (moved from repo root)

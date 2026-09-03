@@ -36,7 +36,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 
 import os  # noqa: E402  (N_GPU below reads the env at import time)
 
@@ -78,11 +78,11 @@ image = (
         "tokenizers==0.22.2",
         "hf_xet",
     )
-    .add_local_file(REPO / "train" / "rl.py", "/pmx/RL/rl_hf.py")
+    .add_local_file(REPO / "rl" / "rl.py", "/pmx/RL/rl_hf.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
-    .add_local_file(REPO / "MAEMMBench" / "eval_universal.py", "/pmx/eval/eval_universal.py")   # inline eval scoring
-    .add_local_file(REPO / "train" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")   # autointerp/locality/WildChat/adversarial inline
-    .add_local_file(REPO / "MAEMMBench" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
+    .add_local_file(REPO / "eval" / "eval_universal.py", "/pmx/eval/eval_universal.py")   # inline eval scoring
+    .add_local_file(REPO / "eval" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")   # autointerp/locality/WildChat/adversarial inline
+    .add_local_file(REPO / "eval" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
     .add_local_file(REPO / "eval" / "autointerp_detection.py", "/pmx/eval/autointerp_detection.py")
 )
 

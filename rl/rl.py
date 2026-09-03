@@ -18,8 +18,8 @@ One step:
   6. update(): ONE clipped policy-gradient step, per-token normalized over the global batch,
      optional --entropy-coef bonus and --kl-coef capped-k3 KL to the frozen init adapter.
 
-    torchrun --nproc_per_node=8 train/rl.py --data-dir <pool> --init-adapter <sft> ...
-    python train/rl.py --groups-per-step 2 --group-size 4 --total-steps 2 --no-wandb   # 1-GPU smoke
+    torchrun --nproc_per_node=8 rl/rl.py --data-dir <pool> --init-adapter <sft> ...
+    python rl/rl.py --groups-per-step 2 --group-size 4 --total-steps 2 --no-wandb   # 1-GPU smoke
 """
 import argparse
 import json

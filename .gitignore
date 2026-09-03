@@ -33,3 +33,4 @@ nohup.out
 modal.toml
 # box-side run_*.sh launchers often carry hardcoded keys — keep them out
 run_*.sh
+eval/out/

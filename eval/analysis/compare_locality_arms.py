@@ -7,7 +7,7 @@ metrics, firing fraction, and the paired-vs-real diff. Across arms: PAIRED per-f
 (arm A - arm B) over features with >=1 firing rollout in BOTH arms — the apples-to-apples
 "did the last-5 reward fix the smearing" test (headline metric: win5_share).
 
-    python MAEMMBench/analysis/compare_locality_arms.py \
+    python eval/analysis/compare_locality_arms.py \
         --arm last5_step75=locality_last5_step75.json \
         --arm v2_step225=locality_v2_step225.json \
         --out snippet_locality_last5_vs_baseline.json

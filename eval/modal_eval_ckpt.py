@@ -21,7 +21,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 app = modal.App("maemm-eval-ckpt")
 GPU = os.environ.get("EVAL_GPU", "B200:1")
 
@@ -42,13 +42,13 @@ image = (
     )
     .pip_install("flash-linear-attention==0.5.2")
     .pip_install("anthropic")
-    .add_local_file(REPO / "train" / "rl.py", "/pmx/RL/rl_hf.py")
-    .add_local_file(REPO / "train" / "rl_disagg.py", "/pmx/RL/rl_disagg.py")               # _build_engine (fast hook + graphs)
-    .add_local_file(REPO / "train" / "fast_lens_ext.py", "/pmx/helpers/fast_lens_ext.py")
-    .add_local_file(REPO / "train" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")
+    .add_local_file(REPO / "rl" / "rl.py", "/pmx/RL/rl_hf.py")
+    .add_local_file(REPO / "rl" / "rl_disagg.py", "/pmx/RL/rl_disagg.py")               # _build_engine (fast hook + graphs)
+    .add_local_file(REPO / "rl" / "fast_lens_ext.py", "/pmx/helpers/fast_lens_ext.py")
+    .add_local_file(REPO / "eval" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
-    .add_local_file(REPO / "MAEMMBench" / "eval_universal.py", "/pmx/eval/eval_universal.py")
-    .add_local_file(REPO / "MAEMMBench" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
+    .add_local_file(REPO / "eval" / "eval_universal.py", "/pmx/eval/eval_universal.py")
+    .add_local_file(REPO / "eval" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
     .add_local_file(REPO / "eval" / "autointerp_detection.py", "/pmx/eval/autointerp_detection.py")
     .add_local_file(REPO / "eval" / "eval_ckpt_daemon.py", "/pmx/eval/eval_ckpt_daemon.py")
 )

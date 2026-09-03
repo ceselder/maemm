@@ -1,4 +1,4 @@
-"""Modal app: DISAGGREGATED Dr.GRPO/GRPO RL for the MAEMM inverter (train/rl_disagg.py) -- X vLLM
+"""Modal app: DISAGGREGATED Dr.GRPO/GRPO RL for the MAEMM inverter (rl/rl_disagg.py) -- X vLLM
 rollout GPUs + Y HF trainer GPUs in ONE container. Dev iteration app (user: "a separate 4-GPU thing to
 iterate on"); production is the same function on 8 GPUs with the chosen (X, Y).
 
@@ -6,8 +6,8 @@ Same image as modal_rl_last5_v15.py (torch 2.10 cu128, vllm 0.19 + vllm-lens 1.1
 peft 0.20) PLUS flash-linear-attention (fla): transformers' Qwen3.5 GatedDeltaNet picks fla's Triton
 chunk kernel over its torch fallback when `fla` is importable (use_kernel_func_from_hub_with_fallback),
 which is what makes the trainer's no-vLLM, no-grad-ckpt, micro-batch 16-32 update fit and run fast.
-Mounts: train/rl.py -> /pmx/RL/rl_hf.py (imported as a module, NEVER edited), train/rl_disagg.py ->
-/pmx/RL/rl_disagg.py, train/fast_lens_ext.py -> /pmx/helpers/fast_lens_ext.py (vLLM worker extension,
+Mounts: rl/rl.py -> /pmx/RL/rl_hf.py (imported as a module, NEVER edited), rl/rl_disagg.py ->
+/pmx/RL/rl_disagg.py, rl/fast_lens_ext.py -> /pmx/helpers/fast_lens_ext.py (vLLM worker extension,
 importable in the engine process), mxf/.
 
 Launch (MODAL_PROFILE=safety-sahan):
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 app = modal.App("maemm-rl-disagg")
 GPU = os.environ.get("DISAGG_GPU", "B200:4")
 
@@ -45,13 +45,13 @@ image = (
     )
     .pip_install("flash-linear-attention==0.5.2")   # fla + fla-core + einops; transformers>=4.45 already satisfied
     .pip_install("anthropic")                        # native Sonnet 5 judge for the inline extra evals (inline_extra_evals.JudgeClient)
-    .add_local_file(REPO / "train" / "rl.py", "/pmx/RL/rl_hf.py")
-    .add_local_file(REPO / "train" / "rl_disagg.py", "/pmx/RL/rl_disagg.py")
-    .add_local_file(REPO / "train" / "fast_lens_ext.py", "/pmx/helpers/fast_lens_ext.py")
+    .add_local_file(REPO / "rl" / "rl.py", "/pmx/RL/rl_hf.py")
+    .add_local_file(REPO / "rl" / "rl_disagg.py", "/pmx/RL/rl_disagg.py")
+    .add_local_file(REPO / "rl" / "fast_lens_ext.py", "/pmx/helpers/fast_lens_ext.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
-    .add_local_file(REPO / "MAEMMBench" / "eval_universal.py", "/pmx/eval/eval_universal.py")            # inline eval scoring
-    .add_local_file(REPO / "train" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")          # autointerp/locality/WildChat/adversarial
-    .add_local_file(REPO / "MAEMMBench" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
+    .add_local_file(REPO / "eval" / "eval_universal.py", "/pmx/eval/eval_universal.py")            # inline eval scoring
+    .add_local_file(REPO / "eval" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")          # autointerp/locality/WildChat/adversarial
+    .add_local_file(REPO / "eval" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
     .add_local_file(REPO / "eval" / "autointerp_detection.py", "/pmx/eval/autointerp_detection.py")
 )
 

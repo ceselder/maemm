@@ -27,7 +27,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 
 APP_NAME = "maemm-sft-8xb200"
 app = modal.App(APP_NAME)
@@ -51,7 +51,7 @@ image = (
         "tokenizers==0.22.2",
         "hf_xet",
     )
-    .add_local_file(REPO / "train" / "pretrain.py", "/pmx/SL/pretrain.py")
+    .add_local_file(REPO / "sft" / "pretrain.py", "/pmx/SL/pretrain.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 

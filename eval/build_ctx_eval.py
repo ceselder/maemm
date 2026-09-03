@@ -14,7 +14,7 @@ they are already in cos_families — but simplest is to run it exactly once per 
 
 Run (paths overridable via env):
     MAEMM_ACTS_LONG=data/acts_long MAEMM_EVAL_CACHE=data/eval_universal_ho/eval_sets_heldout.pt \
-        PYTHONPATH=$PWD python MAEMMBench/build_ctx_eval.py
+        PYTHONPATH=$PWD python eval/build_ctx_eval.py
 """
 import glob
 import json

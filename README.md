@@ -40,25 +40,22 @@ to cover features that only fire at long range. See `bank/` for every family's b
 ## Layout
 
 ```
-mxf/                     core library (config, injection hooks, prompts, SAE loader, MFU)
-collect/collect_acts.py            collect READ_LAYER residuals from a corpus (fixed-len windows)
-collect/collect_acts_longctx.py    long-context activations (uniform position up to 8k) — RL-only source
-bank/train_sasa.py                 train the SASA/BSF subspace featurizer
-bank/build_universal_bank.py       mine all families -> one (direction, target-span) bank
-bank/build_big_sft_bank.py         scaled realact+probes SFT bank (CPU)
-bank/build_rl_bank.py              balanced RL mix (realact + probes + long-context)
-train/pretrain.py                  match-activation SFT (LoRA; single- or multi-GPU via torchrun)
-train/rl.py                        Dr. GRPO RL from the SFT init (single-GPU, or data-parallel via torchrun)
-train/rl_ddp.sh                    gloo-DDP data-parallel RL launcher (see "Scaling & infra")
-modal_rl.py                        Modal app: the same RL run on a single 8xB200 container
-MAEMMBench/                        THE EVAL SUITE — every eval, documented (see MAEMMBench/README.md):
-                                   held-out family cosine + mean_all, SAE norm_act / rank-1 / %unverbalized
-                                   (+ a random-direction control), ctx-bucket + in-distribution families,
-                                   the per-checkpoint Modal eval daemon, the datamix-ablation analysis
-eval/autointerp_detection.py       autointerp DETECTION eval: Opus-5 judge predicts feature firing from
-                                   MAEMM rollouts as the description, vs a max-act-example baseline
-scripts/vllm_smoke.py              vLLM + vllm_lens steering smoke test (the fast-rollout path)
-patches/                           the (already-applied) diversity-bonus + gate-mask patches, for reference
+mxf/        core library: config, injection hooks, prompts, SAE loader, MFU
+data/       activation collection + direction-bank building (+ their Modal launchers)
+            collect_acts.py / collect_acts_longctx.py / collect_acts27b_worker.py   READ_LAYER residuals (fixed-len, long-ctx, 27B sharded)
+            train_sasa.py                                                            the SASA/BSF subspace featurizer
+            build_universal_bank.py / build_big_sft_bank.py / build_rl_bank.py        (direction, target-span) banks
+            modal_acts27b.py, modal_bank_everything.py, modal_big_bank.py, modal_last5_bank.py, modal_pool_last5.py, modal_bsf_retrain.py
+sft/        match-activation SFT: pretrain.py (LoRA; single- or multi-GPU via torchrun) + modal_sft.py
+rl/         RL: rl.py (GRPO, actor + vLLM on every rank), rl_disagg.py (X vLLM rollout GPUs + Y trainer GPUs — the fast path),
+            fast_lens_ext.py (vLLM steering hook), rl_ddp.sh, modal_rl_disagg.py (production launcher), modal_rl*.py (older launchers),
+            patches/ (historical), test_rl_disagg_queue.py
+eval/       THE EVAL SUITE (see eval/README.md): eval_universal.py (held-out family cosine + mean_all, SAE norm_act / rank / cos /
+            %unverbalized, random control, ctx-bucket + in-distribution families), snippet_locality.py, autointerp_detection.py,
+            inline_extra_evals.py (locality + autointerp AUC + WildChat fire-prediction + adversarial confirmation, judge = Sonnet 5),
+            eval_ckpt_daemon.py + modal_eval_ckpt.py (1-GPU per-checkpoint evaluator with its own vLLM engine),
+            build_ctx_eval.py / build_indist_eval.py / wildchat_bank.py (eval-set builders), analysis/ (plots), modal_eval*.py (older daemons)
+scripts/    vllm_smoke.py — vLLM + vllm_lens steering smoke test
 ```
 
 ## Quickstart
@@ -70,28 +67,28 @@ export HF_TOKEN=...               # for model + corpus downloads
 # optional: export WANDB_API_KEY=... ANTHROPIC_API_KEY=...   (logging / LLM-judge evals)
 
 # 1) collect activations (needs a GPU with the model)
-python collect/collect_acts.py --n-seq 20000 --seq-len 512 --out-dir data/acts
+python data/collect_acts.py --n-seq 20000 --seq-len 512 --out-dir data/acts
 
 # 2) build banks
-python bank/build_big_sft_bank.py --n-realact 500000 --n-probe 500000 --out data/pool_sft
-python collect/collect_acts_longctx.py --shard 0 --n-shards 5   # (one per GPU) -> data/acts_long
-python bank/build_rl_bank.py --n-each 250000 --out data/pool_rl_mix
+python data/build_big_sft_bank.py --n-realact 500000 --n-probe 500000 --out data/pool_sft
+python data/collect_acts_longctx.py --shard 0 --n-shards 5   # (one per GPU) -> data/acts_long
+python data/build_rl_bank.py --n-each 250000 --out data/pool_rl_mix
 
 # 3) SFT  (multi-GPU: use gloo — see note)
 DDP_BACKEND=gloo TOKENIZERS_PARALLELISM=false PYTHONPATH=$PWD \
-  torchrun --standalone --nproc_per_node=5 train/pretrain.py \
+  torchrun --standalone --nproc_per_node=5 sft/pretrain.py \
     --data-dir data/pool_sft --lr 3e-5 --batch-size 16 --epochs 2 --save-dir ckpts/sft
 
 # 4) RL from the SFT init (data-parallel; drop the launcher for a single-GPU run)
-NPROC=4 CUDA_VISIBLE_DEVICES=0,1,2,3 bash train/rl_ddp.sh \
+NPROC=4 CUDA_VISIBLE_DEVICES=0,1,2,3 bash rl/rl_ddp.sh \
   --data-dir data/pool_rl_mix --bank-file vecs.f32 \
   --init-adapter ckpts/sft/final --lr 1e-5 --reward-metric cosine --reward-scale 1000 \
   --min-new-tokens 16 --max-new-tokens 96 --len-penalty-start 16 --len-penalty-per-tok 1.0 \
   --div-coef 2000 --kl-coef 0.03 --groups-per-step 32 --group-size 16 \
   --total-steps 400 --save-dir ckpts/rl
 
-# 5) eval (held-out families + %unverbalized SAE — full suite docs in MAEMMBench/README.md)
-python MAEMMBench/eval_universal.py --adapter ckpts/rl/final \
+# 5) eval (held-out families + %unverbalized SAE — full suite docs in eval/README.md)
+python eval/eval_universal.py --adapter ckpts/rl/final \
   --sae-path <ae.pt> --maxacts-path <max_acts.pt> --heldout-pool data/pool_heldout
 ```
 
@@ -106,7 +103,7 @@ Defaults: rsLoRA r64/α16 all-linear, AdamW lr 3e-5 (SFT) / 1e-5 (RL).
 
 ## Scaling & infra
 
-- **Data-parallel RL (gloo DDP) — `train/rl_ddp.sh`.** `train/rl.py` is DDP-aware: under torchrun,
+- **Data-parallel RL (gloo DDP) — `rl/rl_ddp.sh`.** `rl/rl.py` is DDP-aware: under torchrun,
   each rank rolls out / scores / backprops `groups_per_step / world` **whole** groups (Dr. GRPO
   advantages stay intra-rank), then the LoRA grads are all-reduced in one flat **CPU** buffer over
   **gloo**, token-weighted so the update is *exactly* the single-GPU gradient over the union batch
@@ -130,7 +127,7 @@ Defaults: rsLoRA r64/α16 all-linear, AdamW lr 3e-5 (SFT) / 1e-5 (RL).
   out the target direction — pushes a group to find *different* ways to evoke the same direction.
   **Must be masked by the fluency gate** (degenerate rollouts otherwise farm the bonus → collapse).
   Pareto-swept: `--div-coef 2000` ≈ +11% diversity for ~2% cosine cost. `patches/` holds the patch
-  scripts that introduced this (already applied to `train/rl.py`; kept for provenance).
+  scripts that introduced this (already applied to `rl/rl.py`; kept for provenance).
 
 ## Notes
 

@@ -25,7 +25,7 @@ import time
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.join(_HERE, ".."), os.path.join(_HERE, "..", "train"), "/pmx/RL", "/pmx/helpers"):
+for _p in (_HERE, os.path.join(_HERE, ".."), "/pmx/RL", "/pmx/helpers"):
     _p = os.path.abspath(_p)
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.append(_p)

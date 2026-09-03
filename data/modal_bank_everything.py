@@ -1,15 +1,15 @@
 """Modal app: build the "EVERYTHING" RL direction bank at /data/banks/everything on `maemm-data`.
 
 Five ON-MANIFOLD direction families, --n-per-family (default 100,000) rows EACH, in the EXACT bank format
-train/rl.py consumes (== /data/pool_rl_last5, /data/pool_rl_mix):
+rl/rl.py consumes (== /data/pool_rl_last5, /data/pool_rl_mix):
     vecs.f32            raw LE float32 row-major [N, 5120], UNIT rows (layer-42 residual directions of Qwen/Qwen3.6-27B)
     records.jsonl       one JSON/line, line i == vec_idx i: {vec_idx, family, target_text, ...per-family source fields}
-    build_stats.json    "n_examples" == N == rows of vecs.f32 (train/rl.py reads n_examples as the memmap row count)
+    build_stats.json    "n_examples" == N == rows of vecs.f32 (rl/rl.py reads n_examples as the memmap row count)
     meta.json           split summary, recipes, exclusion summary, verification numbers
     exclusions.json     the FULL exclusion id lists actually applied
-Row order is a seeded SHUFFLE of all families (so train/rl.py's --n-eval-dirs front reservation is a family mix).
+Row order is a seeded SHUFFLE of all families (so rl/rl.py's --n-eval-dirs front reservation is a family mix).
 
-Families (train/rl.py samples rows uniformly, so equal row counts == an even mix):
+Families (rl/rl.py samples rows uniformly, so equal row counts == an even mix):
   realact       SHORT-context real L42 activations — the modal_big_bank.py PREFIX harvest: random TRAIN document of
                 /data/acts27b (seq rows [0, ceil(0.95*n_seq)); the last 5% are the eval hold-out), index p ~ U[14, 91];
                 direction = unit(act[s,p] - whiten_mu), 10x-median norm filter; target_text = decode(toks[s, 0:p+1+extra]),
@@ -58,7 +58,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 APP_NAME = "maemm-bank-everything"
 app = modal.App(APP_NAME)
 
@@ -86,7 +86,7 @@ BSF_DIR = "/data/bsf27b_1b"                         # volume cache of the HF BSF
 BSF_FILES = ("sasa.pt", "blocks_Q.pt", "whiten_mu.npy", "whiten_zca.npy", "meta.json")
 OUT_DEFAULT = "banks/everything"
 FAMILIES = ("realact", "realact_long", "sae", "bsf", "cluster")
-N_TAIL_INDIST = 2000                                # MAEMMBench/build_indist_eval.py N_TAIL
+N_TAIL_INDIST = 2000                                # eval/build_indist_eval.py N_TAIL
 NORM_FILTER_MULT = 10.0
 NORM_PRESAMPLE = 20_000
 LEAK_COS = 0.999                                    # direction-level leakage threshold (exact dups are ~1.0)
@@ -718,7 +718,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
                                                f"{EVAL_CACHE} bsf_dirs -> argmax block under {BSF_HF}"]},
                     "probe_rows": {"n": len(excl_probe_src), "range": [excl_probe_src[0], excl_probe_src[-1]],
                                    "sources": [f"{POOL_RL_MIX} cluster tail (last {N_TAIL_INDIST} rows) = indist_probe reservation "
-                                               "(MAEMMBench/build_indist_eval.py N_TAIL)",
+                                               "(eval/build_indist_eval.py N_TAIL)",
                                                f"direction-level: cos > {LEAK_COS} vs pool_heldout cluster dirs + eval cluster_dirs + indist_probe_dirs"],
                                    "dropped_indist_tail": n_drop_tail, "dropped_dir_leak": n_drop_dir},
                     "realact": {"rule": f"acts27b seq rows < {n_train} only (last 5% held out); eval realact/indist/ctx families come from other acts dumps"},

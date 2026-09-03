@@ -1,4 +1,4 @@
-"""Modal launcher for the snippet-locality eval's GPU stage (MAEMMBench/snippet_locality.py
+"""Modal launcher for the snippet-locality eval's GPU stage (eval/snippet_locality.py
 build): one B200, the maemm-data volume (base-model HF cache + SAE + augmented autointerp
 testbed + RL adapter checkpoints). One-shot.
 
@@ -16,7 +16,7 @@ Run (from this box, profile safety-sahan):
         --adapters last5_step75=/data/ckpts_last5/step_75,v2_step225=/data/ckpts_v2/step_225
 Then pull the profiles locally and continue with the local score stage:
     MODAL_PROFILE=safety-sahan modal volume get maemm-data eval_autointerp/locality.json .
-    python MAEMMBench/snippet_locality.py score --locality locality.json \
+    python eval/snippet_locality.py score --locality locality.json \
         --autointerp-results eval/out/results.json --testbed eval/out/testbed_v2.json \
         --out locality_results.json
 """
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 
 app = modal.App("maemm-snippet-locality")
 
@@ -45,7 +45,7 @@ image = (
         "datasets",
         "hf_xet",
     )
-    .add_local_dir(REPO / "MAEMMBench", "/pmx/MAEMMBench", ignore=["__pycache__", "analysis"])
+    .add_local_dir(REPO / "eval", "/pmx/MAEMMBench", ignore=["__pycache__", "out", "analysis", "modal_*", "test_*"])
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 

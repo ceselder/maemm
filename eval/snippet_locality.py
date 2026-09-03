@@ -24,10 +24,10 @@ length-robust metrics — read those first. Per-text token counts ship in the JS
 
 Two stages:
   # GPU (Modal: ../modal_snippet_locality.py) — profiles + per-text metrics -> locality.json
-  python MAEMMBench/snippet_locality.py build \
+  python eval/snippet_locality.py build \
       --testbed /data/eval_autointerp/testbed_v2.json --out /data/eval_autointerp/locality.json
   # local — aggregates, PAIRED maemm-vs-real test, autointerp cross-links -> results json
-  python MAEMMBench/snippet_locality.py score --locality locality.json \
+  python eval/snippet_locality.py score --locality locality.json \
       --autointerp-results results.json --out locality_results.json
 """
 import argparse

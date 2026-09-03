@@ -1,6 +1,6 @@
 """Modal eval daemon for the LAST-5 RL run (app maemm-rl-last5-8xb200, wandb or0215ub).
 
-Variant of MAEMMBench/modal_eval.py (the paper-run daemon) with only the run-specific knobs
+Variant of eval/modal_eval.py (the paper-run daemon) with only the run-specific knobs
 changed: watches /data/ckpts_last5 (--total-steps 400 --save-every 25 -> step_25..step_400 +
 final), logs to project `maxact-fast` as run `last5_rp_rl_eval`. A SEPARATE wandb run — NOT a
 resume of the RL run or0215ub — because that run is being actively written by the live trainer,
@@ -24,7 +24,7 @@ match inside the container. Evaled-ckpt state persists at /data/eval_state/evale
 
 Deploy + run (profile safety-sahan) — deployed app + spawn, NOT `modal run --detach`
 (killing an ephemeral app's local client cancels the app):
-    MODAL_PROFILE=safety-sahan modal deploy MAEMMBench/modal_eval_last5.py
+    MODAL_PROFILE=safety-sahan modal deploy eval/modal_eval_last5.py
     MODAL_PROFILE=safety-sahan python -c "import modal; \
         modal.Function.from_name('maemm-eval-last5-heldout', 'daemon').spawn()"
 """
@@ -33,7 +33,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent.parent   # repo root (this file lives in MAEMMBench/)
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives in eval/)
 
 app = modal.App("maemm-eval-last5-sweep")
 
@@ -54,10 +54,9 @@ image = (
         "tokenizers==0.22.2",
         "hf_xet",
     )
-    # MAEMMBench/ is mounted AT /pmx/eval so `import eval_universal` inside the container is
+    # eval/ is mounted AT /pmx/eval so `import eval_universal` inside the container is
     # unchanged (eval/ at the repo root is now a shim dir that needs the repo on sys.path).
-    .add_local_dir(REPO / "MAEMMBench", "/pmx/eval",
-                   ignore=["__pycache__", "README.md", "analysis", "analysis/**"])
+    .add_local_dir(REPO / "eval", "/pmx/eval", ignore=["__pycache__", "out", "analysis", "modal_*", "test_*"])
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 

@@ -2,8 +2,8 @@
 
 Base model Qwen/Qwen3.6-27B, inject L1 / read L42, rsLoRA r64/α16 all-linear, steer-coeff 1.0.
 
-*(Training-box path mapping: `RL/rl_hf.py` = `train/rl.py` in this repo, `bsf27b/rl_ddp.sh` =
-`train/rl_ddp.sh`, `SL/pretrain.py` = `train/pretrain.py`.)*
+*(Training-box path mapping: `RL/rl_hf.py` = `rl/rl.py` in this repo, `bsf27b/rl_ddp.sh` =
+`rl/rl_ddp.sh`, `SL/pretrain.py` = `sft/pretrain.py`.)*
 
 ## SFT (shared base for every RL run)
 - **`big_sft`** — bank `pool_big_sft` = 1,000,000 examples (500k realact short-ctx ≤512 + 500k probes),

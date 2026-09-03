@@ -10,7 +10,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 
 app = modal.App("maemm-wildchat-bank")
 
@@ -31,10 +31,10 @@ image = (
         "datasets",
         "hf_xet",
     )
-    .add_local_dir(REPO / "eval", "/pmx/eval", ignore=["__pycache__", "out"])
+    .add_local_dir(REPO / "eval", "/pmx/eval", ignore=["__pycache__", "out", "analysis", "modal_*", "test_*"])
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
-    .add_local_file(REPO / "train" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")
-    .add_local_file(REPO / "MAEMMBench" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
+    .add_local_file(REPO / "eval" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")
+    .add_local_file(REPO / "eval" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
     .add_local_file(REPO / "eval" / "autointerp_detection.py", "/pmx/eval/autointerp_detection.py")
 )
 

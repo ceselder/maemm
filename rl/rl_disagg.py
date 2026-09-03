@@ -1,13 +1,13 @@
 """Disaggregated GRPO for the MAEMM universal inverter: X vLLM ROLLOUT GPUs + Y HF TRAINER GPUs in ONE
 container (N = X + Y processes, one GPU each), coupled through the container-local filesystem.
 
-Why. train/rl.py hosts BOTH the HF actor (61 GB resident, ~98 GB peak) AND a vLLM engine on EVERY GPU:
+Why. rl/rl.py hosts BOTH the HF actor (61 GB resident, ~98 GB peak) AND a vLLM engine on EVERY GPU:
 micro-batch is stuck at 3, vLLM gets a third of the GPU, old_logp is recomputed in HF, and the vllm_lens
 hook is O(layers x reqs x keys) per decode step -> 145-250 s per 1024-rollout step on 4 GPUs. Here every
 GPU does ONE job, the trainer never runs vLLM (-> no grad checkpointing, micro-batch 16-32), the sampler's
 own per-token logprobs ARE old_logp (no HF recompute; the 1-2 step policy lag is importance-corrected by
 the PPO clip + TIS cap from rl.py), and rollout GPUs run vLLM at 0.85 memory / 1024 seqs with a fast
-steering hook (train/fast_lens_ext.py) and optional CUDA graphs for decode.
+steering hook (rl/fast_lens_ext.py) and optional CUDA graphs for decode.
 
 Roles (this file, selected by --role; the launcher spawns the others):
   launch   parent: N children, CUDA_VISIBLE_DEVICES=<one gpu> each (GPUs [0,Y) trainers, [Y,N) rollouts),

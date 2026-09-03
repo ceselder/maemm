@@ -28,7 +28,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 
 APP_NAME = "maemm-pool-last5"
 app = modal.App(APP_NAME)

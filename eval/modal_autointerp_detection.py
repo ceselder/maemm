@@ -20,7 +20,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 
 app = modal.App("maemm-autointerp-detection")
 
@@ -41,7 +41,7 @@ image = (
         "datasets",
         "hf_xet",
     )
-    .add_local_dir(REPO / "eval", "/pmx/eval", ignore=["__pycache__"])
+    .add_local_dir(REPO / "eval", "/pmx/eval", ignore=["__pycache__", "out", "analysis", "modal_*", "test_*"])
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 

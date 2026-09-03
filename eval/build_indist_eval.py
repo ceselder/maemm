@@ -20,7 +20,7 @@ Idempotent: families already present in the cache are skipped; re-running is a n
 
 Run (paths overridable via env):
     MAEMM_POOL=data/pool_rl_mix MAEMM_EVAL_CACHE=data/eval_universal_ho/eval_sets_heldout.pt \
-        PYTHONPATH=$PWD python MAEMMBench/build_indist_eval.py
+        PYTHONPATH=$PWD python eval/build_indist_eval.py
 """
 import json
 import os
