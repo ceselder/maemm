@@ -283,10 +283,19 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    records = [json.loads(l) for l in open(f"{a.data_dir}/records.jsonl")]
-    n_vecs = max(r["vec_idx"] for r in records) + 1
+    # stream + shard while reading: 20M-record banks would otherwise put 8 full copies of the record list in host RAM
+    n_lines = sum(1 for _ in open(f"{a.data_dir}/records.jsonl", "rb"))
+    keep = n_lines // world                                   # equal shards (see below)
+    records = []
+    with open(f"{a.data_dir}/records.jsonl") as f:
+        for i, l in enumerate(f):
+            if i % world == rank and len(records) < keep:
+                records.append(json.loads(l))
+    vec_path, vec_bytes = next((os.path.join(a.data_dir, fn), np.dtype(dt).itemsize) for fn, dt in VEC_BANK_FILES
+                               if os.path.exists(os.path.join(a.data_dir, fn)))
+    n_vecs = os.path.getsize(vec_path) // (D_MODEL * vec_bytes)
+    assert all(r["vec_idx"] < n_vecs for r in records), "records reference rows beyond the vector bank"
     vecs, vec_file = open_vec_bank(a.data_dir, n_vecs)
-    records = records[rank::world][: len(records) // world]  # equal shards: unequal lengths deadlock DDP on the last batch
     if is_main:
         print(f"{len(records)*world} records, {n_vecs} vectors ({vec_file}), world={world}", flush=True)
 
