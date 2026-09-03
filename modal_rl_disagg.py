@@ -68,8 +68,8 @@ TRAIN_ARGS = [
     "--lr", "1e-5",
     "--reward-metric", "cosine",
     "--reward-scale", "1",
-    "--len-penalty-start", "32",
-    "--len-penalty-per-tok", "0.01",
+    "--len-penalty-start", "8",       # user (Sep 3): back to the original LP — active from 8 tokens
+    "--len-penalty-per-tok", "0.00025",  # user: 0.00025 cosine per token (was 0.01 past 32 = EasyNLA hinge; "don't do this")
     "--no-gates",
     "--kl-coef", "0.01",
     "--adv-mode", "group",
