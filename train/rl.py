@@ -1068,12 +1068,12 @@ def main():
         else:
             r = score(texts, dirs_rep, actor, tok, device, a)
         r = r * a.reward_scale
+        raw_r, gate_frac = r.clone(), 1.0                      # raw_r = the TRUE cosine (logged/transcripts), before any shaping
         eos_set = set(_eos_ids(tok, actor))
         trunc = torch.tensor([len(g) >= a.max_new_tokens and (not g or g[-1] not in eos_set) for g in gen_ids])
         trunc_frac = trunc.float().mean().item()
         if a.trunc_reward is not None and bool(trunc.any()):   # EasyNLA: cap-hit rollouts score a fixed failure reward and still train
             r[trunc] = a.trunc_reward
-        raw_r, gate_frac = r.clone(), 1.0
         gate = torch.ones(Bl * G, dtype=torch.bool)
         if use_gates:
             if a.fluency_floor is not None:
