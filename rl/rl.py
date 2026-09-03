@@ -607,7 +607,7 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
     out["eval/sae/beat_corpus"] = float(np.mean(best > cp))
     out["eval/sae/unverbalized_frac"] = float(np.mean(best <= EU.SAE_FIRE))
     out["eval/sae/unverbalized_p10"] = float(np.mean(na < 0.10))
-    cos_keys = [k for k in out if k.startswith("eval/") and k.endswith("/cos") and k.split("/")[1] not in EU.CONTROL_FAMS]
+    cos_keys = [k for k in out if k.startswith("eval/") and k.endswith("/cos") and k.split("/")[1] not in EU.CONTROL_FAMS and k.split("/")[1] != "sae"]   # sae/cos is a diagnostic, not a mean_all family
     out["eval/mean_all"] = float(np.mean([out[k] for k in cos_keys]))
     for fam in EV["fams"]:
         out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
