@@ -63,6 +63,9 @@ image = (
     # fla: transformers' Qwen3.5/3.6 GatedDeltaNet uses flash-linear-attention's Triton chunk kernels when importable,
     # else a pure-torch fallback (the last5_rp/big_rp SFT runs used the fallback: 10.6% MFU). Same pin as the RL image.
     .pip_install("flash-linear-attention==0.5.2")
+    # torchao: float8 training linears for --fp8-base (sft/fp8.py). 0.16.0 is the release built against torch 2.10.0
+    # (pytorch/ao#2919 compat table; 0.17+ target 2.11). Pure-python path (casts + torch._scaled_mm), no torchao kernels.
+    .pip_install("torchao==0.16.0")
 )
 # Hopper (H100/H200) opt-in at deploy/run time: SFT_TRITON=3.7.1. fla 0.5.2 refuses its gated chunk_bwd_dqkwg on Triton
 # 3.4-3.7.0 on Hopper (fla #640). No vLLM in this image, so the global Triton can simply be upgraded.
@@ -73,6 +76,9 @@ image = (
     image
     .add_local_file(REPO / "sft" / "pretrain.py", "/pmx/SL/pretrain.py")
     .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/SL/prefix_cache.py")   # --prefix-cache sibling import
+    .add_local_file(REPO / "sft" / "fp8.py", "/pmx/SL/fp8.py")            # --fp8-base (imported by pretrain.py)
+    .add_local_file(REPO / "sft" / "fp8_eval.py", "/pmx/SL/fp8_eval.py")  # fp8 speed/fidelity harness (fp8_eval fn)
+    .add_local_file(REPO / "sft" / "fp8_microbench.py", "/pmx/SL/fp8_microbench.py")  # fp8 GEMM/layer/profile bench
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 
@@ -345,6 +351,83 @@ def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: 
 
 @app.function(
     image=image,
+    gpu=os.environ.get("SFT_SMOKE_GPU", "B200:1"),
+    volumes={"/data": vol},
+    secrets=[
+        modal.Secret.from_name("maemm-hf"),
+        modal.Secret.from_name("maemm-wandb"),
+    ],
+    timeout=3 * 3600,
+)
+def fp8_eval(data_dir: str, n_records: int = 6400, extra_args: str = "", script: str = "SL/fp8_eval.py"):
+    """1 GPU: sft/fp8_eval.py -- bf16 vs --fp8-base speed (meter TFLOP/s, examples/s, peak mem), same-weights logit
+    KL / top-1, and N-step loss curves from one LoRA init on one batch order. Tiny bank = first n_records (the harness
+    needs train-steps*batch + kl batches). extra_args are appended (e.g. "--train-steps 300 --bench-batch-sizes 16,32").
+    script=SL/fp8_microbench.py runs the GEMM/layer/profiler microbenchmark instead (no bank; synthetic tokens).
+    Result JSON is printed and copied to /data/sft_mix/_fp8_eval/<utc>.json."""
+    import os
+    import shutil
+    import time
+
+    out = "/tmp/fp8_eval.json"
+    if script.endswith("fp8_microbench.py"):
+        os.environ["HF_HOME"] = "/data/hf_cache"  # --profile-model loads the (already cached) base model
+        cmd = ["python", script, "--out", out]
+    else:
+        if not data_dir.startswith("/"):
+            data_dir = f"/data/{data_dir}"
+        _, local_bank, _ = _preflight("smoke", data_dir, n_ckpts=2, resume_from="")
+        tiny = "/root/bank_fp8eval"
+        if not os.path.exists(tiny):
+            os.makedirs(tiny)
+            with open(f"{local_bank}/records.jsonl") as fin, open(f"{tiny}/records.jsonl", "w") as fout:
+                for i, line in enumerate(fin):
+                    if i >= n_records:
+                        break
+                    fout.write(line)
+            shutil.copy(f"{local_bank}/vecs.f32", f"{tiny}/vecs.f32")
+        print(f"[modal-fp8-eval] tiny bank: first {n_records} records", flush=True)
+        cmd = ["python", script, "--data-dir", tiny, "--out", out]
+    if extra_args:
+        cmd += extra_args.split()
+    rc = _stream(cmd, _train_env("nccl"), "modal-fp8-eval")
+    if os.path.exists(out):
+        dst = f"{SFT_ROOT}/_fp8_eval/{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy(out, dst)
+        vol.commit()
+        print(f"[modal-fp8-eval] result JSON -> {dst}", flush=True)
+        print("FP8_EVAL_JSON_BEGIN"); print(open(out).read()); print("FP8_EVAL_JSON_END", flush=True)
+    if rc != 0:
+        raise RuntimeError(f"fp8_eval exited rc={rc}")
+
+
+@app.function(image=image, timeout=600, cpu=2)
+def env_check():
+    """CPU-only image check: pins + the torchao float8 imports pretrain.py --fp8-base relies on."""
+    import importlib
+    import sys
+
+    import torch
+    print(f"python {sys.version.split()[0]} torch {torch.__version__} cuda_available={torch.cuda.is_available()}")
+    for pkg in ("torchao", "transformers", "peft", "accelerate", "fla", "triton"):
+        try:
+            print(f"{pkg} {getattr(importlib.import_module(pkg), '__version__', '?')}")
+        except Exception as e:  # noqa
+            print(f"{pkg} IMPORT FAILED: {e!r}")
+    from torchao.float8 import Float8LinearConfig
+    from torchao.float8.float8_linear import Float8Linear
+    from torchao.float8.float8_linear_utils import swap_linear_layers
+    sys.path.insert(0, "/pmx/SL")
+    import fp8
+    print(f"torchao float8 API OK: {Float8Linear.__name__}, {swap_linear_layers.__name__}")
+    print(f"fp8.py OK: recipe default={fp8.DEFAULT_RECIPE} MIN_DIM={fp8.MIN_DIM} "
+          f"config={Float8LinearConfig.from_recipe_name(fp8.DEFAULT_RECIPE)}")
+    print("ENV_CHECK_OK", flush=True)
+
+
+@app.function(
+    image=image,
     volumes={"/data": vol},
     secrets=[modal.Secret.from_name("maemm-hf")],
     timeout=7200,
@@ -453,3 +536,14 @@ def run_smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_ar
 @app.local_entrypoint()
 def run_prewarm():
     prewarm.remote()
+
+
+@app.local_entrypoint()
+def run_fp8_eval(data_dir: str = "banks/last5_rp", n_records: int = 6400, extra_args: str = "",
+                 script: str = "SL/fp8_eval.py"):
+    fp8_eval.remote(data_dir=data_dir, n_records=n_records, extra_args=extra_args, script=script)
+
+
+@app.local_entrypoint()
+def run_env_check():
+    env_check.remote()

@@ -259,6 +259,10 @@ def main():
                          "forward (token-weighted losses => identical to one big-batch mean-loss step). Amortizes the "
                          "B=1 prefix fwd+bwd (~225 ms/step on B200) and lowers peak memory: e.g. --batch-size 128 "
                          "--prefix-accum 2 fits one B200 where a single 128 micro-batch OOMs.")
+    ap.add_argument("--fp8-base", action="store_true",
+                    help="EXPERIMENTAL: run the frozen base linears in torchao float8 (fwd + grad_input GEMMs; LoRA A/B, "
+                         "lm_head, embeddings and the 5120->48 GDN gates stay bf16). Recipe via MAEMM_FP8_RECIPE "
+                         "(rowwise default | tensorwise). See sft/fp8.py.")
     ap.add_argument("--log-steps", type=int, default=20,
                     help="synchronize and report MFU every N optimizer steps (1 for trustworthy microbenchmarks)")
     ap.add_argument("--save-examples", default="",
@@ -309,6 +313,9 @@ def main():
         model = get_peft_model(model, LoraConfig(
             r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=0.0, use_rslora=True,
             target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
+    if a.fp8_base:  # after PEFT (only frozen base_layers convert), before grad-ckpt / compile / DDP
+        from fp8 import convert_frozen_base_to_fp8
+        convert_frozen_base_to_fp8(model, verbose=is_main)
     # 27B/64-layer OOMs on the 178GB B200 without activation checkpointing (~176GB resident at any
     # batch). enable_input_require_grads() above is the prerequisite; recompute activations in the
     # backward to fit. use_reentrant=False is required for LoRA/frozen-base + checkpointing.
