@@ -25,6 +25,8 @@ Needs Modal secrets `maemm-hf` (HF_TOKEN) and `maemm-wandb` (WANDB_API_KEY).
 
 from pathlib import Path
 
+import os
+
 import modal
 
 REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
@@ -51,6 +53,17 @@ image = (
         "tokenizers==0.22.2",
         "hf_xet",
     )
+    # fla: transformers' Qwen3.5/3.6 GatedDeltaNet uses flash-linear-attention's Triton chunk kernels when importable,
+    # else a pure-torch fallback (the last5_rp/big_rp SFT runs used the fallback: 10.6% MFU). Same pin as the RL image.
+    .pip_install("flash-linear-attention==0.5.2")
+)
+# Hopper (H100/H200) opt-in at deploy/run time: SFT_TRITON=3.7.1. fla 0.5.2 refuses its gated chunk_bwd_dqkwg on Triton
+# 3.4-3.7.0 on Hopper (fla #640). No vLLM in this image, so the global Triton can simply be upgraded.
+_SFT_TRITON = os.environ.get("SFT_TRITON", "")
+if _SFT_TRITON:
+    image = image.pip_install(f"triton=={_SFT_TRITON}")
+image = (
+    image
     .add_local_file(REPO / "sft" / "pretrain.py", "/pmx/SL/pretrain.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
@@ -158,7 +171,7 @@ def _stream(cmd, env, tag):
 
 @app.function(
     image=image,
-    gpu="B200:8",
+    gpu=os.environ.get("SFT_GPU", "B200:8"),
     volumes={"/data": vol},
     secrets=[
         modal.Secret.from_name("maemm-hf"),
@@ -254,7 +267,7 @@ def train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
 
 @app.function(
     image=image,
-    gpu="B200:1",
+    gpu=os.environ.get("SFT_SMOKE_GPU", "B200:1"),
     volumes={"/data": vol},
     secrets=[
         modal.Secret.from_name("maemm-hf"),
@@ -262,7 +275,7 @@ def train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
     ],
     timeout=7200,
 )
-def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8):
+def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: str = ""):
     """1xB200 pipeline validation: pre-warms /data/hf_cache, carves a tiny bank (first n_records
     of records.jsonl + the full vecs.f32) and runs world=1 SFT over it (no wandb, ckpts to /tmp,
     including the --n-ckpts intermediate-save path)."""
@@ -294,6 +307,8 @@ def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8):
         "--batch-size", str(batch_size),
         "--no-wandb",
     ]
+    if extra_args:
+        cmd += extra_args.split()   # e.g. "--compile --grad-ckpt 0 --autocast-bf16 --log-steps 10" (speed test)
     rc = _stream(cmd, _train_env("nccl"), "modal-smoke")
     if rc != 0:
         raise RuntimeError(f"smoke exited rc={rc}")
@@ -405,8 +420,8 @@ def run_train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
 
 
 @app.local_entrypoint()
-def run_smoke(data_dir: str, n_records: int = 256, batch_size: int = 8):
-    smoke.remote(data_dir=data_dir, n_records=n_records, batch_size=batch_size)
+def run_smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: str = ""):
+    smoke.remote(data_dir=data_dir, n_records=n_records, batch_size=batch_size, extra_args=extra_args)
 
 
 @app.local_entrypoint()

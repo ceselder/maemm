@@ -6,6 +6,7 @@ READ_LAYER residual space); injected at INJECT_LAYER at the marker. Teacher-forc
     torchrun --standalone --nproc_per_node=8 scripts/pretrain.py --data-dir data/pretrain --epochs 1
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -22,6 +23,22 @@ import wandb
 from mxf.config import D_MODEL, INJECT_LAYER, MODEL, STEER_COEFF, TrainConfig
 from mxf.inject import FixedPositionInjector, get_layer, hooked, make_inject_hook, make_packed_inject_hook
 from mxf.mfu import mfu
+
+
+@contextlib.contextmanager
+def autocast_region(model, enabled):
+    """--autocast-bf16: PEFT input-dtype casting off + torch.autocast(bf16) around the policy forward (mirrors
+    rl_disagg._policy_precision). Off = no-op, byte-identical to the legacy path."""
+    if not enabled:
+        yield
+        return
+    try:
+        from peft.helpers import disable_input_dtype_casting
+        cm = disable_input_dtype_casting(model)
+    except ImportError:
+        cm = contextlib.nullcontext()
+    with cm, torch.autocast("cuda", dtype=torch.bfloat16):
+        yield
 from mxf.prompts import build_sft_ids
 
 
@@ -102,6 +119,12 @@ def main():
                     help="packed blocks per device micro-batch (tokens/step = pack-blocks * pack-len)")
     ap.add_argument("--run-name", default=cfg.run_name)
     ap.add_argument("--compile", action="store_true", help="torch.compile the policy (test injection still fires)")
+    ap.add_argument("--grad-ckpt", type=int, default=1,
+                    help="1 = gradient checkpointing (legacy default; +33%% recompute). 0 = off -- a 178 GB B200 holds batch 16 x "
+                         "192 tokens without it (the RL trainer runs mb 12-16 at 295 tokens with no checkpointing).")
+    ap.add_argument("--autocast-bf16", action="store_true",
+                    help="bf16 LoRA matmuls/activations under torch.autocast with PEFT's fp32 input-dtype casting disabled "
+                         "(fp32 LoRA masters unchanged; HF's loss still upcasts logits to fp32). Same region as rl_disagg.")
     ap.add_argument("--log-steps", type=int, default=20,
                     help="synchronize and report MFU every N steps (1 for trustworthy microbenchmarks)")
     ap.add_argument("--save-examples", default="",
@@ -148,8 +171,17 @@ def main():
     # use_reentrant=True: the layer-1 injection forward-hook modifies activations, which breaks
     # non-reentrant checkpointing's forward-vs-recompute tensor-count determinism check. Reentrant
     # mode re-runs the forward without that check and tolerates the hook.
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+    if a.grad_ckpt:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
     model.train()
+    try:
+        import fla  # noqa
+        _fla = "v" + str(getattr(fla, "__version__", "?"))
+    except Exception:  # noqa
+        _fla = "ABSENT (torch GDN fallback -- slow)"
+    if is_main:
+        print(f"[pretrain] grad_ckpt={a.grad_ckpt} autocast_bf16={a.autocast_bf16} compile={a.compile} fla={_fla} "
+              f"gpu={torch.cuda.get_device_name(0)}", flush=True)
     n_params = sum(p.numel() for p in model.parameters())  # ~8.19B; LoRA adds <0.2%, fine for MFU
     submodule = get_layer(model, INJECT_LAYER)
     persistent_injector = persistent_handle = None
@@ -221,7 +253,7 @@ def main():
                 mask4 = packed_attn_mask(seg.to(device), causal, torch.bfloat16)
                 vmat = torch.from_numpy(np.asarray(vecs[[v for blk in batch for v in blk["vec_idxs"]]]))
                 hook = make_packed_inject_hook(vmat, rows, cols, STEER_COEFF, device, torch.bfloat16)
-                with hooked(submodule, hook):
+                with hooked(submodule, hook), autocast_region(model, a.autocast_bf16):
                     out = ddp(input_ids=input_ids.to(device), attention_mask=mask4,
                               position_ids=pos_ids.to(device), labels=labels.to(device),
                               use_cache=False)
@@ -242,12 +274,13 @@ def main():
                     # hook. The registered hook reads this stable buffer inside the compiled graph.
                     vmat = torch.from_numpy(np.asarray(vecs[[t[3] for t in batch]])).to(device)
                     persistent_injector.set_vectors(vmat)
-                    out = ddp(input_ids=input_ids.to(device), attention_mask=attn.to(device),
-                              labels=labels.to(device))
+                    with autocast_region(model, a.autocast_bf16):
+                        out = ddp(input_ids=input_ids.to(device), attention_mask=attn.to(device),
+                                  labels=labels.to(device))
                 else:
                     vlist = [torch.from_numpy(np.asarray(vecs[t[3]])).unsqueeze(0) for t in batch]
                     hook = make_inject_hook(vlist, [pos] * len(batch), STEER_COEFF, device, torch.bfloat16)
-                    with hooked(submodule, hook):
+                    with hooked(submodule, hook), autocast_region(model, a.autocast_bf16):
                         out = ddp(input_ids=input_ids.to(device), attention_mask=attn.to(device),
                                   labels=labels.to(device))
             out.loss.backward()
