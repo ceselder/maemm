@@ -41,6 +41,29 @@ grad_norm, rollout/len_mean, time/step_s, var/*, rollouts/samples ...) plus
 policy/offpolicy_lag_steps, policy/sampler_abs_dlogp, time/wait_rollouts_s, time/grad_sync_s,
 rollout/queue_depth, rollout/gen_s, rollout/tok_per_s_per_replica, rollout/blocks_dropped.
 
+ScaleRL variant (Khatri et al. 2025, "The Art of Scaling Reinforcement Learning Compute for LLMs", arXiv 2510.13786):
+OPT-IN -- every flag below defaults to the legacy behaviour above (default run = bit-identical to before); --recipe scalerl
+sets the whole bundle, flags given explicitly still win. Pure pieces are unit-tested on CPU in rl/test_rl_disagg_scalerl.py.
+  --max-lag 8           PipelineRL-8: the rollout queue may hold 8 steps' worth of blocks, so a block can be up to ~8 policy
+                        updates stale (legacy: 1). old_lp stays the SAMPLER's logprobs of the adapter that generated the
+                        block, so the per-token IS weight below is the off-policy correction. Adapters swap between blocks
+                        (a block = one <=96-token generate() call), not inside one, which is our grain of "in-flight" updates.
+  --loss cispo          -sg(min(rho, eps_max)) * A * log pi   (truncated-IS REINFORCE, MiniMax-M1 / ScaleRL): no PPO clip of
+                        the objective, every token keeps a gradient. --cispo-eps-max (paper ablates {4,5,8}: no difference).
+  --loss-agg prompt     token-mean within each direction's G rollouts, then mean over directions (each prompt weighs 1).
+  --adv-mode batch      (r - group_mean) / std of ALL surviving advantages in the global batch (rl.py's ScaleRL mode).
+  --zero-var-filter     groups with identical rewards (std <= --zero-var-eps) leave the effective batch: loss weight 0 AND
+                        out of every denominator (the paper's "effective batch"). Near-inert for a continuous cosine reward.
+  --npr-threshold 0.9   No-Positive-Resampling, ADAPTED to the continuous reward: a rollout is a "positive" when its raw
+                        cosine >= --npr-pass-cos; a direction whose cumulative pass rate over all its visits >= threshold is
+                        dropped from all future sampling (trainer rank 0 publishes npr/dropped.json, rollout ranks exclude it).
+  --fp32-head           trainer recomputes the frozen lm_head projection in fp32 (the log_softmax over the logits already
+                        was fp32 -- see _chunked_logp; the vLLM sampler stays bf16-head / fp32-softmax, we cannot change it).
+  --length-control      penalty (default, ALSO under --recipe scalerl: keeps the hinge LP) | interrupt (no LP; cap-hit
+                        snippets are scored as generated = our analogue of the forced wrap-up; needs --trunc-reward unset).
+  metrics under scalerl/*: is_weight_mean, is_trunc_frac, zero_var_dropped_frac, effective_groups, npr_* , lag_max,
+  trunc_frac, step_skipped. Every pre-existing metric name is unchanged.
+
 Launch inside the container (see modal_rl_disagg.py):
     python RL/rl_disagg.py --role launch --n-rollout 1 --n-trainer 3 --data-dir <pool> --init-adapter <sft> ...
 """
@@ -127,7 +150,8 @@ def parse_args(argv=None):
     ap.add_argument("--clip-eps", type=float, default=0.2)
     ap.add_argument("--tis-cap", type=float, default=2.0)
     ap.add_argument("--adv-mode", choices=["none", "group", "batch"], default=None)
-    ap.add_argument("--loss-agg", choices=["token", "seq"], default="token")
+    ap.add_argument("--loss-agg", choices=["token", "seq", "prompt"], default=None,
+                    help="token (default) | seq | prompt (ScaleRL: token-mean within each direction's group, then mean over directions)")
     ap.add_argument("--trunc-reward", type=float, default=None)
     ap.add_argument("--adam-betas", type=float, nargs=2, default=(0.9, 0.999), metavar=("B1", "B2"))
     ap.add_argument("--grad-ckpt", action="store_true", help="IGNORED (never needed off-vLLM)")
@@ -186,6 +210,29 @@ def parse_args(argv=None):
                     help="bench-rollout: <eager|graphs|stock>:<max_num_seqs> list, sharded over rollout ranks "
                          "(stock = eager with vllm_lens' stock hook, the rl.py baseline)")
     ap.add_argument("--bench-rollouts-per-rank", default="128,256,512,1024", help="bench-trainer: update() sizes to time")
+    # ScaleRL variant (module docstring). default=None means "not given", so --recipe fills the bundle without clobbering
+    # explicit flags; _resolve_recipe() turns the Nones into the legacy values otherwise.
+    ap.add_argument("--recipe", choices=("", "scalerl"), default="", help="scalerl = the whole ScaleRL bundle (explicit flags win)")
+    ap.add_argument("--loss", choices=("ppo", "cispo"), default=None,
+                    help="ppo (default: rl.py's clipped surrogate on the TIS-capped ratio) | cispo (truncated-IS REINFORCE)")
+    ap.add_argument("--cispo-eps-max", type=float, default=None, help="CISPO IS-weight truncation (paper ablates {4,5,8}; bundle 5)")
+    ap.add_argument("--zero-var-filter", dest="zero_var_filter", action="store_true", default=None,
+                    help="drop zero-variance groups from the effective batch (loss weight 0 and out of the denominators)")
+    ap.add_argument("--no-zero-var-filter", dest="zero_var_filter", action="store_false")
+    ap.add_argument("--zero-var-eps", type=float, default=1e-6, help="a group is zero-variance when its reward std <= this")
+    ap.add_argument("--npr-threshold", type=float, default=None,
+                    help="No-Positive-Resampling: drop a direction from future sampling once its cumulative pass rate >= this (0 = off)")
+    ap.add_argument("--npr-pass-cos", type=float, default=0.7,
+                    help="continuous-reward adaptation of 'correct': a rollout is a positive when its RAW cosine >= this")
+    ap.add_argument("--max-lag", type=int, default=None,
+                    help="max off-policyness in trainer steps: the rollout queue holds this many steps' worth of blocks "
+                         "(an explicit --max-queue-blocks overrides); legacy 1, ScaleRL 8")
+    ap.add_argument("--fp32-head", dest="fp32_head", action="store_true", default=None,
+                    help="trainer: recompute the frozen lm_head projection in fp32 (ScaleRL/MiniMax precision fix, trainer side)")
+    ap.add_argument("--no-fp32-head", dest="fp32_head", action="store_false")
+    ap.add_argument("--length-control", choices=("penalty", "interrupt"), default=None,
+                    help="penalty = the --len-penalty-* hinge (default, also under --recipe scalerl) | interrupt = no length "
+                         "penalty, cap-hit snippets scored as generated (our analogue of ScaleRL's forced interruption)")
     a = ap.parse_args(argv)
     assert a.div_coef == 0 and a.firsttok_coef == 0
     assert not (a.std_norm and a.batch_norm)
@@ -194,14 +241,39 @@ def parse_args(argv=None):
         a.fluency_floor = a.distinct_floor = None
     if a.no_len_penalty:
         a.len_penalty_start = None
+    _resolve_recipe(a)
     if a.rollout_block_groups <= 0:
         a.rollout_block_groups = max(1, a.groups_per_step // max(a.n_rollout, 1))
     assert a.groups_per_step % a.rollout_block_groups == 0, "groups_per_step must be a multiple of rollout_block_groups"
     a.blocks_per_step = a.groups_per_step // a.rollout_block_groups
     if a.max_queue_blocks <= 0:
-        a.max_queue_blocks = a.blocks_per_step
+        a.max_queue_blocks = a.max_lag * a.blocks_per_step      # legacy max_lag 1 -> one step's worth (unchanged)
     if a.max_num_seqs <= 0:
         a.max_num_seqs = a.rollout_block_groups * a.group_size
+    return a
+
+
+# The two bundles _resolve_recipe() fills unspecified (None) variant flags from. LEGACY == the pre-ScaleRL defaults.
+SCALERL_BUNDLE = {"loss": "cispo", "cispo_eps_max": 5.0, "loss_agg": "prompt", "zero_var_filter": True,
+                  "npr_threshold": 0.9, "max_lag": 8, "fp32_head": True, "length_control": "penalty"}
+LEGACY_BUNDLE = {"loss": "ppo", "cispo_eps_max": 5.0, "loss_agg": "token", "zero_var_filter": False,
+                 "npr_threshold": 0.0, "max_lag": 1, "fp32_head": False, "length_control": "penalty"}
+
+
+def _resolve_recipe(a):
+    """Fill every ScaleRL-variant flag the user did not give (None) from the bundle --recipe selects; --recipe scalerl also
+    picks --adv-mode batch unless an advantage mode was given. With --recipe '' and no variant flags nothing changes."""
+    bundle = SCALERL_BUNDLE if a.recipe == "scalerl" else LEGACY_BUNDLE
+    for k, v in bundle.items():
+        if getattr(a, k) is None:
+            setattr(a, k, v)
+    if a.recipe == "scalerl" and a.adv_mode is None and not (a.std_norm or a.batch_norm):
+        a.adv_mode = "batch"
+    if a.length_control == "interrupt":
+        a.len_penalty_start = None
+        assert a.trunc_reward is None, "--length-control interrupt scores cap-hit rollouts as generated: unset --trunc-reward"
+    assert a.cispo_eps_max > 0 and a.max_lag >= 1 and 0.0 <= a.npr_threshold <= 1.0
+    assert a.max_lag == 1 or not a.drop_stale, "--max-lag > 1 needs the FIFO queue (--drop-stale would discard the lagged blocks)"
     return a
 
 
@@ -253,6 +325,191 @@ def _bank_open(a):
                 i += 1
         eval_rows = i
     return bank, n_vecs, eval_rows
+
+
+# ----------------------------------------------------------------------------------------------
+# ScaleRL pieces: pure functions / plain state, unit-tested on CPU in rl/test_rl_disagg_scalerl.py
+# ----------------------------------------------------------------------------------------------
+def _sample_block_idx(rng, lo, hi, size, dropped=None):
+    """`size` distinct bank rows in [lo, hi), sorted. Without a drop set this is EXACTLY the original rollout draw
+    (same rng stream); with one (No-Positive-Resampling) the dropped rows are excluded by rejection -- the surviving
+    prefix of a uniform without-replacement draw is a uniform without-replacement draw from the allowed rows."""
+    import numpy as np
+    if not dropped:
+        return lo + np.sort(rng.choice(hi - lo, size=size, replace=False))
+    n_drop = sum(1 for i in dropped if lo <= i < hi)
+    assert hi - lo - n_drop >= size, f"only {hi - lo - n_drop} directions left after NPR dropped {n_drop}"
+    k = size
+    while True:
+        k = min(hi - lo, 2 * k)
+        cand = lo + rng.choice(hi - lo, size=k, replace=False)
+        cand = cand[np.fromiter((int(c) not in dropped for c in cand), dtype=bool, count=len(cand))]
+        if len(cand) >= size:
+            return np.sort(cand[:size])
+
+
+class NPRTracker:
+    """No-Positive-Resampling (ScaleRL: "maintaining a history of pass rates and permanently removing any prompt with pass
+    rate >= 0.9 from subsequent epochs"), ADAPTED to a continuous reward: a rollout is a 'positive' when its raw cosine
+    >= pass_cos; a direction's pass rate is positives / rollouts over ALL its visits so far (the "history"); once that rate
+    >= threshold the direction is dropped from every future block (G=8, 0.9: 8/8 on one visit, 15/16 over two, ...).
+    Owned by trainer rank 0 (which sees every rank's rewards); publish() writes the drop list _NPRDropList reads."""
+
+    def __init__(self, threshold, pass_cos):
+        self.threshold, self.pass_cos = float(threshold), float(pass_cos)
+        self.hist = {}            # dir_idx -> [positives, rollouts]
+        self.dropped = set()
+        self._dirty = False
+
+    def update(self, dir_idx, raw_cos, group_size):
+        """dir_idx [B] bank rows (-1 = random direction, ignored); raw_cos [B*G] group-major RAW cosines. -> step stats."""
+        import numpy as np
+        idx = np.asarray(dir_idx).reshape(-1)
+        pos = np.asarray(raw_cos, dtype=np.float64).reshape(len(idx), int(group_size)) >= self.pass_cos
+        n_new, n_flag = 0, 0
+        for i, row in zip(idx.tolist(), pos):
+            if i < 0:
+                continue
+            h = self.hist.setdefault(i, [0, 0])
+            h[0] += int(row.sum()); h[1] += int(row.size)
+            if h[0] / h[1] >= self.threshold:
+                n_flag += 1
+                if i not in self.dropped:
+                    self.dropped.add(i); n_new += 1; self._dirty = True
+        return {"scalerl/npr_pass_frac": float(pos.mean()) if pos.size else 0.0,
+                "scalerl/npr_batch_flagged_frac": n_flag / max(len(idx), 1),
+                "scalerl/npr_new_dropped": float(n_new), "scalerl/npr_dropped_total": float(len(self.dropped)),
+                "scalerl/npr_directions_seen": float(len(self.hist))}
+
+    def publish(self, path):
+        """Atomic json list of the dropped rows, rewritten only when the set changed. Returns True when written."""
+        if not self._dirty:
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _atomic_write_text(path, json.dumps(sorted(self.dropped)))
+        self._dirty = False
+        return True
+
+
+class _NPRDropList:
+    """Rollout-side reader of NPRTracker.publish(): re-reads the file only when its mtime changes."""
+
+    def __init__(self, path):
+        self.path, self.mtime, self.dropped = path, None, set()
+
+    def refresh(self):
+        try:
+            mt = os.path.getmtime(self.path)
+        except FileNotFoundError:
+            return self.dropped
+        if mt != self.mtime:
+            try:
+                with open(self.path) as f:
+                    self.dropped = set(json.load(f))
+                self.mtime = mt
+            except (ValueError, OSError):     # mid-replace / half-written: keep the previous list, retry next block
+                pass
+        return self.dropped
+
+
+def compute_advantages_disagg(r, n_groups, group_size, mode, zero_var_eps=1e-6, zero_var_filter=False):
+    """rl.py compute_advantages (none = Dr. GRPO centering; group = / per-group std; batch = ScaleRL: zero-variance groups
+    zeroed, / ONE std of all surviving advantages of the GLOBAL batch, all_reduce'd over DDP) with the zero-variance
+    threshold exposed, plus the ScaleRL effective-batch mask: keep [n_groups*group_size] bool, None when the filter is
+    off (-> the loss weights are the original ones bit for bit). Zero-variance = reward std <= zero_var_eps."""
+    import torch
+    import torch.distributed as dist
+    rg = r.view(n_groups, group_size)
+    adv = rg - rg.mean(1, keepdim=True)
+    nz_g = rg.std(1) > zero_var_eps
+    if mode == "group":
+        adv = adv / (rg.std(1, keepdim=True) + 1e-6)
+    elif mode == "batch":
+        nz = nz_g[:, None].expand(-1, group_size)
+        adv = adv * nz
+        stats = torch.tensor([adv[nz].double().pow(2).sum(), adv[nz].double().sum(), nz.sum()], dtype=torch.float64)
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(stats)                                        # CPU tensor -> gloo
+        n = stats[2].item()
+        std = math.sqrt(max(stats[0].item() / n - (stats[1].item() / n) ** 2, 0.0)) if n > 1 else 1.0
+        adv = adv / (std + 1e-6)
+    elif mode != "none":
+        raise ValueError(mode)
+    keep = nz_g.repeat_interleave(group_size) if zero_var_filter else None
+    return adv.flatten().detach(), keep
+
+
+def loss_weights(gen_mask, loss_agg, group_size=1, keep=None):
+    """Per-token loss weights w_all [n,T] (sum 1 over the local batch) + the weight _sync_grads uses so the DDP
+    all-reduce equals the single-GPU gradient over the union batch:
+      token  : every completion token weighs 1/total_tok                              (sync_w = total_tok)  rl.py / DAPO
+      seq    : every rollout weighs 1/n, its tokens 1/|y_i| within                    (sync_w = n)          GRPO sample-mean
+      prompt : every GROUP (direction) weighs 1/n_groups, its tokens 1/sum_g |y_g| within (sync_w = n_groups) ScaleRL
+    keep [n] bool (zero-variance filter): dropped rollouts weigh 0 and leave every denominator (effective batch).
+    keep=None reproduces the original rl_disagg expressions bit for bit."""
+    import torch
+    n = gen_mask.shape[0]
+    gm = gen_mask.float()
+    if keep is None:
+        if loss_agg == "seq":
+            return gm / gen_mask.sum(1, keepdim=True).clamp(min=1).float() / n, float(n)
+        if loss_agg == "token":
+            total_tok = max(int(gen_mask.sum()), 1)
+            return gm / total_tok, float(total_tok)
+        keep = torch.ones(n, dtype=torch.bool)
+    gm = gm * keep.float()[:, None]
+    if loss_agg == "token":
+        tot = max(int(gm.sum()), 1)
+        return gm / tot, float(tot)
+    if loss_agg == "seq":
+        n_eff = max(int(keep.sum()), 1)
+        return gm / gm.sum(1, keepdim=True).clamp(min=1) / n_eff, float(n_eff)
+    if loss_agg == "prompt":
+        G = int(group_size)
+        assert n % G == 0, f"{n} rollouts is not a multiple of the group size {G}"
+        m3 = gm.view(n // G, G, -1)
+        tok_g = m3.sum((1, 2))                                            # completion tokens per group (0 when dropped)
+        n_eff = max(int((tok_g > 0).sum()), 1)
+        return (m3 / tok_g.clamp(min=1)[:, None, None] / n_eff).view(n, -1), float(n_eff)
+    raise ValueError(loss_agg)
+
+
+def pg_token_loss(new_lp, old_lp, A, loss, clip_eps, tis_cap, cispo_eps_max):
+    """Per-token policy-gradient loss BEFORE the aggregation weights, for A broadcast over tokens ([n,1]):
+      ppo   : rl.py's clipped surrogate on ratio = min(exp(new-old), tis_cap): -min(ratio*A, clip(ratio, 1-+eps)*A)
+      cispo : ScaleRL / MiniMax-M1 truncated-IS REINFORCE: -sg(min(exp(new-old), eps_max)) * A * new_lp -- no clip of the
+              objective, every token keeps a gradient; the truncation IS the off-policy correction (lower bound 0).
+    Returns (loss_tok [n,T], ratio [n,T] = the IS weight the gradient sees (detached for cispo), rho [n,T] raw ratio, no grad)."""
+    import torch
+    if loss == "cispo":
+        rho = torch.exp(new_lp.detach() - old_lp)
+        is_w = rho.clamp(max=cispo_eps_max)
+        return -(is_w * A * new_lp), is_w, rho
+    ratio = torch.exp(new_lp - old_lp).clamp(max=tis_cap)
+    with torch.no_grad():
+        rho = torch.exp(new_lp - old_lp)
+    return -torch.minimum(ratio * A, ratio.clamp(1 - clip_eps, 1 + clip_eps) * A), ratio, rho
+
+
+def install_fp32_head(actor):
+    """ScaleRL / MiniMax-M1 "FP32 at the LM head", trainer side: a forward hook replaces the lm_head output with
+    F.linear(x.float(), W_fp32) so the logits the loss sees are not bf16-rounded (their log_softmax already was fp32, see
+    _chunked_logp). W_fp32 is ONE persistent detached copy (2x the head's bf16 bytes; ~5 GB for a 248k x 5120 head) so no
+    per-call cast is kept alive for backward. lm_head must be a frozen nn.Linear (PEFT 'all-linear' never wraps it).
+    Returns the hook handle."""
+    import torch
+    import torch.nn.functional as F
+    heads = [(n, m) for n, m in actor.named_modules() if n.endswith("lm_head")]
+    assert len(heads) == 1, f"expected exactly one lm_head module, found {[n for n, _ in heads]}"
+    name, head = heads[0]
+    assert isinstance(head, torch.nn.Linear) and not any(p.requires_grad for p in head.parameters()), \
+        f"{name} must be a frozen nn.Linear (got {type(head).__name__})"
+    w32 = head.weight.detach().float()
+    b32 = None if head.bias is None else head.bias.detach().float()
+
+    def _fp32_out(mod, inp, out):
+        return F.linear(inp[0].float(), w32, b32)
+    return head.register_forward_hook(_fp32_out)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -595,6 +852,7 @@ def run_rollout(a):
     inflight = f"{work}/queue/.inflight_{rank}"
     n_rollout = int(os.environ["DISAGG_WORLD"])
     ev_job, ev_done = None, set()
+    npr_drop = _NPRDropList(f"{work}/npr/dropped.json") if a.npr_threshold > 0 else None   # No-Positive-Resampling
 
     def depth():   # complete blocks + blocks other ranks are generating right now (so N producers cannot all overshoot the cap)
         return len(_queue_files(work)) + len([f for f in glob.glob(f"{work}/queue/.inflight_*") if f != inflight])
@@ -636,7 +894,7 @@ def run_rollout(a):
             idx = np.full(Bb, -1, dtype=np.int64)
             dirs = F.normalize(torch.randn(Bb, D_MODEL, dtype=torch.float32), dim=-1)
         else:
-            idx = eval_rows + np.sort(rng.choice(n_vecs - eval_rows, size=Bb, replace=False))
+            idx = _sample_block_idx(rng, eval_rows, n_vecs, Bb, npr_drop.refresh() if npr_drop is not None else None)
             dirs = F.normalize(torch.from_numpy(np.asarray(bank[idx], dtype=np.float32)), dim=-1)
         gen_ids, lps, appended, gen_s = _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_ids,
                                                         key_prefix=f"r{rank}b{blk}")
@@ -752,12 +1010,18 @@ def _sync_grads(params, weight, backend, device):
     flat = torch.cat([g.detach().reshape(-1).float() for g in grads] + [torch.ones(1, device=grads[0].device)]).to(dev)
     flat.mul_(float(weight))
     dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-    flat.div_(flat[-1].item())
+    tot = flat[-1].item()
+    if tot <= 0:                  # every rank's effective batch is empty (zero-variance filter): nothing to average
+        for g in grads:
+            g.zero_()
+        return 0.0
+    flat.div_(tot)
     off = 0
     for g in grads:
         n = g.numel()
         g.copy_(flat[off : off + n].view_as(g))
         off += n
+    return tot
 
 
 def _chunked_logp(logits, targets, vocab_chunk, need_entropy_grad):
@@ -780,10 +1044,13 @@ def _chunked_logp(logits, targets, vocab_chunk, need_entropy_grad):
     return torch.cat(lp_chunks, 1), torch.cat(ent_chunks, 1)
 
 
-def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb):
+def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=None):
     """rl.py update() with: vLLM sampler logprobs as old_lp (ratio := 1 where the sampler logp is unknown, i.e.
     the re-appended stop token), logits only for the completion positions (logits_to_keep), fp32 vocab math
-    in chunks, use_cache off, exact weighted grad sync. Returns rl.py's stats + sampler_abs_dlogp."""
+    in chunks, use_cache off, exact weighted grad sync. Returns rl.py's stats + sampler_abs_dlogp.
+    ScaleRL variant: a.loss (ppo | cispo), a.loss_agg (token | seq | prompt) and keep (effective-batch mask from the
+    zero-variance filter, None = everything) go through pg_token_loss() / loss_weights(); the legacy flags reproduce the
+    original arithmetic bit for bit."""
     import torch
     import torch.distributed as dist
     import rl_hf as R
@@ -792,13 +1059,9 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     T = L - p_len
     gen_mask = attn[:, p_len:].bool()
     total_tok = max(int(gen_mask.sum()), 1)
-    if a.loss_agg == "seq":
-        w_all = gen_mask.float() / gen_mask.sum(1, keepdim=True).clamp(min=1).float() / n
-        sync_w = float(n)
-    else:
-        w_all = gen_mask.float() / total_tok
-        sync_w = float(total_tok)
+    w_all, sync_w = loss_weights(gen_mask, a.loss_agg, a.group_size, keep)
     lo, hi = 1 - a.clip_eps, 1 + a.clip_eps
+    trunc_cap = a.cispo_eps_max if a.loss == "cispo" else a.tis_cap
     t_ref = time.time()
     # micro-batches of LENGTH-SORTED rollouts, each padded only to ITS longest sequence: the loss weights are
     # per-sequence and independent of batching, so this is exactly the same gradient as global padding while
@@ -835,6 +1098,7 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     t_ref = time.time() - t_ref
     opt.zero_grad(set_to_none=True)
     loss_sum, clipped_tok, ent_sum, kl_sum, ratio_sum, dlp_sum, dlp_n = 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0
+    isw_sum, trunc_tok = 0.0, 0
     t_fb = time.time()
     for ix, Lc in chunks(mb):
         Tc = Lc - p_len
@@ -847,8 +1111,8 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
             new_lp, ent = _chunked_logp(logits, b_ids[:, p_len:], a.vocab_chunk, a.entropy_coef > 0)
             del logits
             olp_eff = torch.where(kn, olp, new_lp.detach())
-            ratio = torch.exp(new_lp - olp_eff).clamp(max=a.tis_cap)
-            loss = (-torch.minimum(ratio * A, ratio.clamp(lo, hi) * A) * w).sum()
+            loss_tok, ratio, rho = pg_token_loss(new_lp, olp_eff, A, a.loss, a.clip_eps, a.tis_cap, a.cispo_eps_max)
+            loss = (loss_tok * w).sum()
             ent_sum += float((ent.detach() * m).sum())
             if a.entropy_coef > 0:
                 loss = loss - a.entropy_coef * (ent * w).sum()
@@ -862,24 +1126,34 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         loss_sum += loss.item()
         clipped_tok += int((((ratio < lo) | (ratio > hi)) & m).sum())
         ratio_sum += float((ratio.detach() * m).sum())
+        with torch.no_grad():   # the IS weight the gradient actually sees: min(rho, eps_max) (cispo) / ratio where the PPO clip is inactive
+            eff = ratio.detach() if a.loss == "cispo" else ratio.detach() * ~(((ratio > hi) & (A > 0)) | ((ratio < lo) & (A < 0)))
+            isw_sum += float((eff * m).sum()); trunc_tok += int(((rho > trunc_cap) & m).sum())
         mk = m & kn
         dlp_sum += float(((new_lp.detach() - olp).abs() * mk).sum()); dlp_n += int(mk.sum())
-        del new_lp, ent, ratio, loss, olp_eff
+        del new_lp, ent, ratio, loss, olp_eff, loss_tok, rho, eff
     t_fb = time.time() - t_fb
     params = [p for p in actor.parameters() if p.requires_grad]
     t_sync = time.time()
+    tot_w = sync_w
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        _sync_grads(params, sync_w, a.backend, device)
+        tot_w = _sync_grads(params, sync_w, a.backend, device)
     t_sync = time.time() - t_sync
-    gn = float(torch.nn.utils.clip_grad_norm_(params, a.max_grad_norm))
-    if math.isfinite(gn):
-        opt.step()
+    skipped = 0
+    if tot_w <= 0:               # zero-variance filter emptied the global effective batch (never with keep=None)
+        opt.zero_grad(set_to_none=True); gn = 0.0; skipped = 1
+        print("[update] empty effective batch (every group zero-variance) -- skipping step", flush=True)
     else:
-        opt.zero_grad(set_to_none=True)
-        print(f"[update] non-finite grad norm ({gn}) -- skipping step", flush=True)
+        gn = float(torch.nn.utils.clip_grad_norm_(params, a.max_grad_norm))
+        if math.isfinite(gn):
+            opt.step()
+        else:
+            opt.zero_grad(set_to_none=True); skipped = 1
+            print(f"[update] non-finite grad norm ({gn}) -- skipping step", flush=True)
     return {"loss": loss_sum, "grad_norm": gn, "clipfrac": clipped_tok / total_tok, "entropy": ent_sum / total_tok,
             "kl": kl_sum / total_tok, "ratio_mean": ratio_sum / total_tok, "sampler_abs_dlogp": dlp_sum / max(dlp_n, 1),
-            "t_ref": t_ref, "t_fb": t_fb, "t_sync": t_sync, "n_unknown_lp": int((gen_mask & ~known).sum())}
+            "t_ref": t_ref, "t_fb": t_fb, "t_sync": t_sync, "n_unknown_lp": int((gen_mask & ~known).sum()),
+            "is_weight_mean": isw_sum / total_tok, "is_trunc_frac": trunc_tok / total_tok, "sync_w": sync_w, "skipped": skipped}
 
 
 def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag):
@@ -1176,6 +1450,9 @@ def run_trainer(a):
         actor = get_peft_model(actor, LoraConfig(r=tr.lora_r, lora_alpha=tr.lora_alpha, lora_dropout=0.0, use_rslora=True,
                                                  target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
     actor.train()
+    if a.fp32_head:   # before the micro-batch search so its +memory is part of the OOM probe
+        install_fp32_head(actor)
+        _log(tag, "lm_head recomputed in fp32 (ScaleRL precision fix, trainer side; the vLLM sampler stays bf16-head/fp32-softmax)")
     opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0,
                             eps=a.adam_eps, betas=tuple(a.adam_betas))
     optim_p = os.path.join(a.init_adapter or "", "optim.pt")
@@ -1243,9 +1520,18 @@ def run_trainer(a):
                 vi = rec.get("vec_idx", i)
                 if vi not in tgt_map and rec.get("target_text") is not None:
                     tgt_map[vi] = (rec.get("family"), rec["target_text"][:240])
+    npr, npr_path, n_bank_avail = None, f"{work}/npr/dropped.json", 0
+    if a.npr_threshold > 0 and a.direction_source == "cluster":
+        npr = NPRTracker(a.npr_threshold, a.npr_pass_cos)          # rank 0 drives it; every rank sees the same gathered rewards
+        _, _nv, _er = _bank_open(a)
+        n_bank_avail = int(_nv - _er)
     if is_main:
         _log(tag, f"B={B} groups x G={G} per step from {a.blocks_per_step} block(s) of {a.rollout_block_groups} | adv {adv_mode} "
                   f"| gates {use_gates} | mb {mb} | ref-mb {a.ref_micro_batch} | queue cap {a.max_queue_blocks} | {'drop-stale' if a.drop_stale else 'FIFO'}")
+        _log(tag, f"recipe {a.recipe or 'legacy'} | loss {a.loss} " + (f"eps_max {a.cispo_eps_max}" if a.loss == "cispo" else f"clip {a.clip_eps} tis {a.tis_cap}")
+                  + f" | loss-agg {a.loss_agg} | zero-var filter {a.zero_var_filter} (eps {a.zero_var_eps}) | NPR {a.npr_threshold}"
+                  + (f" (pass cos {a.npr_pass_cos}, {n_bank_avail} directions)" if npr is not None else " (off)")
+                  + f" | max lag {a.max_lag} step(s) | fp32 head {a.fp32_head} | length control {a.length_control}")
         if not a.no_wandb:
             wandb.init(project="maxact-fast", name=a.run_name, config={**vars(a), "micro_batch_used": mb, "mb_search": mb_res,
                                                                         "fla": fla_v, "disagg": True},
@@ -1321,6 +1607,7 @@ def run_trainer(a):
         lps_all = [l for b in blocks for l in b["lps"]]
         assert dirs_all.shape[0] == B and len(gen_all) == B * G, f"batch shape {dirs_all.shape[0]} groups / {len(gen_all)} seqs"
         lag = float(np.mean([step - b["adapter_step"] for b in blocks]))
+        lag_max = float(max(step - b["adapter_step"] for b in blocks))
         gen_s = float(np.mean([b["gen_s"] for b in blocks]))
         blk_tok = float(np.sum([b["n_tok"] for b in blocks]))
         my_groups = np.array_split(np.arange(B), world)[rank]
@@ -1356,7 +1643,7 @@ def run_trainer(a):
         if a.len_penalty_start is not None:
             over = torch.tensor([max(0, len(g) - a.len_penalty_start) for g in gen_ids], dtype=torch.float32)
             r = r - a.len_penalty_per_tok * over * gate.float()
-        adv = R.compute_advantages(r, Bl, G, adv_mode)
+        adv, keep = compute_advantages_disagg(r, Bl, G, adv_mode, a.zero_var_eps, a.zero_var_filter)
         t_sc = time.time() - t_sc
 
         _table = None
@@ -1394,7 +1681,7 @@ def run_trainer(a):
             for _g in opt.param_groups:
                 _g["lr"] = a.lr * min(1.0, (step + 1) / a.warmup_steps)
 
-        stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb)
+        stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=keep)
         if a.entropy_target > 0:   # SAC-style temperature adaptation on the measured per-token entropy of this step
             a.entropy_coef = float(min(a.entropy_coef_max, max(a.entropy_coef_min,
                                    a.entropy_coef * math.exp(a.entropy_adapt_rate * (a.entropy_target - stats["entropy"])))))
@@ -1415,10 +1702,11 @@ def run_trainer(a):
         torch.cuda.reset_peak_memory_stats(device)
         n_gen = float(sum(len(g) for g in gen_ids))
         _rg = raw_r.view(Bl, G)
+        n_dropped_g = 0.0 if keep is None else float((~keep.view(Bl, G)[:, 0]).sum())
         loc = torch.tensor([n_gen, gate_frac * Bl, r.view(Bl, G).std(1).sum().item(), Bl,
                             _rg.std(1).sum().item(), (_rg.std(1) < 1e-6).float().sum().item(),
                             adv.pow(2).sum().item(), adv.abs().sum().item(), float(Bl * G),
-                            stats["n_unknown_lp"]], dtype=torch.float64)
+                            stats["n_unknown_lp"], n_dropped_g], dtype=torch.float64)
         gmin, gmax = torch.tensor([_rg.std(1).min().item()]), torch.tensor([_rg.std(1).max().item()])
         if world > 1:
             dev = device if a.backend == "nccl" else "cpu"
@@ -1448,7 +1736,16 @@ def run_trainer(a):
                "time/step_s": secs, "time/wait_rollouts_s": t_wait, "time/score_s": t_sc, "time/update_s": t_up,
                "time/ref_pass_s": stats["t_ref"], "time/fwd_bwd_s": stats["t_fb"], "time/grad_sync_s": stats["t_sync"],
                "time/publish_s": t_pub, "time/rollout_s": gen_s,
-               "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, "micro_batch": mb}
+               "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, "micro_batch": mb,
+               # ScaleRL diagnostics (present in every run; zero/inert when the variant flags are off)
+               "scalerl/is_weight_mean": stats["is_weight_mean"], "scalerl/is_trunc_frac": stats["is_trunc_frac"],
+               "scalerl/zero_var_dropped_frac": float(loc[10] / n_groups_all), "scalerl/effective_groups": float(n_groups_all - loc[10]),
+               "scalerl/lag_max": lag_max, "scalerl/trunc_frac": trunc_frac, "scalerl/step_skipped": float(stats["skipped"])}
+        if npr is not None:   # No-Positive-Resampling bookkeeping on the whole batch (every rank has the gathered rewards; rank 0 publishes)
+            log.update(npr.update(idx_all, (raw_r_all / a.reward_scale).numpy(), G))
+            log["scalerl/npr_dropped_frac_of_bank"] = len(npr.dropped) / max(n_bank_avail, 1)
+            if is_main:
+                npr.publish(npr_path)
         if R.SCORE_STATS.get("peak_dist"):
             _pd = torch.cat(R.SCORE_STATS["peak_dist"]); log["reward/peak_dist_mean"] = _pd.mean().item()
             log["reward/peak_in_last5_frac"] = (_pd <= 4).float().mean().item()
@@ -1549,6 +1846,8 @@ def run_bench_trainer(a):
     actor = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
     actor = PeftModel.from_pretrained(actor, a.init_adapter, is_trainable=True)
     actor.train()
+    if a.fp32_head:
+        install_fp32_head(actor)
     opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0, eps=a.adam_eps, betas=tuple(a.adam_betas))
     submodule = get_layer(actor, INJECT_LAYER)
     if a.kl_coef > 0:

@@ -49,7 +49,8 @@ data/       activation collection + direction-bank building (+ their Modal launc
 sft/        match-activation SFT: pretrain.py (LoRA; single- or multi-GPU via torchrun) + modal_sft.py
 rl/         RL: rl.py (GRPO, actor + vLLM on every rank), rl_disagg.py (X vLLM rollout GPUs + Y trainer GPUs — the fast path),
             fast_lens_ext.py (vLLM steering hook), rl_ddp.sh, modal_rl_disagg.py (production launcher), modal_rl*.py (older launchers),
-            patches/ (historical), test_rl_disagg_queue.py
+            patches/ (historical), test_rl_disagg_queue.py, test_rl_disagg_scalerl.py (CPU tests of the opt-in
+            ScaleRL variant: --recipe scalerl = PipelineRL-8 lag, CISPO, prompt-level agg, batch adv norm, zero-var filter, NPR)
 eval/       THE EVAL SUITE (see eval/README.md): eval_universal.py (held-out family cosine + mean_all, SAE norm_act / rank / cos /
             %unverbalized, random control, ctx-bucket + in-distribution families), snippet_locality.py, autointerp_detection.py,
             inline_extra_evals.py (locality + autointerp AUC + WildChat fire-prediction + adversarial confirmation, judge = Sonnet 5),
