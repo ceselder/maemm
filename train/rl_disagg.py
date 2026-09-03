@@ -160,10 +160,19 @@ def parse_args(argv=None):
                     help="rollout backpressure: max unconsumed blocks; 0 = one step's worth (lag stays 1 with full overlap)")
     ap.add_argument("--drop-stale", action="store_true", help="consume the NEWEST blocks and discard older ones (min lag, wastes rollouts)")
     ap.add_argument("--publish-every", type=int, default=1)
-    ap.add_argument("--keep-loras", type=int, default=3)
+    ap.add_argument("--keep-loras", type=int, default=10,
+                    help="published adapters kept: an eval request needs its adapter on disk until every rollout rank has generated its shard "
+                         "(vLLM has 2 LoRA slots; the live policy advancing each step can evict the eval adapter -> reload from disk)")
     ap.add_argument("--publish-fp32", action="store_true",
                     help="publish the adapter in fp32 (rl.py behaviour). Default bf16: vLLM casts LoRA weights to the model dtype (bf16) on load anyway, so the served policy is identical and the write is half the size")
     ap.add_argument("--no-fla", action="store_true", help="trainer: block the fla (flash-linear-attention) GDN kernels -> HF torch fallback")
+    # inline eval (disaggregated): rollout ranks generate the held-out eval texts as a side job, trainer ranks score
+    ap.add_argument("--eval-chunk-seqs", type=int, default=512,
+                    help="rollout ranks: eval sequences per generate() call when filling idle time (one chunk per idle slot)")
+    ap.add_argument("--eval-max-delay-s", type=float, default=120.0,
+                    help="rollout ranks: after this many seconds a pending eval request is worked on even if the rollout queue is not full")
+    ap.add_argument("--eval-drop-after-s", type=float, default=2400.0,
+                    help="trainer: an eval request whose shards have not all arrived after this long is dropped with an error")
     ap.add_argument("--bench-sizes", default="128,256,512,1024", help="bench-rollout: sequences per generate call")
     ap.add_argument("--bench-configs", default="eager:512,graphs:512,eager:1024,graphs:1024",
                     help="bench-rollout: <eager|graphs|stock>:<max_num_seqs> list, sharded over rollout ranks "
@@ -238,6 +247,83 @@ def _bank_open(a):
     return bank, n_vecs, eval_rows
 
 
+# ----------------------------------------------------------------------------------------------
+# inline-eval plumbing (pure functions; unit-tested on CPU in train/test_rl_disagg_queue.py)
+#   eval_req/req_<k>.pt   trainer rank 0 -> everything the rollout side needs to generate ckpt k's eval texts
+#   eval_gen/<k>_r<r>.pt  rollout rank r -> its row shard (rows i with i % X == r) of every eval set
+# ----------------------------------------------------------------------------------------------
+def _eval_req_path(work, k):
+    return f"{work}/eval_req/req_{k:07d}.pt"
+
+
+def _eval_shard_path(work, k, rank):
+    return f"{work}/eval_gen/{k:07d}_r{rank}.pt"
+
+
+def _eval_requests(work):
+    """ckpt steps with a pending request, oldest first."""
+    ks = []
+    for f in glob.glob(f"{work}/eval_req/req_*.pt"):
+        try:
+            ks.append(int(os.path.basename(f)[4:-3]))
+        except ValueError:
+            pass
+    return sorted(ks)
+
+
+def _eval_shards_ready(work, k, n_rollout):
+    return all(os.path.exists(_eval_shard_path(work, k, r)) for r in range(n_rollout))
+
+
+def _eval_plan(req, rank, n_rollout, chunk_seqs):
+    """Split ckpt k's eval generation into this rank's chunks (rows i % n_rollout == rank), each <= chunk_seqs
+    sequences. Returns a list of dicts {set, kind, rows, n, temp, min_new, max_new, seeds} in a fixed order.
+    Row -> seed: held-out families use eval_universal GEN_SEED*1000+i (== rl.py inline_eval), the extra-eval
+    testbed uses snippet_locality GEN_SEED*1000+i mod 2^31-1 (== inline_extra_evals.run_extra_evals_gpu)."""
+    chunks = []
+    for st in req["sets"]:
+        rows = [i for i in range(st["n_rows"]) if i % n_rollout == rank]
+        per = max(1, chunk_seqs // max(int(st["n"]), 1))
+        for c0 in range(0, len(rows), per):
+            rr = rows[c0 : c0 + per]
+            chunks.append({"set": st["name"], "kind": st["kind"], "rows": rr, "n": int(st["n"]), "temp": float(st["temp"]),
+                           "min_new": int(st["min_new"]), "max_new": int(st["max_new"]),
+                           "seeds": [int(st["seed_base"] + i) % 2147483647 for i in rr]})
+    return chunks
+
+
+def _eval_merge_shards(shards):
+    """[{set: {row: [texts]}}, ...] -> {set: {row: [texts]}} (rows from all rollout ranks)."""
+    out = {}
+    for sh in shards:
+        for name, rows in sh["texts"].items():
+            out.setdefault(name, {}).update({int(i): v for i, v in rows.items()})
+    return out
+
+
+def _eval_sets_from_assets(EV, EX, a):
+    """The eval 'sets' list for a request: one entry per held-out cosine family + the SAE family (+ the
+    extra-eval testbed features). dirs are unit fp32 [n_rows, d]."""
+    import torch.nn.functional as F
+    EU, es = EV["EU"], EV["es"]
+    sets = []
+    for fam in EV["fams"]:
+        du = F.normalize(es[f"{fam}_dirs"].float(), dim=-1)
+        sets.append({"name": fam, "kind": "cos", "n_rows": int(du.shape[0]), "dirs": du, "n": a.eval_bo, "temp": a.eval_temp,
+                     "min_new": a.eval_min_new, "max_new": a.eval_max_new, "seed_base": EU.GEN_SEED * 1000})
+    du = F.normalize(es["sae_dirs"].float(), dim=-1)
+    sets.append({"name": "sae", "kind": "sae", "n_rows": int(du.shape[0]), "dirs": du, "n": a.eval_bo, "temp": a.eval_temp,
+                 "min_new": a.eval_min_new, "max_new": a.eval_max_new, "seed_base": EU.GEN_SEED * 1000, "feats": list(EV["feats"])})
+    if EX is not None:
+        import snippet_locality as SL
+        cfg = EX["tb_config"]
+        max_new = min(int(cfg.get("max_new", 64)), int(a.max_new_tokens))
+        sets.append({"name": "extra", "kind": "extra", "n_rows": len(EX["feats"]), "dirs": F.normalize(EX["dirs"].float(), dim=-1),
+                     "n": int(EX["n_rollouts"]), "temp": float(cfg.get("temp", 1.0)), "min_new": min(int(cfg.get("min_new", 16)), max_new),
+                     "max_new": max_new, "seed_base": SL.GEN_SEED * 1000, "feats": list(EX["feats"])})
+    return sets
+
+
 class _GenCfgStub:
     """rl.py's _eos_ids(tok, actor) only reads actor.generation_config -- rollout ranks have no actor."""
     def __init__(self, gen_cfg):
@@ -274,7 +360,7 @@ def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
         max_len = p_len + a.max_new_tokens + 8
         kw = dict(model=MODEL, tensor_parallel_size=1, gpu_memory_utilization=a.vllm_gpu_mem, max_model_len=max_len,
                   attention_backend="TRITON_ATTN", language_model_only=True, enable_prefix_caching=False,
-                  enable_lora=True, max_loras=1, max_lora_rank=64, max_num_seqs=int(max_seqs),
+                  enable_lora=True, max_loras=2, max_lora_rank=64, max_num_seqs=int(max_seqs),   # 2 slots: live policy + eval ckpt
                   max_num_batched_tokens=max(8192, int(max_seqs) * max_len),   # never chunk a prompt: the marker must be prefilled in a hooked (eager) pass
                   seed=a.seed * 1000 + 500 + rank, dtype="bfloat16")
         if use_graphs:
@@ -368,6 +454,81 @@ def _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_
     return gen_ids, lps, appended, gen_s
 
 
+def _generate_eval_chunk(llm, a, tok, prompt_ids, marker, ch, dirs, hnorm, lora_req, eos_ids, key_prefix):
+    """One generate() for an eval chunk: n samples per row at the set's temperature / token limits with the
+    per-row seeds (deterministic like rl.py inline_eval), steering via _steering_id (one RPC per chunk).
+    Returns {row: [n texts]} (stop token trimmed, decoded, empty -> ' ' as in inline_extra_evals)."""
+    import rl_hf as R
+    from vllm import SamplingParams
+    keys = [f"{key_prefix}_{i}" for i in ch["rows"]]
+    payload = {k: [R._steer_vec(dirs[i], hnorm, marker)] for k, i in zip(keys, ch["rows"])}
+    llm.collective_rpc("set_steering_data_many", args=(pickle.dumps(payload),))
+    params = [SamplingParams(n=ch["n"], temperature=ch["temp"], top_p=1.0, top_k=0, min_p=0.0, repetition_penalty=1.0,
+                             max_tokens=ch["max_new"], min_tokens=ch["min_new"], stop_token_ids=sorted(eos_ids), seed=sd,
+                             extra_args={"_steering_id": k}) for k, sd in zip(keys, ch["seeds"])]
+    reqs = [{"prompt_token_ids": list(prompt_ids)} for _ in keys]
+    try:
+        outs = llm.generate(reqs, params, lora_request=lora_req, use_tqdm=False)
+    finally:
+        llm.collective_rpc("clear_steering_data_many", args=(keys,))
+    res = {}
+    for i, out in zip(ch["rows"], outs):
+        assert len(out.outputs) == ch["n"], f"expected {ch['n']} samples, got {len(out.outputs)}"
+        res[i] = [(tok.decode(R._trim_at_stop(list(o.token_ids), eos_ids), skip_special_tokens=True).strip() or " ")
+                  for o in out.outputs]
+    return res
+
+
+class _EvalJob:
+    """Rollout-side state of one eval request: the chunks still to generate + the texts generated so far."""
+
+    def __init__(self, work, k, rank, n_rollout, a, tag):
+        import torch
+        from vllm.lora.request import LoRARequest
+        self.k, self.rank, self.tag, self.work = k, rank, tag, work
+        self.req = torch.load(_eval_req_path(work, k), weights_only=False)
+        self.adapter_step = int(self.req["adapter_step"])
+        d = f"{work}/lora/step_{self.adapter_step}"
+        self.error = None if os.path.isdir(d) else f"adapter step {self.adapter_step} no longer published"
+        self.hnorm = float(json.load(open(f"{d}/meta.json"))["hnorm"]) if self.error is None else None
+        self.lora_req = LoRARequest(lora_name=f"step{self.adapter_step}", lora_int_id=self.adapter_step + 1, lora_path=d)
+        self.dirs = {st["name"]: st["dirs"] for st in self.req["sets"]}
+        self.chunks = _eval_plan(self.req, rank, n_rollout, a.eval_chunk_seqs)
+        self.texts = {st["name"]: {} for st in self.req["sets"]}
+        self.t_gen, self.t0, self.n_seq = 0.0, time.time(), 0
+        _log(tag, f"eval request ckpt {k}: {len(self.chunks)} chunks / {sum(len(c['rows']) * c['n'] for c in self.chunks)} seqs for this rank"
+                  + (f" | ERROR {self.error}" if self.error else ""))
+
+    @property
+    def age(self):
+        return time.time() - float(self.req.get("t", self.t0))
+
+    def done(self):
+        return self.error is not None or not self.chunks
+
+    def step(self, llm, a, tok, prompt_ids, marker, eos_ids):
+        ch = self.chunks.pop(0)
+        t1 = time.time()
+        try:
+            res = _generate_eval_chunk(llm, a, tok, prompt_ids, marker, ch, self.dirs[ch["set"]], self.hnorm, self.lora_req, eos_ids,
+                                       key_prefix=f"ev{self.k}r{self.rank}{ch['set']}")
+            self.texts[ch["set"]].update(res)
+            self.n_seq += len(ch["rows"]) * ch["n"]
+        except Exception as e:  # noqa
+            self.error = f"rank{self.rank}: {type(e).__name__}: {str(e)[:300]}"
+            self.chunks = []
+        self.t_gen += time.time() - t1
+
+    def write(self):
+        import torch
+        fn = _eval_shard_path(self.work, self.k, self.rank)
+        torch.save({"ckpt_step": self.k, "adapter_step": self.adapter_step, "rank": self.rank, "texts": self.texts,
+                    "t_gen": self.t_gen, "n_seq": self.n_seq, "error": self.error, "t_done": time.time()}, fn + ".tmp")
+        os.replace(fn + ".tmp", fn)
+        _log(self.tag, f"eval shard ckpt {self.k}: {self.n_seq} seqs in {self.t_gen:.1f}s gen, {self.age:.0f}s after the request"
+                       + (f" | ERROR {self.error}" if self.error else ""))
+
+
 def run_rollout(a):
     import numpy as np
     import torch
@@ -391,7 +552,7 @@ def run_rollout(a):
     if a.direction_source == "cluster":
         bank, n_vecs, eval_rows = _bank_open(a)
         assert n_vecs - eval_rows >= a.rollout_block_groups
-    Bb, G = a.rollout_block_groups, a.group_size
+    Bb = a.rollout_block_groups
 
     # the engine can load while the trainer is still loading the actor; the first block waits for step 0
     llm = _build_engine(a, rank, p_len, a.max_num_seqs, a.cuda_graphs, tag)
@@ -421,11 +582,44 @@ def run_rollout(a):
         raise RuntimeError(f"vLLM steering does NOT match the HF inject hook: {chk}")
 
     blk = 0
+    inflight = f"{work}/queue/.inflight_{rank}"
+    n_rollout = int(os.environ["DISAGG_WORLD"])
+    ev_job, ev_done = None, set()
+
+    def depth():   # complete blocks + blocks other ranks are generating right now (so N producers cannot all overshoot the cap)
+        return len(_queue_files(work)) + len([f for f in glob.glob(f"{work}/queue/.inflight_*") if f != inflight])
+
+    def eval_job():
+        """The oldest pending eval request this rank has not finished (None if there is none)."""
+        nonlocal ev_job
+        if ev_job is None:
+            for k in _eval_requests(work):
+                if k not in ev_done and not os.path.exists(_eval_shard_path(work, k, rank)):
+                    try:
+                        ev_job = _EvalJob(work, k, rank, n_rollout, a, tag)
+                    except Exception as e:  # noqa — request file half-written / adapter vanished: retry next slot
+                        _log(tag, f"eval request ckpt {k} not loadable yet ({type(e).__name__}: {e})")
+                    break
+        return ev_job
     while not _stop_requested(work):
-        while len(_queue_files(work)) >= a.max_queue_blocks:           # backpressure: bounded lag, no wasted rollouts
+        # ---- eval generation fills the slack: whenever the rollout queue is full (the trainer is the bottleneck) do ONE
+        # chunk of pending eval work instead of sleeping; a request older than --eval-max-delay-s is worked on regardless ----
+        job = eval_job()
+        if job is not None and (depth() >= a.max_queue_blocks or job.age > a.eval_max_delay_s):
+            if not job.done():
+                job.step(llm, a, tok, prompt_ids, marker, eos_ids)
+            if job.done():
+                job.write(); ev_done.add(job.k); ev_job = None
+            continue
+        while depth() >= a.max_queue_blocks:                           # backpressure: bounded lag, no wasted rollouts
             if _stop_requested(work):
                 return
-            time.sleep(0.25)
+            if eval_job() is not None:
+                break                                                  # -> top of the loop: eval chunk instead of idling
+            time.sleep(0.25 + 0.05 * rank)
+        if depth() >= a.max_queue_blocks:
+            continue
+        open(inflight, "w").close()
         t0 = time.time()
         swapped = refresh()
         if a.direction_source == "random":
@@ -442,6 +636,10 @@ def run_rollout(a):
                "lora_swapped": swapped}
         fn = f"{work}/queue/blk_{cur_step:07d}_{time.time_ns()}_{rank}.pt"
         torch.save(rec, fn + ".tmp"); os.replace(fn + ".tmp", fn)
+        try:
+            os.remove(inflight)
+        except FileNotFoundError:
+            pass
         _log(tag, f"block {blk} | adapter step {cur_step}{' (swapped)' if swapped else ''} | {len(gen_ids)} seqs "
                   f"{n_tok} tok in gen {gen_s:.1f}s ({n_tok / gen_s:.0f} tok/s, {len(gen_ids) / gen_s:.1f} seq/s) "
                   f"| appended_stop {appended} | wall {time.time() - t0:.1f}s | queue {len(_queue_files(work))}")
@@ -460,7 +658,7 @@ def run_bench_rollout(a):
     from safetensors.torch import load_file, save_file
     from transformers import AutoTokenizer, GenerationConfig
     import rl_hf as R
-    from mxf.config import D_MODEL, MODEL
+    from mxf.config import MODEL
     from mxf.prompts import build_prompt_ids
     from vllm.lora.request import LoRARequest
 
@@ -601,7 +799,9 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     def chunks(size):
         for s in range(0, n, size):
             ix = order[s : s + size]
-            yield ix, p_len + int(lens[ix].max())
+            # pad to a multiple of 16 completion tokens (right padding is masked -> numerically inert; fewer distinct
+            # shapes -> far fewer fla Triton autotune stalls in the first steps)
+            yield ix, p_len + min(T, -(-int(lens[ix].max()) // 16) * 16)
     ref_lp_all = None
     if a.kl_coef > 0:
         ref_lp_all = torch.zeros_like(old_lp)
@@ -715,17 +915,6 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
     return chosen, res
 
 
-def inline_eval_stub(a, tag):
-    """Inline eval is NOT run in the disaggregated trainer yet. Design for the follow-up: rank 0 writes
-    <work>/eval_req/<ckpt>.json (families, bo, temp, tokens); the rollout ranks pick it up between blocks,
-    generate the held-out texts with the LoRA of that ckpt (vLLM, like rl.py inline_eval) into
-    <work>/eval_gen/<ckpt>_<rank>.pt; the trainer ranks score them on the clean base with eval_universal's
-    score_probe_cos / score_sae_peaks (sharded), all_gather, and log eval/* with x-axis ckpt_step."""
-    if a.inline_eval_every > 0:
-        _log(tag, f"--inline-eval-every {a.inline_eval_every} requested but inline eval is disabled in rl_disagg "
-                  "(dev iteration); see inline_eval_stub() for the planned rollout-generates/trainer-scores protocol")
-
-
 def _save_adapter_for_vllm(actor, lora_dir, dtype):
     """rl.py's _save_adapter_for_vllm (module names renamed to the Qwen3_5ForConditionalGeneration layout vLLM
     serves) with a configurable dtype. bf16 halves the write; vLLM casts LoRA weights to the model dtype on
@@ -746,6 +935,157 @@ def _save_adapter_for_vllm(actor, lora_dir, dtype):
     actor.peft_config["default"].save_pretrained(lora_dir)
     t2 = time.time()
     return len(out), {"state_dict_s": t1 - t0, "write_s": t2 - t1, "bytes": sum(v.numel() * v.element_size() for v in out.values())}
+
+
+def _write_eval_request(work, k, adapter_step, EV, EX, a, tag):
+    """rank 0: everything the rollout ranks need to generate ckpt k's eval texts (~30 MB of unit directions)."""
+    import torch
+    os.makedirs(f"{work}/eval_req", exist_ok=True)
+    req = {"ckpt_step": k, "adapter_step": adapter_step, "t": time.time(), "sets": _eval_sets_from_assets(EV, EX, a)}
+    p = _eval_req_path(work, k)
+    torch.save(req, p + ".tmp"); os.replace(p + ".tmp", p)
+    _log(tag, f"eval request written for ckpt {k} (adapter step {adapter_step}): "
+              + ", ".join(f"{st['name']}x{st['n_rows']}x{st['n']}" for st in req["sets"]))
+
+
+def _score_eval_block(k, shard_paths, EV, EX, IX, actor, tok, device, rank, world, a):
+    """ALL trainer ranks: load the rollout ranks' shards, score rows i % world == rank of every set on the CLEAN base
+    (exactly rl.py inline_eval's scoring + inline_extra_evals.run_extra_evals_gpu's scoring half), all_gather, and
+    on rank 0 reduce to rl.py's eval/* keys (+ extra/locality + adversarial of the previous ckpt's judge texts).
+    Returns (ev, ex) dicts on rank 0 ({} elsewhere); errors travel as data so no rank can deadlock."""
+    import numpy as np
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+    t0 = time.time()
+    EU, es, sae = EV["EU"], EV["es"], EV["sae"]
+    pending = IX._broadcast_pending(EX, rank, world) if (EX is not None and IX is not None) else []
+    local = {}
+    try:
+        shards = [torch.load(p, weights_only=False) for p in shard_paths]
+        errs = [sh["error"] for sh in shards if sh.get("error")]
+        if errs:
+            raise RuntimeError("rollout shard errors: " + " | ".join(errs))
+        texts = _eval_merge_shards(shards)
+        bo = a.eval_bo
+        for fam in EV["fams"]:
+            du = es[f"{fam}_dirs"]
+            rows = [i for i in sorted(texts.get(fam, {})) if i % world == rank]
+            if rows:
+                flat = [t for i in rows for t in texts[fam][i]]
+                rd = F.normalize(torch.stack([du[i] for i in rows for _ in range(bo)]).float(), dim=-1)
+                cos = EU.score_probe_cos(flat, rd, actor, tok, device).view(len(rows), bo).max(1).values
+                local[fam] = {int(i): float(c) for i, c in zip(rows, cos.tolist())}
+            else:
+                local[fam] = {}
+        feats = EV["feats"]
+        rows = [i for i in sorted(texts.get("sae", {})) if i % world == rank]
+        if rows:
+            flat = [t for i in rows for t in texts["sae"][i]]
+            fl = [feats[i] for i in rows for _ in range(bo)]
+            acts, peaks = EU.score_sae_peaks(flat, fl, sae, actor, tok, device)
+            acts = acts.view(len(rows), bo)
+            best, arg = acts.max(1)
+            pk = peaks.view(len(rows), bo, -1)[torch.arange(len(rows)), arg]
+            local["sae"] = {int(i): float(v) for i, v in zip(rows, best.tolist())}
+            local["sae_peak"] = {int(i): pk[j].half().numpy().tobytes() for j, i in enumerate(rows)}
+        else:
+            local["sae"], local["sae_peak"] = {}, {}
+        local["extra"] = None
+        if EX is not None and IX is not None:
+            xf, subsae, fidx = EX["feats"], EX["subsae"], EX["fidx"]
+            n_roll = EX["n_rollouts"]
+            xrows = [i for i in sorted(texts.get("extra", {})) if i % world == rank]
+            flat_t = [t for i in xrows for t in texts["extra"][i]]
+            flat_f = [xf[i] for i in xrows for _ in range(n_roll)]
+            loc_rows = IX.locality_rows_from_profiles(IX._profiles(flat_t, flat_f, actor, tok, device, subsae) if flat_t else [], EX["fire"])
+            loc = {xf[i]: loc_rows[j * n_roll:(j + 1) * n_roll] for j, i in enumerate(xrows)}
+            adv = []
+            for item in pending:
+                res = {"src": item["src_ckpt_step"], "true": {}, "naive": {}}
+                at, af, tags = [], [], []
+                for arm in ("true", "naive"):
+                    for f, txts in item[arm].items():
+                        f = int(f)
+                        if f in fidx and fidx[f] % world == rank:
+                            for t in txts:
+                                at.append(t); af.append(f); tags.append((arm, f))
+                profs = IX._profiles(at, af, actor, tok, device, subsae) if at else []
+                for (arm, f), pr in zip(tags, profs):
+                    res[arm].setdefault(f, []).append(float(pr.max()) if len(pr) else 0.0)
+                adv.append(res)
+            local["extra"] = {"texts": {xf[i]: texts["extra"][i] for i in xrows}, "loc": loc, "adv": adv}
+        local["t_gen"] = float(max(sh.get("t_gen", 0.0) for sh in shards))
+    except Exception as e:  # noqa
+        local = {"error": f"rank{rank}: {type(e).__name__}: {str(e)[:300]}"}
+    gathered = [None] * world
+    if world > 1:
+        dist.all_gather_object(gathered, local)
+    else:
+        gathered = [local]
+    if rank != 0:
+        return {}, {}
+    errs = [g["error"] for g in gathered if "error" in g]
+    if errs:
+        return {"error": " | ".join(errs)}, {}
+    merged = {}
+    for g in gathered:
+        for key, d in g.items():
+            if key in ("extra", "t_gen"):
+                continue
+            merged.setdefault(key, {}).update(d)
+    out = {}
+    for fam in EV["fams"]:
+        vals = np.array([merged[fam][i] for i in sorted(merged[fam])], dtype=np.float64)
+        out[f"eval/{fam}/cos"] = float(vals.mean())
+    idx = sorted(merged["sae"])
+    best = np.array([merged["sae"][i] for i in idx], dtype=np.float64)
+    cp = EV["cp"][idx]
+    na = best / np.maximum(cp, 1e-6)
+    out["eval/sae/norm_act"] = float(na.mean())
+    if merged.get("sae_peak"):
+        peak_h = torch.from_numpy(np.stack([np.frombuffer(merged["sae_peak"][i], dtype=np.float16) for i in idx]).astype(np.float32))
+        ranks = EU.sae_rank_at_peaks(sae, peak_h, [EV["feats"][i] for i in idx]).astype(np.float64)
+        out["eval/sae/rank1_frac"] = float(np.mean(ranks == 1))
+        out["eval/sae/rank_le5"] = float(np.mean(ranks <= 5))
+        out["eval/sae/mean_rank"] = float(ranks.mean())
+        out["eval/sae/mrr"] = float(np.mean(1.0 / ranks))
+    out["eval/sae/fired"] = float(np.mean(best > EU.SAE_FIRE))
+    out["eval/sae/beat_corpus"] = float(np.mean(best > cp))
+    out["eval/sae/unverbalized_frac"] = float(np.mean(best <= EU.SAE_FIRE))
+    out["eval/sae/unverbalized_p10"] = float(np.mean(na < 0.10))
+    cos_keys = [kk for kk in out if kk.startswith("eval/") and kk.endswith("/cos") and kk.split("/")[1] not in EU.CONTROL_FAMS]
+    out["eval/mean_all"] = float(np.mean([out[kk] for kk in cos_keys]))
+    for fam in EV["fams"]:
+        out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
+    out["eval/all/sae_norm_act"] = out["eval/sae/norm_act"]
+    out["eval/all/sae_unverbalized"] = out["eval/sae/unverbalized_frac"]
+    out["time/inline_eval_s"] = time.time() - t0
+    out["time/inline_eval_gen_s"] = float(max(g.get("t_gen", 0.0) for g in gathered))
+    ex = {}
+    if EX is not None and IX is not None and all(g.get("extra") is not None for g in gathered):
+        texts_x, loc = {}, {}
+        adv_true, adv_naive = {}, {}
+        for g in gathered:
+            texts_x.update(g["extra"]["texts"]); loc.update(g["extra"]["loc"])
+            for res in g["extra"]["adv"]:
+                for arm, store in (("true", adv_true), ("naive", adv_naive)):
+                    for f, acts in res[arm].items():
+                        store.setdefault(res["src"], {}).setdefault(int(f), []).extend(acts)
+        ex = IX.aggregate_locality(loc, EX["corpus_peak"])
+        for src in sorted(set(adv_true) | set(adv_naive)):
+            m = IX.adversarial_metrics(adv_true.get(src, {}), adv_naive.get(src, {}), EX["corpus_peak"], fire=EX["fire"])
+            IX._RESULTS_Q.put((src, m))
+        ex["extra/adversarial/n_pending_scored"] = float(len(pending))
+        ex["time/extra_eval_gpu_s"] = time.time() - t0
+        EX["last_rollouts"] = {"ckpt_step": k, "rollouts": texts_x}
+        try:
+            os.makedirs(EX["out_dir"], exist_ok=True)
+            IX._save_json_atomic({"ckpt_step": k, "rollouts": {str(f): v for f, v in texts_x.items()},
+                                  "locality": {str(f): v for f, v in loc.items()}}, os.path.join(EX["out_dir"], f"rollouts_ckpt{k}.json"))
+        except Exception as e:  # noqa
+            _log("T0", f"could not write extra-eval rollouts artifact: {e}")
+    return out, ex
 
 
 def _publish_adapter(actor, submodule, prompt, marker, device, work, step, keep, tag, fp32=False):
@@ -782,14 +1122,13 @@ def run_trainer(a):
     import numpy as np
     import torch
     import torch.distributed as dist
-    import torch.nn.functional as F
     if a.no_fla:
         sys.modules["fla"] = None      # transformers' use_kernel_func_from_hub_with_fallback then keeps the torch GDN path
     from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
     import wandb
     import rl_hf as R
-    from mxf.config import D_MODEL, INJECT_LAYER, MODEL, TrainConfig
+    from mxf.config import INJECT_LAYER, MODEL, TrainConfig
     from mxf.inject import get_layer
     from mxf.prompts import build_prompt_ids
 
@@ -799,8 +1138,9 @@ def run_trainer(a):
     torch.manual_seed(a.seed + rank)
     torch.cuda.set_device(0)
     device = "cuda:0"
-    if world > 1:
-        dist.init_process_group(a.backend, init_method=f"tcp://127.0.0.1:{a.master_port}", rank=rank, world_size=world)
+    if world > 1:   # nccl for the GPU flat-buffer grad all-reduce, gloo for the CPU-tensor collectives of the eval code
+        dist.init_process_group("cpu:gloo,cuda:nccl" if a.backend == "nccl" else "gloo",
+                                init_method=f"tcp://127.0.0.1:{a.master_port}", rank=rank, world_size=world)
     try:
         import fla  # noqa
         fla_v = getattr(fla, "__version__", "?")
@@ -859,7 +1199,26 @@ def run_trainer(a):
             dist.all_reduce(t, op=dist.ReduceOp.MIN)
             mb = int(t.item())
     _log(tag, f"micro-batch = {mb} (no gradient checkpointing)")
-    inline_eval_stub(a, tag)
+    # ---- inline eval assets (held-out sets + SAE on every trainer rank; extra-eval testbed/judge) — after the
+    # micro-batch search so the SAE's 2.7 GB is not part of the OOM probe ----
+    EV = R.load_eval_assets(a, device, is_main) if a.inline_eval_every > 0 else None
+    EX, IX = None, None
+    if EV is not None and not a.no_extra_evals:
+        try:
+            import inline_extra_evals as IX
+            EX = IX.prepare_extra_eval_assets(a, device, rank, world, is_main, sae=EV["sae"])
+        except Exception as e:  # noqa
+            EX, IX = None, None
+            if is_main:
+                _log(tag, f"extra-eval DISABLED ({type(e).__name__}: {e})")
+    if world > 1:   # every rank must agree on whether EV exists (a failed load on one rank would otherwise desync the collectives)
+        t = torch.tensor([0 if EV is None else 1], dtype=torch.long)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        if int(t.item()) == 0:
+            EV, EX = None, None
+    if is_main and EV is not None:
+        _log(tag, f"inline eval every {a.inline_eval_every} steps: rollout ranks generate {len(EV['fams'])} families x {len(EV['es'][EV['fams'][0] + '_dirs'])} "
+                  f"dirs x Bo{a.eval_bo} + sae + {'extra testbed' if EX is not None else 'NO extra evals'}; trainer ranks score sharded")
 
     adv_mode = a.adv_mode or ("batch" if a.batch_norm else ("group" if a.std_norm else "none"))
     use_gates = a.fluency_floor is not None or a.distinct_floor is not None
@@ -881,6 +1240,9 @@ def run_trainer(a):
             wandb.init(project="maxact-fast", name=a.run_name, config={**vars(a), "micro_batch_used": mb, "mb_search": mb_res,
                                                                         "fla": fla_v, "disagg": True},
                        id=a.wandb_id or None, resume="must" if a.wandb_id else None)
+            wandb.define_metric("ckpt_step")
+            wandb.define_metric("eval/*", step_metric="ckpt_step")
+            wandb.define_metric("extra/*", step_metric="ckpt_step")
         os.makedirs(a.save_dir, exist_ok=True)
         json.dump({"micro_batch": mb, "search": mb_res}, open(f"{work}/trainer_mb.json", "w"))
     eos_set = set(R._eos_ids(tok, actor))
@@ -889,17 +1251,50 @@ def run_trainer(a):
     for step in range(a.step_offset, a.total_steps):
         t0 = time.time()
         # ---- rank 0 picks the blocks; everyone loads them (shared /tmp) and takes its whole-group shard ----
-        pick = [None, None]
+        pick = [None, None, None]
         if is_main:
+            ev_ready = None
+            if EV is not None:   # a complete eval block (all rollout shards present) is scored at the START of the step
+                for kk in _eval_requests(work):
+                    if _eval_shards_ready(work, kk, a.n_rollout):
+                        ev_ready = (kk, [_eval_shard_path(work, kk, r) for r in range(a.n_rollout)])
+                        break
+                    if time.time() - os.path.getmtime(_eval_req_path(work, kk)) > a.eval_drop_after_s:
+                        _log(tag, f"inline-eval ckpt {kk}: shards never completed after {a.eval_drop_after_s:.0f}s — dropped")
+                        os.remove(_eval_req_path(work, kk))
             while True:
                 take, stale = _pick_blocks(work, a.blocks_per_step, a.drop_stale)
                 if take is not None:
                     break
                 time.sleep(0.2)
-            pick = [take, stale]
+            pick = [take, stale, ev_ready]
         if world > 1:
             dist.broadcast_object_list(pick, src=0)
-        take, stale = pick
+        take, stale, ev_ready = pick
+        if ev_ready is not None:
+            kk, paths = ev_ready
+            ev, ex = _score_eval_block(kk, paths, EV, EX, IX, actor, tok, device, rank, world, a)
+            if is_main:
+                for pth in paths + [_eval_req_path(work, kk)]:
+                    try:
+                        os.remove(pth)
+                    except FileNotFoundError:
+                        pass
+                if "error" in ev:
+                    _log(tag, f"inline-eval FAILED for ckpt {kk}: {ev['error']}")
+                else:
+                    print(f"  [inline-eval] ckpt {kk}: mean_all {ev['eval/mean_all']:.4f} | sae norm_act {ev['eval/sae/norm_act']:.4f} "
+                          f"unverb {ev['eval/sae/unverbalized_frac']:.3f} rank1 {ev.get('eval/sae/rank1_frac', float('nan')):.3f} | realact "
+                          f"{ev.get('eval/realact/cos', float('nan')):.4f} | scored in {ev['time/inline_eval_s']:.0f}s (rollout gen {ev['time/inline_eval_gen_s']:.0f}s)"
+                          + (f" | locality win5 {ex.get('extra/locality/win5_share', float('nan')):.3f} fire {ex.get('extra/locality/fire_frac', float('nan')):.3f}" if ex else ""),
+                          flush=True)
+                    if not a.no_wandb:
+                        wandb.log({**ev, **ex, "ckpt_step": kk})
+                    if ex and IX is not None:
+                        try:
+                            IX.launch_judge_stage(None, kk, EX, a)
+                        except Exception as e:  # noqa
+                            _log(tag, f"judge launch failed: {type(e).__name__}: {e}")
         t_wait = time.time() - t0
         blocks = [torch.load(f, weights_only=False) for f in take]
         if world > 1:
@@ -935,11 +1330,11 @@ def run_trainer(a):
         else:
             r = R.score(texts, dirs_rep, actor, tok, device, a)
         r = r * a.reward_scale
+        raw_r, gate_frac = r.clone(), 1.0                      # raw_r = the TRUE cosine (logged/transcripts), before any shaping (rl.py fd2d144)
         trunc = torch.tensor([len(g) >= a.max_new_tokens and (not g or g[-1] not in eos_set) for g in gen_ids])
         trunc_frac = trunc.float().mean().item()
-        if a.trunc_reward is not None and bool(trunc.any()):
+        if a.trunc_reward is not None and bool(trunc.any()):   # EasyNLA: cap-hit rollouts score a fixed failure reward and still train
             r[trunc] = a.trunc_reward
-        raw_r, gate_frac = r.clone(), 1.0
         gate = torch.ones(Bl * G, dtype=torch.bool)
         if use_gates:
             if a.fluency_floor is not None:
@@ -992,6 +1387,9 @@ def run_trainer(a):
         t_pub, hnorm = 0.0, float("nan")
         if is_main and a.publish_every > 0 and (step + 1) % a.publish_every == 0:
             hnorm, t_pub = _publish_adapter(actor, submodule, prompt, marker, device, work, step + 1, a.keep_loras, tag, a.publish_fp32)
+            # rl.py evaluates ckpt `step` (the weights after this update) with the adapter published right here
+            if EV is not None and step % a.inline_eval_every == 0:
+                _write_eval_request(work, step, step + 1, EV, EX, a, tag)
 
         # ---- logging (reward stats over ALL trainer ranks; uneven shards -> weighted) ----
         secs = time.time() - t0
@@ -1061,6 +1459,12 @@ def run_trainer(a):
                 print(f"  sample r={raw_r[0]:.2f}: {texts[0][:110]!r}", flush=True)
             if not a.no_wandb:
                 wandb.log(log, step=step)
+            if IX is not None and EX is not None:
+                for cs, m in IX.poll_judge_results():          # judge results arrive minutes later; x-axis = ckpt_step
+                    print(f"  [extra-eval] judge results for ckpt {cs}: " + " ".join(
+                        f"{kk.split('/')[-1]}={v:.3f}" for kk, v in m.items() if kk.startswith("extra/") and "auc" in kk), flush=True)
+                    if not a.no_wandb:
+                        wandb.log({**m, "ckpt_step": cs})
             json.dump(step_hist, open(f"{work}/trainer_steps.json", "w"))
             if a.save_every and step and step % a.save_every == 0:
                 actor.save_pretrained(f"{a.save_dir}/step_{step}")
@@ -1079,6 +1483,11 @@ def run_trainer(a):
             _log(tag, f"checkpoint {a.save_dir}/final loads via PeftModel.load_adapter: OK")
         except Exception as e:  # noqa
             _log(tag, f"checkpoint load-back FAILED: {type(e).__name__}: {e}")
+        if IX is not None and EX is not None:
+            IX.wait_for_judge_stages(900)
+            for cs, m in IX.poll_judge_results():
+                if not a.no_wandb:
+                    wandb.log({**m, "ckpt_step": cs})
         _atomic_write_text(f"{work}/STOP", "done")
         print("RL_DONE", flush=True)
     if world > 1:

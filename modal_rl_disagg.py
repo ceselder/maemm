@@ -13,8 +13,9 @@ importable in the engine process), mxf/.
 Launch (MODAL_PROFILE=safety-sahan):
     DISAGG_GPU=B200:4 modal run --detach modal_rl_disagg.py::bench                    # throughput tables
     DISAGG_GPU=B200:4 modal run --detach modal_rl_disagg.py::main --n-rollout 1 --n-trainer 3 --total-steps 6
-    DISAGG_GPU=B200:8 modal run --detach modal_rl_disagg.py::main --n-rollout 3 --n-trainer 5 --total-steps 400 \
-        --run-name rl_everything_8x128_disagg --save-dir /data/ckpts_last5_v15_disagg
+    DISAGG_GPU=B200:8 modal run --detach modal_rl_disagg.py::main --n-rollout 2 --n-trainer 6 --total-steps 400 \
+        --extra-args "--cuda-graphs --run-name rl_everything_8x128_disagg --save-dir /data/ckpts_last5_v15_disagg"
+Resume from a checkpoint: --extra-args "... --init-adapter <ckpt>/step_N --ref-adapter /data/sft_mix/last5_rp/final --step-offset N+1 --wandb-id <id>"
 Set DISAGG_GPU (e.g. H200:4) at `modal run` time to pick the GPU request; the container's real GPU count
 is what the launcher uses.
 """
@@ -43,11 +44,15 @@ image = (
         "hf_xet",
     )
     .pip_install("flash-linear-attention==0.5.2")   # fla + fla-core + einops; transformers>=4.45 already satisfied
+    .pip_install("anthropic")                        # native Sonnet 5 judge for the inline extra evals (inline_extra_evals.JudgeClient)
     .add_local_file(REPO / "train" / "rl.py", "/pmx/RL/rl_hf.py")
     .add_local_file(REPO / "train" / "rl_disagg.py", "/pmx/RL/rl_disagg.py")
     .add_local_file(REPO / "train" / "fast_lens_ext.py", "/pmx/helpers/fast_lens_ext.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
-    .add_local_file(REPO / "MAEMMBench" / "eval_universal.py", "/pmx/eval/eval_universal.py")
+    .add_local_file(REPO / "MAEMMBench" / "eval_universal.py", "/pmx/eval/eval_universal.py")            # inline eval scoring
+    .add_local_file(REPO / "train" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")          # autointerp/locality/WildChat/adversarial
+    .add_local_file(REPO / "MAEMMBench" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
+    .add_local_file(REPO / "eval" / "autointerp_detection.py", "/pmx/eval/autointerp_detection.py")
 )
 
 vol = modal.Volume.from_name("maemm-data", create_if_missing=True)
@@ -82,6 +87,8 @@ TRAIN_ARGS = [
     "--score-batch", "128",
     "--ref-micro-batch", "32",
     "--vllm-gpu-mem", "0.85",
+    "--inline-eval-every", "10",   # held-out eval suite per saved ckpt: rollout ranks generate in their idle slots, trainer ranks score sharded
+    "--eval-n-per-family", "128",  # = v15 (512/family costs 4x the generation)
     "--save-every", "10",
     "--save-dir", CKPT_DIR,
     "--run-name", "rl_everything_8x128_disagg_dev",
@@ -154,7 +161,10 @@ def _collect(work="/tmp/disagg"):
 
 
 @app.function(image=image, gpu=GPU, volumes={"/data": vol},
-              secrets=[modal.Secret.from_name("maemm-hf"), modal.Secret.from_name("maemm-wandb")], timeout=6 * 3600)
+              secrets=[modal.Secret.from_name("maemm-hf"), modal.Secret.from_name("maemm-wandb"),
+                       modal.Secret.from_name("maemm-openrouter"),   # judge fallback
+                       modal.Secret.from_name("maemm-anthropic")],   # native Sonnet 5 judge: ANTHROPIC_API_KEY + ANTHROPIC_WORKSPACE_ID
+              timeout=24 * 3600)
 def train(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_args: str = "", no_wandb: bool = False):
     local_pool = _stage()
     args = list(TRAIN_ARGS)
