@@ -1,0 +1,88 @@
+{
+  "env": {
+    "gpu": "NVIDIA B200",
+    "torch": "2.10.0+cu128",
+    "transformers": "5.15.0",
+    "transformers_fork": true,
+    "peft": "0.20.0",
+    "fla": "0.5.2",
+    "triton": "3.6.0",
+    "tf_spec": "transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
+  },
+  "prompt_len": 103,
+  "marker": 102,
+  "steps": 10,
+  "warmup": 3,
+  "autocast_bf16": true,
+  "target_len_range": [
+    8,
+    32
+  ],
+  "rows": [
+    {
+      "config": "naive",
+      "micro_batch": 16,
+      "first_step_s": 88.97593474388123,
+      "examples_per_s": 24.261053499221834,
+      "target_tokens_per_s": 510.3919129898793,
+      "ms_per_step": 659.4932079315186,
+      "peak_mem_gb": 135.5443115234375,
+      "mean_seq_len": 192.0
+    },
+    {
+      "config": "naive_nocache",
+      "micro_batch": 16,
+      "first_step_s": 14.123827695846558,
+      "examples_per_s": 24.48804809036334,
+      "target_tokens_per_s": 522.5137261281277,
+      "ms_per_step": 653.3799648284912,
+      "peak_mem_gb": 133.1068115234375,
+      "mean_seq_len": 192.0
+    },
+    {
+      "config": "cached",
+      "micro_batch": 16,
+      "first_step_s": 45.86660647392273,
+      "examples_per_s": 20.434526816987063,
+      "target_tokens_per_s": 441.00263186910206,
+      "ms_per_step": 782.9885244369507,
+      "peak_mem_gb": 80.07321500778198,
+      "mean_seq_len": 37.6
+    },
+    {
+      "config": "cached",
+      "micro_batch": 64,
+      "first_step_s": 21.406579732894897,
+      "examples_per_s": 60.784813520905345,
+      "target_tokens_per_s": 1250.8374907348802,
+      "ms_per_step": 1052.8945684432983,
+      "peak_mem_gb": 142.544020652771,
+      "mean_seq_len": 40.0
+    },
+    {
+      "config": "cached",
+      "micro_batch": 128,
+      "error": "OOM: CUDA out of memory. Tried to allocate 192.00 MiB. GPU 0 has a total capacity of 178.35 GiB of which 113.94 MiB is free. Process 1 has 178.22 GiB memory in use. Of the allocated memory 168.35 GiB is allocated by PyTorch, and 1.85 GiB is reserved by PyTorch but unallocated. If reserved but unallocated"
+    },
+    {
+      "config": "cached_compile",
+      "micro_batch": 16,
+      "first_step_s": 688.0905721187592,
+      "examples_per_s": 21.415850033282727,
+      "target_tokens_per_s": 454.4175678937179,
+      "ms_per_step": 747.1101999282837,
+      "peak_mem_gb": 76.76847171783447,
+      "mean_seq_len": 36.8
+    },
+    {
+      "config": "cached_compile",
+      "micro_batch": 64,
+      "first_step_s": 336.66924476623535,
+      "examples_per_s": 76.59194868720508,
+      "target_tokens_per_s": 1561.279004020746,
+      "ms_per_step": 835.5969667434692,
+      "peak_mem_gb": 131.05537843704224,
+      "mean_seq_len": 40.0
+    }
+  ]
+}

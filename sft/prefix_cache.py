@@ -28,6 +28,7 @@ including EOS if you want it, exactly what ``build_sft_ids`` appends). ``out.los
 mean over target tokens (labels -100 on marker/tail/pad) -- so it matches the naive ``model(..., labels=...).loss``.
 """
 import contextlib
+import copy
 from types import SimpleNamespace
 
 import torch
@@ -39,6 +40,27 @@ def unwrap_base(model):
     """HF base model through DDP + PEFT wrappers."""
     m = model.module if hasattr(model, "module") else model
     return m.get_base_model() if hasattr(m, "get_base_model") else m
+
+
+_LAYER_DICT_ATTRS = ("conv_states", "recurrent_states", "is_conv_states_initialized",
+                     "is_recurrent_states_initialized", "has_previous_state", "conv_kernel_size")
+
+
+def expand_cache_copy(cache, repeats):
+    """A NEW cache whose per-layer tensors are ``cache``'s repeated ``repeats`` times along the batch dim; ``cache``
+    itself is left untouched (so one prefix cache can feed several micro-batches -- grad accumulation). Shallow copies
+    of the Cache and its layer objects (+ their state dicts); tensors are shared until ``batch_repeat_interleave``
+    replaces them out-of-place, so autograd still points back at the single prefix forward."""
+    new = copy.copy(cache)
+    new.layers = []
+    for layer in cache.layers:
+        l2 = copy.copy(layer)
+        for attr in _LAYER_DICT_ATTRS:
+            if hasattr(l2, attr):
+                setattr(l2, attr, dict(getattr(l2, attr)))
+        new.layers.append(l2)
+    new.batch_repeat_interleave(repeats)
+    return new
 
 
 def check_transformers():
@@ -64,8 +86,8 @@ class PrefixCache:
     """Shared-prefix forward for a fixed prompt. Construct once (prompt is fixed), call ``forward`` per micro-batch."""
 
     def __init__(self, model, prompt_ids, marker, pad_id, inject_module, coeff, device,
-                 inject_dtype=torch.bfloat16, inject_mode="add", pad_multiple=8, prefix_model=None,
-                 persistent_injector=None):
+                 inject_dtype=torch.bfloat16, inject_mode="add", pad_multiple=16, prefix_model=None,
+                 persistent_injector=None, compile_prefix=None):
         """
         model: the model to run (PEFT-wrapped, possibly DDP-wrapped) -- used for the SUFFIX forward.
         prefix_model: module used for the PREFIX forward. Under DDP pass the unwrapped ``ddp.module`` so DDP's reducer
@@ -75,6 +97,9 @@ class PrefixCache:
         persistent_injector: optional ``mxf.inject.FixedPositionInjector(position=0, ...)`` whose ``.hook`` the
             caller registered on ``inject_module`` (torch.compile path: no per-step Python hook). It is switched
             ``active=False`` for the prefix forward and ``True`` for the suffix forward.
+        compile_prefix: None | "default" | "reduce-overhead" -- torch.compile ONLY the prefix call (fully static
+            shape [1, prefix_len]; the eager 64-layer PEFT forward+backward at batch 1 is launch/Python-bound).
+            The suffix forward stays eager (its cache inputs make Dynamo recompile endlessly).
         """
         check_transformers()
         if not (0 < marker < len(prompt_ids)):
@@ -94,6 +119,12 @@ class PrefixCache:
         self.pad_multiple = pad_multiple
         self.persistent_injector = persistent_injector
         self._prefix_tensor = torch.tensor(self.prefix_ids, dtype=torch.long, device=device)[None]
+        self.compile_prefix = compile_prefix
+        if compile_prefix:
+            fwd = self.prefix_model.forward if hasattr(self.prefix_model, "forward") else self.prefix_model
+            self._prefix_fn = torch.compile(fwd, mode=None if compile_prefix == "default" else compile_prefix, dynamic=False)
+        else:
+            self._prefix_fn = self.prefix_model
 
     @property
     def prefix_len(self):
@@ -125,7 +156,7 @@ class PrefixCache:
             inj.active = False
         try:
             with autocast():
-                out = self.prefix_model(input_ids=self._prefix_tensor, use_cache=True, logits_to_keep=1)
+                out = self._prefix_fn(input_ids=self._prefix_tensor, use_cache=True, logits_to_keep=1)
         finally:
             if inj is not None:
                 inj.active = True
@@ -152,9 +183,14 @@ class PrefixCache:
         if vecs.ndim != 2 or vecs.shape[0] != B:
             raise ValueError(f"vecs must be [B={B}, d], got {tuple(vecs.shape)}")
         t0 = _tick()
-        cache = prefix_cache if prefix_cache is not None else self.run_prefix(autocast)
-        t1 = _tick()
-        cache.batch_repeat_interleave(B)   # out-of-place in the fork: grads flow back into the prefix graph
+        if prefix_cache is not None:
+            # caller-owned prefix (shared across micro-batches of one optimizer step): expand a COPY, keep theirs intact
+            t1 = _tick()
+            cache = expand_cache_copy(prefix_cache, B)
+        else:
+            cache = self.run_prefix(autocast)
+            t1 = _tick()
+            cache.batch_repeat_interleave(B)   # out-of-place in the fork: grads flow back into the prefix graph
         t2 = _tick()
         P = self.prefix_len
 

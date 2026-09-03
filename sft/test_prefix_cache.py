@@ -121,8 +121,11 @@ def _random_batch(gen, B, d_model, vocab, min_tgt, max_tgt, eos):
     return vecs, targets
 
 
-def _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast_on, device, max_seq=192, use_cache=None):
-    """Exactly sft/pretrain.py's per-example padded path (L rounded to 64, <= max_seq; hook at the absolute marker)."""
+def _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast_on, device, max_seq=192, use_cache=None,
+                   injector=None, fwd=None):
+    """Exactly sft/pretrain.py's per-example padded path (L rounded to 64, <= max_seq; hook at the absolute marker).
+    ``injector``/``fwd``: pretrain.py's --compile variant (FixedPositionInjector registered once + compiled forward)."""
+    import contextlib
     import torch
     from mxf.config import STEER_COEFF
     from mxf.inject import hooked, make_inject_hook
@@ -138,10 +141,15 @@ def _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast
         r = r[:L]
         ids[i, : len(r)] = torch.tensor(r); attn[i, : len(r)] = True
         labels[i, len(prompt_ids) : len(r)] = torch.tensor(r[len(prompt_ids):])
-    hook = make_inject_hook([v[None] for v in vecs], [[marker]] * B, STEER_COEFF, device, torch.bfloat16)
+    if injector is not None:
+        injector.set_vectors(torch.as_tensor(vecs).to(device, injector.vectors.dtype)); hook_cm = contextlib.nullcontext()
+    else:
+        hook = make_inject_hook([v[None] for v in vecs], [[marker]] * B, STEER_COEFF, device, torch.bfloat16)
+        hook_cm = hooked(submodule, hook)
     kw = {} if use_cache is None else {"use_cache": use_cache}
-    with hooked(submodule, hook), autocast_region(model, autocast_on):
-        out = model(input_ids=ids.to(device), attention_mask=attn.to(device), labels=labels.to(device), **kw)
+    call = fwd if fwd is not None else model
+    with hook_cm, autocast_region(model, autocast_on):
+        out = call(input_ids=ids.to(device), attention_mask=attn.to(device), labels=labels.to(device), **kw)
     return out, labels
 
 
@@ -175,7 +183,7 @@ def _cmp_grads(g1, g2):
 # ----------------------------------------------------------------------------------------------------------------
 @app.function(image=image, gpu=GPU, volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=5400)
 def equiv_remote(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt: int = 8, max_tgt: int = 32,
-                 fresh_lora: bool = False, stock_demo: bool = False):
+                 fresh_lora: bool = False, stock_demo: bool = False, compile_prefix: str = ""):
     import sys
     import time
     import torch
@@ -252,11 +260,56 @@ def equiv_remote(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt:
         r["n_target_tokens"] = out_c.n_target_tokens; r["suffix_len_padded"] = out_c.suffix_len
         del out_c, cached_sel
 
+        N = int((labels_n != -100).sum())
+        half = batch // 2
+        ac = lambda: autocast_region(model, autocast_on)  # noqa
+
+        # ---- shared prefix across micro-batches (grad accumulation): ONE prefix forward, two half-batches each on a
+        # copy-expanded cache, token-weighted losses, retain_graph on the prefix graph until the last one ----
+        model.zero_grad(set_to_none=True)
+        cache0 = pc.run_prefix(ac)
+        loss_acc = 0.0; acc_sel = []
+        for k, (lo, hi) in enumerate(((0, half), (half, batch))):
+            out_h = pc.forward(vecs[lo:hi], targets[lo:hi], autocast=ac, prefix_cache=cache0)
+            (out_h.loss * (out_h.n_target_tokens / N)).backward(retain_graph=k == 0)
+            loss_acc += out_h.loss.item() * out_h.n_target_tokens / N
+            acc_sel.append(torch.cat([out_h.logits[b, : suffix_lens[lo + b]] for b in range(hi - lo)]).detach())
+            del out_h
+        del cache0
+        g_acc = _flat_grads(params); acc_sel = torch.cat(acc_sel)
+        r["accum_loss_abs_diff"] = abs(loss_naive - loss_acc)
+        r["accum_logits"] = _cmp_logits(naive_sel, acc_sel); r["accum_grads"] = _cmp_grads(g_naive, g_acc)
+        del acc_sel, g_acc
+        print(f"[{tag}] shared-prefix 2x{half}: loss |d|={r['accum_loss_abs_diff']:.2e} logits {json.dumps({k: round(v, 6) for k, v in r['accum_logits'].items()})} "
+              f"grads {json.dumps({k: round(v, 6) for k, v in r['accum_grads'].items()})}", flush=True)
+
+        # ---- compiled prefix (torch.compile reduce-overhead on the static prefix call only) ----
+        if compile_prefix:
+            model.zero_grad(set_to_none=True)
+            pcc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device,
+                                    compile_prefix=compile_prefix)
+            torch.cuda.synchronize(); t0 = time.time()
+            out_cc = pcc.forward(vecs, targets, autocast=ac)   # compile happens here
+            torch.cuda.synchronize(); r["pfxcompile_first_call_s"] = time.time() - t0
+            out_cc.loss.backward()
+            g_cc = _flat_grads(params); cc_sel = torch.cat([out_cc.logits[b, : suffix_lens[b]] for b in range(batch)]).detach()
+            r["pfxcompile_loss_abs_diff"] = abs(loss_naive - out_cc.loss.item())
+            r["pfxcompile_logits"] = _cmp_logits(naive_sel, cc_sel); r["pfxcompile_grads"] = _cmp_grads(g_naive, g_cc)
+            del out_cc, g_cc, cc_sel
+            # second call = steady state timing of the compiled prefix (fwd only, synced)
+            model.zero_grad(set_to_none=True)
+            tm = {}
+            out_cc = pcc.forward(vecs, targets, autocast=ac, timings=tm); out_cc.loss.backward(); del out_cc
+            r["pfxcompile_phases_s"] = tm
+            print(f"[{tag}] compiled-prefix({compile_prefix}): first call {r['pfxcompile_first_call_s']:.0f}s, steady prefix_fwd "
+                  f"{1000 * tm['prefix_fwd_s']:.1f}ms; loss |d|={r['pfxcompile_loss_abs_diff']:.2e} "
+                  f"logits {json.dumps({k: round(v, 6) for k, v in r['pfxcompile_logits'].items()})} "
+                  f"grads {json.dumps({k: round(v, 6) for k, v in r['pfxcompile_grads'].items()})}", flush=True)
+            del pcc; torch._dynamo.reset()
+
         # ---- noise-floor control: the SAME naive computation split into two half-batches (different GEMM shapes
         # -> bf16 kernel/tiling noise), token-weighted so the total loss/grad equals the full-batch mean ----
         model.zero_grad(set_to_none=True)
-        N = int((labels_n != -100).sum())
-        half = batch // 2
         loss_ctrl = 0.0; ctrl_sel = []
         for lo, hi in ((0, half), (half, batch)):
             out_h, labels_h = _naive_forward(model, prompt_ids, marker, vecs[lo:hi], targets[lo:hi], submodule, autocast_on, device)
@@ -283,9 +336,9 @@ def equiv_remote(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt:
 
 @app.local_entrypoint()
 def equiv(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt: int = 8, max_tgt: int = 32,
-          fresh_lora: bool = False, stock_demo: bool = False, out: str = ""):
+          fresh_lora: bool = False, stock_demo: bool = False, compile_prefix: str = "", out: str = ""):
     res = equiv_remote.remote(adapter=adapter, batch=batch, seed=seed, min_tgt=min_tgt, max_tgt=max_tgt,
-                              fresh_lora=fresh_lora, stock_demo=stock_demo)
+                              fresh_lora=fresh_lora, stock_demo=stock_demo, compile_prefix=compile_prefix)
     path = Path(out) if out else REPO / "sft" / "results" / ("prefix_cache_equiv_stock.json" if stock_demo else "prefix_cache_equiv.json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(res, indent=2))
@@ -322,37 +375,78 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
     results = {"env": env, "prompt_len": len(prompt_ids), "marker": marker, "steps": steps, "warmup": warmup,
                "autocast_bf16": autocast_on, "target_len_range": [min_tgt, max_tgt], "rows": []}
 
-    def step_naive(B, use_cache):
-        vecs, targets = _random_batch(gen, B, D_MODEL, tok.vocab_size, min_tgt, max_tgt, tok.eos_token_id)
-        out, labels = _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast_on, device, use_cache=use_cache)
+    def batch_gen(B, force_len=None):
+        """Random micro-batch; force_len pins every target length (warm up the shortest/longest suffix shapes)."""
+        if force_len is None:
+            return _random_batch(gen, B, D_MODEL, tok.vocab_size, min_tgt, max_tgt, tok.eos_token_id)
+        return _random_batch(gen, B, D_MODEL, tok.vocab_size, force_len, force_len, tok.eos_token_id)
+
+    def step_naive(B, use_cache, injector=None, fwd=None, force_len=None):
+        vecs, targets = batch_gen(B, force_len)
+        out, labels = _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast_on, device,
+                                     use_cache=use_cache, injector=injector, fwd=fwd)
         out.loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step(); opt.zero_grad()
         return B, int((labels != -100).sum()), out.logits.shape[1]
 
-    def make_cached(B, use_compile):
+    def make_naive_compiled(B):
+        """pretrain.py --compile: FixedPositionInjector at the absolute marker + torch.compile(model.forward)."""
+        inj = FixedPositionInjector(B, D_MODEL, marker, STEER_COEFF, device, torch.bfloat16)
+        handle = submodule.register_forward_hook(inj.hook)
+        fwd = torch.compile(model.forward)
+
+        def step(force_len=None):
+            return step_naive(B, None, injector=inj, fwd=fwd, force_len=force_len)
+
+        def cleanup():
+            handle.remove(); torch._dynamo.reset()
+        return step, cleanup
+
+    def make_cached(B, use_compile, n_accum=1, compile_prefix=None):
+        """n_accum > 1: ONE prefix per optimizer step shared by n_accum micro-batches of B (token-weighted losses, so
+        the step equals a single mean-loss step over n_accum*B examples). compile_prefix: torch.compile the static
+        prefix call only."""
         inj = None
         if use_compile:
             inj = FixedPositionInjector(B, D_MODEL, 0, STEER_COEFF, device, torch.bfloat16)
             handle = submodule.register_forward_hook(inj.hook)
             torch._dynamo.config.cache_size_limit = 64
             fwd = torch.compile(model.forward, dynamic=True)
-        pc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device, persistent_injector=inj)
+        pc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device,
+                               persistent_injector=inj, compile_prefix=compile_prefix)
         if use_compile:
             class _Wrap:  # route both forwards through the compiled function
                 def __call__(self, **kw):
                     return fwd(**kw)
-            pc.model = pc.prefix_model = _Wrap()
+            pc.model = pc.prefix_model = pc._prefix_fn = _Wrap()
+        ac = lambda: autocast_region(model, autocast_on)  # noqa
 
-        def step(B=B):
-            vecs, targets = _random_batch(gen, B, D_MODEL, tok.vocab_size, min_tgt, max_tgt, tok.eos_token_id)
-            out = pc.forward(vecs, targets, autocast=lambda: autocast_region(model, autocast_on))
-            out.loss.backward()
+        def step(force_len=None):
+            if n_accum == 1:
+                vecs, targets = batch_gen(B, force_len)
+                out = pc.forward(vecs, targets, autocast=ac)
+                out.loss.backward()
+                n_tok, L = out.n_target_tokens, out.suffix_len
+                del out
+            else:
+                mbs = [batch_gen(B, force_len) for _ in range(n_accum)]
+                n_tot = sum(len(t) for _, tg in mbs for t in tg)
+                cache0 = pc.run_prefix(ac)
+                n_tok = 0; L = 0
+                for k, (vecs, targets) in enumerate(mbs):
+                    out = pc.forward(vecs, targets, autocast=ac, prefix_cache=cache0)
+                    (out.loss * (out.n_target_tokens / n_tot)).backward(retain_graph=k < n_accum - 1)
+                    n_tok += out.n_target_tokens; L = max(L, out.suffix_len)
+                    del out
+                del cache0
             torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step(); opt.zero_grad()
-            return B, out.n_target_tokens, out.suffix_len
+            return B * n_accum, n_tok, L
 
         def cleanup():
             if use_compile:
-                handle.remove(); torch._dynamo.reset()
+                handle.remove()
+            if use_compile or compile_prefix:
+                torch._dynamo.reset()
         return step, cleanup
 
     def run_case(name, B, fn, cleanup=None):
@@ -360,7 +454,11 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
         try:
             torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
             t_first = time.time(); fn(); torch.cuda.synchronize(); row["first_step_s"] = time.time() - t_first
-            for _ in range(warmup - 1):
+            # warm up BOTH shape extremes: Triton specializes int args (seq len) on divisibility by 16, so a new
+            # suffix length inside the measured window would otherwise pay a recompile
+            t_w = time.time(); fn(force_len=min_tgt); fn(force_len=max_tgt); torch.cuda.synchronize()
+            row["shape_warmup_s"] = time.time() - t_w
+            for _ in range(max(warmup - 3, 0)):
                 fn()
             torch.cuda.synchronize(); t0 = time.time()
             n_ex = n_tok = 0; seq = []
@@ -383,15 +481,23 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
         results["rows"].append(row)
 
     for spec in configs.split(","):
-        kind, B = spec.split(":"); B = int(B)
+        kind, Bs = spec.split(":")
+        B, n_acc = (int(Bs.split("x")[0]), int(Bs.split("x")[1])) if "x" in Bs else (int(Bs), 1)
+        label = f"{kind}" + (f" {B}x{n_acc}" if n_acc > 1 else "")
         if kind == "naive":
-            run_case("naive", B, lambda B=B: step_naive(B, None))
+            run_case("naive", B, lambda force_len=None, B=B: step_naive(B, None, force_len=force_len))
         elif kind == "naive_nocache":
-            run_case("naive_nocache", B, lambda B=B: step_naive(B, False))
+            run_case("naive_nocache", B, lambda force_len=None, B=B: step_naive(B, False, force_len=force_len))
+        elif kind == "naive_compile":
+            fn, cl = make_naive_compiled(B); run_case("naive_compile", B, fn, cl)
         elif kind == "cached":
-            fn, cl = make_cached(B, False); run_case("cached", B, fn, cl)
+            fn, cl = make_cached(B, False, n_acc); run_case(label, B * n_acc, fn, cl)
+        elif kind == "cached_pfxcompile":
+            fn, cl = make_cached(B, False, n_acc, compile_prefix="reduce-overhead"); run_case(label, B * n_acc, fn, cl)
+        elif kind == "cached_pfxcompile_default":
+            fn, cl = make_cached(B, False, n_acc, compile_prefix="default"); run_case(label, B * n_acc, fn, cl)
         elif kind == "cached_compile":
-            fn, cl = make_cached(B, True); run_case("cached_compile", B, fn, cl)
+            fn, cl = make_cached(B, True, n_acc); run_case(label, B * n_acc, fn, cl)
         else:
             raise ValueError(spec)
     if compile_:
