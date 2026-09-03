@@ -39,7 +39,7 @@ def autocast_region(model, enabled):
         cm = contextlib.nullcontext()
     with cm, torch.autocast("cuda", dtype=torch.bfloat16):
         yield
-from mxf.prompts import build_sft_ids
+from mxf.prompts import build_prompt_ids, build_sft_ids
 
 
 def pack_examples(toks, pack_len, seed=0):
@@ -125,6 +125,11 @@ def main():
     ap.add_argument("--autocast-bf16", action="store_true",
                     help="bf16 LoRA matmuls/activations under torch.autocast with PEFT's fp32 input-dtype casting disabled "
                          "(fp32 LoRA masters unchanged; HF's loss still upcasts logits to fp32). Same region as rl_disagg.")
+    ap.add_argument("--prefix-cache", action="store_true",
+                    help="compute the shared prompt prefix (tokens before the marker) ONCE per micro-batch and run only "
+                         "[marker]+target per example on top of the expanded cache (sft/prefix_cache.py). Exact incl. "
+                         "gradients; needs the transformers fork ceselder/transformers@maemm-prefix-cache, --grad-ckpt 0 "
+                         "and the per-example path (no --pack-len). Lets --batch-size go to 64-128 on one B200.")
     ap.add_argument("--log-steps", type=int, default=20,
                     help="synchronize and report MFU every N steps (1 for trustworthy microbenchmarks)")
     ap.add_argument("--save-examples", default="",
@@ -191,13 +196,31 @@ def main():
         _, _, fixed_positions = build_sft_ids(tok, "compile marker probe")
         assert len(fixed_positions) == 1
         persistent_injector = FixedPositionInjector(
-            a.batch_size, D_MODEL, fixed_positions[0], STEER_COEFF, device, torch.bfloat16
+            # prefix-cache path: the marker is index 0 of the suffix forward, not its absolute prompt index
+            a.batch_size, D_MODEL, 0 if a.prefix_cache else fixed_positions[0], STEER_COEFF, device, torch.bfloat16
         )
         persistent_handle = submodule.register_forward_hook(persistent_injector.hook)
     if a.compile:
-        model.forward = torch.compile(model.forward)
+        model.forward = torch.compile(model.forward, dynamic=True if a.prefix_cache else None)
     ddp = DDP(model, device_ids=[local]) if world > 1 else model
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
+    prefix_cache = None
+    if a.prefix_cache:
+        try:
+            from sft.prefix_cache import PrefixCache  # repo layout (needs the transformers fork; checked inside)
+        except ImportError:  # mounted next to this file (modal_sft.py puts both under /pmx/SL/)
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from prefix_cache import PrefixCache
+        assert not a.pack_len, "--prefix-cache is the per-example path (no --pack-len)"
+        assert not a.grad_ckpt, "--prefix-cache needs --grad-ckpt 0 (GradientCheckpointingLayer drops past_key_values)"
+        prompt_ids, mpos = build_prompt_ids(tok)
+        # suffix forward through `ddp` (primes DDP's reducer once per step), prefix forward through the bare model
+        prefix_cache = PrefixCache(ddp, prompt_ids, mpos[0], tok.pad_token_id, submodule, STEER_COEFF, device,
+                                   prefix_model=model, persistent_injector=persistent_injector)
+        if is_main:
+            print(f"[pretrain] prefix-cache ON: shared prefix {prefix_cache.prefix_len} tokens, suffix = "
+                  f"{len(prefix_cache.suffix_prompt)} prompt token(s) + target", flush=True)
 
     # pre-tokenize once. Packed path: shuffle-once greedy packing into fixed pack-len blocks (zero
     # intra-block padding, one static shape for compile). Legacy path: length-bucketed padded batches.
@@ -257,6 +280,14 @@ def main():
                     out = ddp(input_ids=input_ids.to(device), attention_mask=mask4,
                               position_ids=pos_ids.to(device), labels=labels.to(device),
                               use_cache=False)
+            elif prefix_cache is not None:
+                # toks_cache rows are prompt+target ids (truncated to max_seq): the target is everything after the
+                # prompt. vecs: one memmap gather. n_real = tokens actually run (shared prefix once + suffixes).
+                n_prompt = len(prompt_ids)
+                targets = [t[0][n_prompt:] for t in batch]
+                vmat = torch.from_numpy(np.asarray(vecs[[t[3] for t in batch]]))
+                out = prefix_cache.forward(vmat, targets, autocast=lambda: autocast_region(model, a.autocast_bf16))
+                n_real = prefix_cache.prefix_len + int(out.suffix_mask.sum())
             else:
                 L = max(len(t[0]) for t in batch)
                 L = min(((L + 63) // 64) * 64, a.max_seq)  # round to mult-of-64 → ≤3 static shapes for compile

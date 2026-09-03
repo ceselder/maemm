@@ -36,14 +36,21 @@ app = modal.App(APP_NAME)
 
 # torch 2.10.0+cu128 == the box venv; cu128 wheels carry sm_100 (B200) kernels. Identical pins to
 # modal_rl.py so both trainers see one environment; pretrain needs no vllm (pure HF fwd/bwd).
+# --prefix-cache (sft/prefix_cache.py) needs the transformers fork with autograd-safe linear-attention cache writes:
+#   SFT_TRANSFORMERS="transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
+# Default stays the stock pin so existing deployments rebuild nothing.
+_SFT_TRANSFORMERS = os.environ.get("SFT_TRANSFORMERS", "transformers==5.15.0")
+image = modal.Image.debian_slim(python_version="3.11")
+if "git+" in _SFT_TRANSFORMERS:
+    image = image.apt_install("git")
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    image
     .pip_install(
         "torch==2.10.0",
         index_url="https://download.pytorch.org/whl/cu128",
     )
     .pip_install(
-        "transformers==5.15.0",
+        _SFT_TRANSFORMERS,
         "peft==0.20.0",
         "accelerate==1.14.0",
         "wandb==0.28.2",
@@ -65,6 +72,7 @@ if _SFT_TRITON:
 image = (
     image
     .add_local_file(REPO / "sft" / "pretrain.py", "/pmx/SL/pretrain.py")
+    .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/SL/prefix_cache.py")   # --prefix-cache sibling import
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 
