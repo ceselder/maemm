@@ -136,9 +136,6 @@ def main():
                          "forward (token-weighted losses => identical to one big-batch mean-loss step). Amortizes the "
                          "B=1 prefix fwd+bwd (~225 ms/step on B200) and lowers peak memory: e.g. --batch-size 128 "
                          "--prefix-accum 2 fits one B200 where a single 128 micro-batch OOMs.")
-    ap.add_argument("--compile-mlp", action="store_true",
-                    help="regional torch.compile of the 64 MLP blocks only (cache objects never enter a graph, so it is "
-                         "safe with --prefix-cache, unlike --compile which recompiles endlessly on the cache path).")
     ap.add_argument("--log-steps", type=int, default=20,
                     help="synchronize and report MFU every N steps (1 for trustworthy microbenchmarks)")
     ap.add_argument("--save-examples", default="",
@@ -232,15 +229,6 @@ def main():
             print(f"[pretrain] prefix-cache ON: shared prefix {prefix_cache.prefix_len} tokens, suffix = "
                   f"{len(prefix_cache.suffix_prompt)} prompt token(s) + target, prefix shared by {a.prefix_accum} "
                   f"micro-batch(es) of {a.batch_size // a.prefix_accum}", flush=True)
-    if a.compile_mlp:
-        assert not a.compile, "--compile-mlp and --compile are exclusive"
-        try:
-            from sft.prefix_cache import compile_mlp_blocks
-        except ImportError:
-            import sys
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from prefix_cache import compile_mlp_blocks
-        compile_mlp_blocks(model)
 
     # pre-tokenize once. Packed path: shuffle-once greedy packing into fixed pack-len blocks (zero
     # intra-block padding, one static shape for compile). Legacy path: length-bucketed padded batches.

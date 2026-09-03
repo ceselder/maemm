@@ -48,8 +48,11 @@ _LAYER_DICT_ATTRS = ("conv_states", "recurrent_states", "is_conv_states_initiali
 
 def compile_mlp_blocks(model, dynamic=True):
     """Regional torch.compile: only each decoder layer's MLP (3 LoRA linears + SiLU-mul) -- no cache objects cross the
-    compiled boundary, so Dynamo does not recompile per step (whole-forward compile does: see the report). Returns a
-    zero-arg undo callable. Both the prefix and the suffix forward benefit (the eager step is launch-bound)."""
+    compiled boundary, so Dynamo does not recompile per step (whole-forward compile does). Returns a zero-arg undo
+    callable. MEASURED (B200, mb64): no speed gain (62.5 vs 62.4 ex/s), -5 GB peak -- the launch-bound part of the step
+    is not in the MLPs. Kept for the bench (test_prefix_cache.py cached_mlpcompile); not wired into pretrain.py.
+    Note: a compiled backward + retain_graph=True (shared-prefix accumulation) fails with 'donated buffers' unless
+    torch._functorch.config.donated_buffer=False."""
     base = unwrap_base(model)
     layers = base.model.layers
     originals = [layer.mlp for layer in layers]
