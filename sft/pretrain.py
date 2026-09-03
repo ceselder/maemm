@@ -355,8 +355,11 @@ def main():
         micro_per_epoch = math.ceil(len(toks_cache) / a.batch_size)
     # one optimizer step per --grad-accum micro-batches (the last group of an epoch may be shorter)
     steps_total = math.ceil(micro_per_epoch / a.grad_accum) * a.epochs
+    # warmup >= 2 optimizer steps: OneCycleLR divides by (pct_start*total_steps - 1), which is 0 for runs of
+    # < 100 steps at the 2% default (smoke tests / --grad-accum shrinking the step count); production unchanged.
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=steps_total,
-                                                pct_start=cfg.warmup_frac, anneal_strategy="linear")
+                                                pct_start=max(cfg.warmup_frac, 2.0 / steps_total),
+                                                anneal_strategy="linear")
     save_every = max(1, steps_total // a.n_ckpts) if a.n_ckpts else 2000
     if is_main:
         print(f"steps_total {steps_total} ({micro_per_epoch} micro-batches/epoch, grad_accum {a.grad_accum}), "
