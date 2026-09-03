@@ -11,7 +11,7 @@ the HF actor (rl._marker_norm). Generation: this process' own vLLM engine built 
 steering hook + FULL_DECODE_ONLY CUDA graphs, injection verified with rl.verify_vllm_injection at start-up).
 Scoring: the CLEAN HF base (adapter disabled) via eval_universal.score_probe_cos / score_sae_peaks / sae_rank_at_peaks,
 exactly as inside the trainer. Memory: HF base bf16 54 GB + adapter + SAE encoder (~60 GB) and the engine at
---vllm-gpu-mem 0.45 of the card (80 GB on a 178 GB B200, 63 GB on a 141 GB H200).
+--vllm-gpu-mem 0.5 of the card (89 GB on a 178 GB B200, 70 GB on a 141 GB H200; prefill budget 24k tokens keeps KV headroom).
 
 Loop (MAEMMBench/modal_eval_last5.py conventions): vol.reload -> newest un-evaled <ckpt_dir>/step_* (+ final as
 --final-step) first -> load the adapter -> publish to vLLM layout -> inline_eval + run_extra_evals_gpu -> wandb.log
