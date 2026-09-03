@@ -163,8 +163,7 @@ def _run(out_name: str, n_examples: int, world: int, batch: int, per_window: int
         env["CUDA_VISIBLE_DEVICES"] = str(r)
         env["PYTHONPATH"] = "/pmx:/pmx/helpers"
         env["TOKENIZERS_PARALLELISM"] = "false"
-        env["HF_HUB_OFFLINE"] = "1"
-        env["TRANSFORMERS_OFFLINE"] = "1"
+        # NOT offline: the reader downloads FineFineWeb jsonl files from the Hub (model loads use local_files_only)
         cmd = [sys.executable, "/pmx/collect_bank_worker.py", "--rank", str(r), "--world", str(world),
                "--n-examples", str(per[r]), "--seq-len", str(p_hi), "--batch", str(batch), "--per-window", str(per_window),
                "--p-lo", str(p_lo), "--p-hi", str(p_hi), "--w-lo", str(w_lo), "--w-hi", str(w_hi), "--max-wins", str(max_wins),
