@@ -57,6 +57,8 @@ sets the whole bundle, flags given explicitly still win. Pure pieces are unit-te
   --npr-threshold 0.9   No-Positive-Resampling, ADAPTED to the continuous reward: a rollout is a "positive" when its raw
                         cosine >= --npr-pass-cos; a direction whose cumulative pass rate over all its visits >= threshold is
                         dropped from all future sampling (trainer rank 0 publishes npr/dropped.json, rollout ranks exclude it).
+  --autocast-bf16       trainer: policy forward under torch.autocast(bf16) with PEFT's LoRA input casting off -> bf16 LoRA
+                        matmuls + bf16 saved activations (fp32 masters/AdamW, fp32 vocab math, inject hook, fp32 head unchanged)
   --fp32-head           trainer recomputes the frozen lm_head projection in fp32 (the log_softmax over the logits already
                         was fp32 -- see _chunked_logp; the vLLM sampler stays bf16-head / fp32-softmax, we cannot change it).
   --length-control      penalty (default, ALSO under --recipe scalerl: keeps the hinge LP) | interrupt (no LP; cap-hit
@@ -68,6 +70,7 @@ Launch inside the container (see modal_rl_disagg.py):
     python RL/rl_disagg.py --role launch --n-rollout 1 --n-trainer 3 --data-dir <pool> --init-adapter <sft> ...
 """
 import argparse
+import contextlib
 import gc
 import glob
 import json
@@ -227,6 +230,10 @@ def parse_args(argv=None):
     ap.add_argument("--max-lag", type=int, default=None,
                     help="max off-policyness in trainer steps: the rollout queue holds this many steps' worth of blocks "
                          "(an explicit --max-queue-blocks overrides); legacy 1, ScaleRL 8")
+    ap.add_argument("--autocast-bf16", action="store_true",
+                    help="trainer: run the POLICY forward under torch.autocast(bf16) with PEFT's LoRA input-dtype casting disabled, so the "
+                         "LoRA matmuls and their saved activations are bf16 (the fp32 LoRA master weights + AdamW, the fp32 chunked "
+                         "log-softmax, the inject hook and the fp32 head are unchanged). Off = byte-identical to the default path.")
     ap.add_argument("--fp32-head", dest="fp32_head", action="store_true", default=None,
                     help="trainer: recompute the frozen lm_head projection in fp32 (ScaleRL/MiniMax precision fix, trainer side)")
     ap.add_argument("--no-fp32-head", dest="fp32_head", action="store_false")
@@ -508,8 +515,61 @@ def install_fp32_head(actor):
     b32 = None if head.bias is None else head.bias.detach().float()
 
     def _fp32_out(mod, inp, out):
-        return F.linear(inp[0].float(), w32, b32)
+        with torch.autocast(inp[0].device.type, enabled=False):   # composable with --autocast-bf16: the head stays fp32 (no-op otherwise)
+            return F.linear(inp[0].float(), w32, b32)
     return head.register_forward_hook(_fp32_out)
+
+
+@contextlib.contextmanager
+def _policy_precision(actor, enabled):
+    """--autocast-bf16 region for the POLICY forward. Off: a pure no-op (default path byte-identical). On: (1) PEFT's LoRA
+    input-dtype casting is disabled (peft.helpers.disable_input_dtype_casting, else the same `cast_input_dtype_enabled`
+    toggle by hand) -- otherwise every LoRA layer still materialises an fp32 copy of its input; (2) torch.autocast(bf16) on the
+    actor's device, so F.linear(x_bf16, W_lora_fp32) runs as a bf16 matmul and autograd saves bf16 activations. The LoRA
+    master weights stay fp32 (grads arrive in fp32 through autocast's cast nodes), AdamW is untouched, rsLoRA `scaling` is a
+    Python float applied after the matmul, lora_dropout is nn.Identity at p=0. The bf16 base layers are unaffected (their
+    inputs are bf16 already; RMSNorm's explicit fp32 upcasts are explicit casts, which autocast does not override)."""
+    if not enabled:
+        yield
+        return
+    import torch
+    dev = next(actor.parameters()).device.type
+    try:
+        from peft.helpers import disable_input_dtype_casting
+        cm = disable_input_dtype_casting(actor)
+    except ImportError:
+        cm = _disable_input_dtype_casting_manual(actor)
+    with cm, torch.autocast(dev, dtype=torch.bfloat16):
+        yield
+
+
+@contextlib.contextmanager
+def _disable_input_dtype_casting_manual(model):
+    """Fallback == peft.helpers.disable_input_dtype_casting: flip `cast_input_dtype_enabled` off on every tuner layer, restore after."""
+    saved = {}
+    for name, m in model.named_modules():
+        if hasattr(m, "cast_input_dtype_enabled"):
+            saved[name] = m.cast_input_dtype_enabled
+            m.cast_input_dtype_enabled = False
+    try:
+        yield
+    finally:
+        for name, m in model.named_modules():
+            if name in saved:
+                m.cast_input_dtype_enabled = saved[name]
+
+
+def _hook_outside_autocast(hook, enabled):
+    """Wrap a forward hook so it runs with autocast DISABLED (the inject hook's ||h|| and add stay bf16-exact as in rl.py)."""
+    if not enabled:
+        return hook
+    import torch
+
+    def wrapped(mod, inp, out):
+        h = out[0] if isinstance(out, tuple) else out
+        with torch.autocast(h.device.type, enabled=False):
+            return hook(mod, inp, out)
+    return wrapped
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1105,9 +1165,11 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         b_ids, b_attn = ids[ix, :Lc].to(device), attn[ix, :Lc].to(device)
         m = gen_mask[ix, :Tc].to(device); w = w_all[ix, :Tc].to(device); A = adv[ix, None].to(device)
         olp = old_lp[ix, :Tc].to(device); kn = known[ix, :Tc].to(device)
-        hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[marker]] * len(ix), STEER_COEFF, device, torch.bfloat16)
+        hook = _hook_outside_autocast(R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[marker]] * len(ix), STEER_COEFF, device, torch.bfloat16),
+                                      a.autocast_bf16)
         with R.hooked(submodule, hook):
-            logits = actor(input_ids=b_ids, attention_mask=b_attn, use_cache=False, logits_to_keep=Tc + 1).logits[:, :-1]
+            with _policy_precision(actor, a.autocast_bf16):   # --autocast-bf16: bf16 LoRA matmuls/activations; fp32 vocab math below is outside
+                logits = actor(input_ids=b_ids, attention_mask=b_attn, use_cache=False, logits_to_keep=Tc + 1).logits[:, :-1]
             new_lp, ent = _chunked_logp(logits, b_ids[:, p_len:], a.vocab_chunk, a.entropy_coef > 0)
             del logits
             olp_eff = torch.where(kn, olp, new_lp.detach())
@@ -1175,9 +1237,11 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
             ids[:, :p_len] = torch.tensor(prompt_ids, device=device)
             attn = torch.ones_like(ids)
             dirs = F.normalize(torch.randn(mb, D_MODEL, device=device), dim=-1)
-            hook = R.make_inject_hook([dirs[i : i + 1] for i in range(mb)], [[marker]] * mb, STEER_COEFF, device, torch.bfloat16)
+            hook = _hook_outside_autocast(R.make_inject_hook([dirs[i : i + 1] for i in range(mb)], [[marker]] * mb, STEER_COEFF, device, torch.bfloat16),
+                                          getattr(a, "autocast_bf16", False))
             with R.hooked(submodule, hook):
-                logits = actor(input_ids=ids, attention_mask=attn, use_cache=False, logits_to_keep=L - p_len + 1).logits[:, :-1]
+                with _policy_precision(actor, getattr(a, "autocast_bf16", False)):
+                    logits = actor(input_ids=ids, attention_mask=attn, use_cache=False, logits_to_keep=L - p_len + 1).logits[:, :-1]
                 new_lp, ent = _chunked_logp(logits, ids[:, p_len:], a.vocab_chunk, False)
                 del logits
                 loss = new_lp.mean() * 0.0
@@ -1485,7 +1549,9 @@ def run_trainer(a):
             t = torch.tensor([mb], dtype=torch.int64, device=device if a.backend == "nccl" else "cpu")
             dist.all_reduce(t, op=dist.ReduceOp.MIN)
             mb = int(t.item())
-    _log(tag, f"micro-batch = {mb} (no gradient checkpointing)")
+    _peak = (mb_res.get(mb) or {}).get("peak_gb")
+    _log(tag, f"micro-batch = {mb} (no gradient checkpointing; autocast bf16 policy forward {'ON' if a.autocast_bf16 else 'off'}"
+              + (f"; probe peak {_peak:.1f} GB" if _peak else "") + ")")
     # ---- inline eval assets (held-out sets + SAE on every trainer rank; extra-eval testbed/judge) — after the
     # micro-batch search so the SAE's 2.7 GB is not part of the OOM probe ----
     EV = R.load_eval_assets(a, device, is_main) if a.inline_eval_every > 0 else None
