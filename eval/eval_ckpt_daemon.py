@@ -132,12 +132,16 @@ def main():
         except Exception:  # noqa
             pass
 
-    def vol_reload():
+    _reload_warned = [False]
+
+    def vol_reload():   # best-effort; the launcher's parent process refreshes the mount every 45 s regardless
         try:
             import modal
             modal.Volume.from_name("maemm-data").reload()
-        except Exception:  # noqa
-            pass
+        except Exception as e:  # noqa
+            if not _reload_warned[0]:
+                _reload_warned[0] = True
+                log(f"in-process vol.reload unavailable ({type(e).__name__}: {str(e)[:80]}); relying on the launcher's reload thread")
 
     device = "cuda:0"
     torch.cuda.set_device(0)

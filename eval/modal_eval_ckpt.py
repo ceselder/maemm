@@ -85,9 +85,21 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
         cmd += extra_args.split()
     print("[modal] launching:", " ".join(cmd), flush=True)
     p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # The daemon polls the volume from a SUBPROCESS, where `modal.Volume.from_name(...).reload()` is not the mounted
+    # handle (it silently no-ops) -> it would never see checkpoints committed after it started. Refresh the mount here.
+    import threading
+    _stop = threading.Event()
+    def _reload_loop():
+        while not _stop.wait(45):
+            try:
+                vol.reload()
+            except Exception as e:  # noqa
+                print(f"[modal] vol.reload failed: {e}", flush=True)
+    threading.Thread(target=_reload_loop, daemon=True).start()
     for line in p.stdout:
         print(line, end="", flush=True)
     rc = p.wait()
+    _stop.set()
     vol.commit()
     if rc != 0:
         raise RuntimeError(f"eval daemon exited rc={rc}")
