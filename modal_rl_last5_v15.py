@@ -149,7 +149,8 @@ TRAIN_ARGS = [
     secrets=[
         modal.Secret.from_name("maemm-hf"),
         modal.Secret.from_name("maemm-wandb"),
-        modal.Secret.from_name("maemm-openrouter"),   # judge key for the inline extra evals (Anthropic keys blocked: workspace id)
+        modal.Secret.from_name("maemm-openrouter"),
+        modal.Secret.from_name("maemm-anthropic"),    # native Sonnet 5 judge (key + anthropic-workspace-id); preferred over OpenRouter by inline_extra_evals   # judge key for the inline extra evals (Anthropic keys blocked: workspace id)
     ],
     timeout=86400,
 )
