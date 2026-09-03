@@ -9,7 +9,9 @@ Same image as modal_rl_disagg.py. Separate wandb run `eval_ckpt_<tag>` (x-axis c
 Deploy + spawn (profile safety-sahan) -- a deployed function survives the local client:
     MODAL_PROFILE=safety-sahan EVAL_GPU=B200:1 modal deploy modal_eval_ckpt.py
     MODAL_PROFILE=safety-sahan python -c "import modal; modal.Function.from_name('maemm-eval-ckpt', 'daemon').spawn(
-        ckpt_dir='/data/ckpts_last5_v15_disagg', tag='last5_v15_disagg', rl_run_id='<wandb id>')"
+        ckpt_dir='/data/ckpts_last5_disagg_2x6', tag='last5_disagg_2x6', rl_run_id='<wandb id>',
+        wandb_name='rl_everything_8x256_disagg_entropy2.0_last5win_eval')"
+ONE GPU container at a time: the daemon holds its GPU while polling, so launch it only once the first checkpoint exists.
 One-off (the step_90 protocol check):
     ... .spawn(ckpt_dir='/data/ckpts_last5_v15_g8', tag='last5_v15_g8', once=True, only_step=90)
 Set EVAL_GPU (default B200:1; e.g. H200:1) at deploy time.
@@ -59,7 +61,7 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
                        modal.Secret.from_name("maemm-anthropic"), modal.Secret.from_name("maemm-openrouter")],
               timeout=24 * 3600)
 def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once: bool = False, only_step: int = -1,
-           final_step: int = 1000, vllm_gpu_mem: float = 0.5, extra_args: str = ""):
+           final_step: int = 1000, vllm_gpu_mem: float = 0.5, wandb_name: str = "", extra_args: str = ""):
     import subprocess
     env = os.environ.copy()
     env["PYTHONPATH"] = "/pmx/helpers:/pmx/eval:/pmx/RL"
@@ -73,6 +75,8 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
     os.makedirs("/tmp/wandb", exist_ok=True)
     cmd = ["python", "/pmx/eval/eval_ckpt_daemon.py", "--ckpt-dir", ckpt_dir, "--tag", tag, "--rl-run-id", rl_run_id,
            "--poll-s", str(poll_s), "--final-step", str(final_step), "--vllm-gpu-mem", str(vllm_gpu_mem)]
+    if wandb_name:
+        cmd += ["--wandb-name", wandb_name]
     if once:
         cmd.append("--once")
     if only_step >= 0:

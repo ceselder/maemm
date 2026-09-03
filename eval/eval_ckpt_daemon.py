@@ -38,6 +38,7 @@ def parse_args(argv=None):
     ap.add_argument("--tag", required=True, help="wandb run name/id + state-file key, one per RL run (e.g. last5_v15_g8)")
     ap.add_argument("--rl-run-id", default="", help="wandb id of the RL run being tracked (config cross-reference only)")
     ap.add_argument("--wandb-project", default="maxact-fast")
+    ap.add_argument("--wandb-name", default="", help="wandb run name AND id (default eval_ckpt_<tag>); one run per RL run, never the RL run's own id")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--state", default="", help="evaled-ckpt state json (default /data/eval_state/evaled_ckpt_<tag>.json)")
     ap.add_argument("--out-dir", default="", help="per-ckpt metric json + judge artifacts (default /data/eval_ckpt/<tag>)")
@@ -172,7 +173,8 @@ def main():
     eos_ids = R._eos_ids(tok, actor)
 
     if not a.no_wandb:
-        wandb.init(project=a.wandb_project, name=f"eval_ckpt_{a.tag}", id=f"eval_ckpt_{a.tag}", resume="allow",
+        wb_name = a.wandb_name or f"eval_ckpt_{a.tag}"
+        wandb.init(project=a.wandb_project, name=wb_name, id=wb_name, resume="allow",
                    config={"ckpt_dir": a.ckpt_dir, "rl_run_id": a.rl_run_id, "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]),
                            "bo": a.eval_bo, "temp": a.eval_temp, "max_new": a.eval_max_new, "min_new": a.eval_min_new, "cache": a.eval_cache,
                            "sae_rank_metric": True, "extra_evals": EX is not None, "engine": "vllm fast_lens_ext" + (" cudagraphs" if a.cuda_graphs else " eager"),
