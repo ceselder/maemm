@@ -2053,6 +2053,10 @@ def run_launch(a, argv):
 
     def spawn(role, gpu, rank, world):
         env = dict(base_env, CUDA_VISIBLE_DEVICES=str(gpu), DISAGG_RANK=str(rank), DISAGG_WORLD=str(world))
+        if role in ("trainer", "bench-trainer") and base_env.get("DISAGG_TRAINER_PYTHONPATH"):
+            # Hopper: fla 0.5.2 refuses its gated chunk_bwd_dqkwg on Triton 3.4-3.7.0 (fla #640, wrong results). The HF
+            # trainer children (no vLLM) get a newer Triton from this dir; the vLLM rollout children keep torch's pin.
+            env["PYTHONPATH"] = base_env["DISAGG_TRAINER_PYTHONPATH"] + os.pathsep + base_env.get("PYTHONPATH", "")
         child_argv = [x for x in argv]
         child_argv[child_argv.index("--role") + 1] = role
         tagp = {"trainer": "T", "rollout": "R", "bench-rollout": "B", "bench-trainer": "BT"}[role] + str(rank)

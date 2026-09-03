@@ -45,6 +45,15 @@ image = (
     )
     .pip_install("flash-linear-attention==0.5.2")   # fla + fla-core + einops; transformers>=4.45 already satisfied
     .pip_install("anthropic")                        # native Sonnet 5 judge for the inline extra evals (inline_extra_evals.JudgeClient)
+)
+# Hopper (H100/H200) trainer fix, opt-in at deploy time: DISAGG_TRAINER_TRITON=3.7.1. fla 0.5.2 raises on Triton 3.4-3.7.0 on
+# Hopper ("produces incorrect results for gated chunk_bwd_dqkwg", fla #640); torch 2.10 pins triton 3.6.0, which vLLM also
+# uses, so the newer Triton goes into its own dir and ONLY the HF trainer children see it (rl_disagg.run_launch spawn()).
+TRAINER_TRITON = os.environ.get("DISAGG_TRAINER_TRITON", "")
+if TRAINER_TRITON:
+    image = image.run_commands(f"pip install --no-deps --target /opt/triton_{TRAINER_TRITON} triton=={TRAINER_TRITON}")
+image = (
+    image
     .add_local_file(REPO / "rl" / "rl.py", "/pmx/RL/rl_hf.py")
     .add_local_file(REPO / "rl" / "rl_disagg.py", "/pmx/RL/rl_disagg.py")
     .add_local_file(REPO / "rl" / "fast_lens_ext.py", "/pmx/helpers/fast_lens_ext.py")
@@ -98,6 +107,8 @@ TRAIN_ARGS = [
 def _env():
     env = os.environ.copy()
     env["PYTHONPATH"] = "/pmx/helpers:/pmx/eval:/pmx/RL"
+    if TRAINER_TRITON:
+        env["DISAGG_TRAINER_PYTHONPATH"] = f"/opt/triton_{TRAINER_TRITON}"
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["WANDB_DIR"] = "/tmp/wandb"
     env["HF_HOME"] = "/data/hf_cache"
