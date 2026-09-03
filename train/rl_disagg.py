@@ -84,6 +84,8 @@ def parse_args(argv=None):
     ap.add_argument("--wandb-id", default=None)
     ap.add_argument("--save-dir", default="checkpoints/rl_disagg")
     ap.add_argument("--save-every", type=int, default=500)
+    ap.add_argument("--save-steps", default="", help="comma-separated extra checkpoint steps, e.g. 25,40,60,90,130,200,300,450,675,1000 (log-spaced)")
+    ap.add_argument("--warmup-steps", type=int, default=0, help="linear LR warmup over the first N global steps (stability)")
     ap.add_argument("--run-name", default="mxf-rl-disagg")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
@@ -863,6 +865,9 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     t_sync = time.time() - t_sync
     gn = float(torch.nn.utils.clip_grad_norm_(params, a.max_grad_norm))
     if math.isfinite(gn):
+        if a.warmup_steps > 0:   # linear LR warmup over the first N global steps
+            for _g in opt.param_groups:
+                _g["lr"] = a.lr * min(1.0, (step + 1) / a.warmup_steps)
         opt.step()
     else:
         opt.zero_grad(set_to_none=True)
@@ -1466,12 +1471,14 @@ def run_trainer(a):
                     if not a.no_wandb:
                         wandb.log({**m, "ckpt_step": cs})
             json.dump(step_hist, open(f"{work}/trainer_steps.json", "w"))
-            if a.save_every and step and step % a.save_every == 0:
+            _save_steps = {int(x) for x in a.save_steps.split(",") if x.strip()}
+            if (a.save_every and step and step % a.save_every == 0) or (step in _save_steps):
                 actor.save_pretrained(f"{a.save_dir}/step_{step}")
                 torch.save(opt.state_dict(), f"{a.save_dir}/step_{step}/optim.pt")
-                stale_o = os.path.join(a.save_dir, f"step_{step - 2 * a.save_every}", "optim.pt")
-                if os.path.exists(stale_o):
-                    os.remove(stale_o)
+                if a.save_every:   # rolling optim.pt cleanup only for the periodic schedule (log-spaced ckpts keep theirs)
+                    stale_o = os.path.join(a.save_dir, f"step_{step - 2 * a.save_every}", "optim.pt")
+                    if os.path.exists(stale_o) and (step - 2 * a.save_every) not in _save_steps:
+                        os.remove(stale_o)
     if is_main:
         actor.save_pretrained(f"{a.save_dir}/final")
         if a.save_every:
