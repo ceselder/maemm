@@ -114,10 +114,11 @@ def main():
         nonlocal buf_n, kept, norm_med, n_norm_drop, n_win
         ids = torch.tensor([[bos] + w for w in wins], device="cuda:0")
         h, _ = read_resid(model, READ_LAYER, {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, pool="all")
-        content = h[:, 1:, :]                                          # fp32 [B, L, d]; row t = content token t
-        B = content.shape[0]
-        cand = np.arange(a.p_lo - 1, min(a.p_hi, L))                  # 0-indexed positions with ctx_len in range
-        pos = np.stack([rng.choice(cand, size=K, replace=False) for _ in range(B)])   # [B, K]
+        content = h[:, 1:, :]                                          # fp32 [B, Lw, d]; row t = content token t
+        B, Lw = content.shape[0], content.shape[1]                     # Lw = this batch's window length (<= L for doc tails)
+        cand = np.arange(a.p_lo - 1, min(a.p_hi, Lw))                 # 0-indexed positions with ctx_len in range
+        Kb = min(K, len(cand))
+        pos = np.stack([rng.choice(cand, size=Kb, replace=False) for _ in range(B)])   # [B, Kb]
         acts = content[torch.arange(B, device="cuda:0")[:, None], torch.tensor(pos, device="cuda:0")]   # [B, K, d]
         norms = acts.norm(dim=-1)                                      # raw norms
         if norm_med is None:
@@ -126,7 +127,7 @@ def main():
         keep = (norms <= a.norm_cap * norm_med).cpu().numpy()          # [B, K]
         dirs = torch.nn.functional.normalize(acts - mu, dim=-1).to(torch.float16).cpu().numpy()
         for b in range(B):
-            for k in range(K):
+            for k in range(Kb):
                 if kept >= a.n_examples:
                     break
                 p = int(pos[b, k])
