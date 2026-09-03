@@ -865,9 +865,6 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     t_sync = time.time() - t_sync
     gn = float(torch.nn.utils.clip_grad_norm_(params, a.max_grad_norm))
     if math.isfinite(gn):
-        if a.warmup_steps > 0:   # linear LR warmup over the first N global steps
-            for _g in opt.param_groups:
-                _g["lr"] = a.lr * min(1.0, (step + 1) / a.warmup_steps)
         opt.step()
     else:
         opt.zero_grad(set_to_none=True)
@@ -1385,6 +1382,10 @@ def run_trainer(a):
                 if v is not None:
                     old_lp[i, j] = float(v); known[i, j] = True
         t_up = time.time()
+        if a.warmup_steps > 0:   # linear LR warmup over the first N global steps (stability)
+            for _g in opt.param_groups:
+                _g["lr"] = a.lr * min(1.0, (step + 1) / a.warmup_steps)
+
         stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb)
         t_up = time.time() - t_up
 

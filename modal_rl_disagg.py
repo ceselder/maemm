@@ -76,7 +76,6 @@ TRAIN_ARGS = [
     "--adam-eps", "1e-8",
     "--adam-betas", "0.9", "0.95",
     "--loss-agg", "seq",
-    "--trunc-reward", "-2",
     "--max-grad-norm", "1",
     "--reward-window-last", "5",
     "--reward-topk", "1",
@@ -88,7 +87,9 @@ TRAIN_ARGS = [
     "--ref-micro-batch", "32",
     "--vllm-gpu-mem", "0.85",
     "--inline-eval-every", "0",    # in-trainer eval OFF (user, Sep 3): checkpoints are evaluated by the separate 1-GPU daemon modal_eval_ckpt.py
-    "--save-every", "10",
+    "--save-every", "0",
+    "--save-steps", "25,40,60,90,130,200,300,450,675,1000",   # user: ~10 log-spaced ckpts to 1000; a separate 1-GPU job evals them
+    "--warmup-steps", "10",                                      # user: 10-step linear LR warmup for stability
     "--save-dir", CKPT_DIR,
     "--run-name", "rl_everything_8x128_disagg_dev",
 ]
