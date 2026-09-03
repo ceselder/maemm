@@ -53,14 +53,16 @@ MU_PATH = "/data/acts27b/whiten_mu.npy"
 EXCLUDE_STORES = ["/data/acts27b", "/data/acts27b_long", "/data/acts_longctx"]   # any that exist: hash their rows
 
 
-def _build_assignment(world: int, seed: int):
-    """Same scheme as modal_acts27b._build_assignment: 2 FineFineWeb jsonl files per domain (seeded), dealt round-robin."""
+def _build_assignment(world: int, seed: int, exclude_files=()):
+    """Same scheme as modal_acts27b._build_assignment: 2 FineFineWeb jsonl files per domain (seeded), dealt round-robin.
+    exclude_files: files already used by another bank (embarrassingly-parallel collections must not share documents)."""
     import random
 
     from huggingface_hub import HfApi
 
     try:
         files = [f for f in HfApi().list_repo_files(DATASET, repo_type="dataset") if f.endswith(".jsonl")]
+        files = [f for f in files if f not in set(exclude_files)]
         assert files, "no jsonl files listed"
     except Exception as e:  # noqa
         print(f"[modal] {DATASET} unavailable ({type(e).__name__}: {e}) -- FALLING BACK to {FALLBACK}", flush=True)
@@ -107,8 +109,18 @@ def _exclusion_hashes():
     return sorted(out), per_store
 
 
+def _other_bank_files(bank_name: str):
+    """Files used by another (running or finalized) bank, for disjoint parallel collections."""
+    import json
+    for cand in (f"/data/banks/{bank_name}/shards/assignment.json", f"/data/banks/{bank_name}/assignment.json"):
+        if os.path.exists(cand):
+            a = json.load(open(cand))
+            return [f for r in a.get("ranks", []) for f in r]
+    raise FileNotFoundError(f"no assignment.json for bank {bank_name}")
+
+
 def _run(out_name: str, n_examples: int, world: int, batch: int, per_window: int, p_lo: int, p_hi: int, w_lo: int,
-         w_hi: int, max_wins: int, chunk_examples: int, seed: int):
+         w_hi: int, max_wins: int, chunk_examples: int, seed: int, exclude_from: str = ""):
     import json
     import subprocess
     import sys
@@ -128,9 +140,15 @@ def _run(out_name: str, n_examples: int, world: int, batch: int, per_window: int
         assign = json.load(open(assign_path))
         assert assign.get("world", world) == world, "resume with a different world size is not supported"
     else:
-        assign = _build_assignment(world, seed)
+        excl_files = []
+        for other in [x for x in exclude_from.split(",") if x.strip()]:
+            excl_files += _other_bank_files(other.strip())
+        assign = _build_assignment(world, seed, exclude_files=excl_files)
         assign["world"] = world
+        assign["excluded_files_from"] = exclude_from
+        assign["n_excluded_files"] = len(set(excl_files))
         json.dump(assign, open(assign_path, "w"))
+        print(f"[modal] assignment: {assign.get('n_files')} files over {world} ranks (excluded {len(set(excl_files))} files of {exclude_from!r})", flush=True)
     excl_path = f"{shards}/exclude_hashes.json"
     if not os.path.exists(excl_path):
         hashes, per_store = _exclusion_hashes()
@@ -249,6 +267,7 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
         "files": {"vecs.f16": f"float16 [{total},{D_MODEL}]", "records.jsonl": "shuffled; vec_idx -> row"},
     }
     json.dump(stats, open(f"{out}/build_stats.json", "w"), indent=2)
+    shutil.copy(f"{shards}/assignment.json", f"{out}/assignment.json")   # keeps the file list for disjoint follow-up banks
     shutil.rmtree(shards, ignore_errors=True)
     print(f"[modal] FINALIZED {out}: {total} examples, {stats['docs_seen']} docs, {stats['docs_excluded_eval_hash']} excluded, "
           f"vecs.f16 {total * D_MODEL * 2 / 2**30:.1f} GB ({time.time() - t0:.0f}s)", flush=True)
@@ -258,11 +277,76 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
               cpu=32, memory=192 * 1024)
 def collect(n_examples: int = 20_000_000, out_name: str = "realact_short_20m", batch: int = 64, per_window: int = 8,
             p_lo: int = 8, p_hi: int = 256, w_lo: int = 8, w_hi: int = 32, max_wins: int = 4, chunk_examples: int = 50_000,
-            seed: int = 7):
+            seed: int = 7, exclude_from: str = ""):
+    _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from)
+
+
+def _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from):
     import subprocess
     n = len([ln for ln in subprocess.check_output(["nvidia-smi", "-L"], text=True).splitlines() if ln.strip()])
     _run(out_name, n_examples, world=n, batch=batch, per_window=per_window, p_lo=p_lo, p_hi=p_hi, w_lo=w_lo, w_hi=w_hi,
-         max_wins=max_wins, chunk_examples=chunk_examples, seed=seed)
+         max_wins=max_wins, chunk_examples=chunk_examples, seed=seed, exclude_from=exclude_from)
+
+
+@app.function(image=image, gpu="B200:8", volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=86400,
+              cpu=32, memory=192 * 1024)
+def collect_b200(n_examples: int = 9_000_000, out_name: str = "realact_short_20m_b", batch: int = 64, per_window: int = 8,
+                 p_lo: int = 8, p_hi: int = 256, w_lo: int = 8, w_hi: int = 32, max_wins: int = 4, chunk_examples: int = 50_000,
+                 seed: int = 8, exclude_from: str = "realact_short_20m"):
+    """Same collector on 8xB200 (embarrassingly parallel with `collect` on H200s): a different seed + the other bank's files
+    excluded => disjoint documents. Merge the finished parts with `merge`."""
+    _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from)
+
+
+@app.function(image=image, volumes={"/data": vol}, timeout=4 * 3600, cpu=16, memory=128 * 1024, ephemeral_disk=512 * 1024)
+def merge(out_name: str, parts: str, seed: int = 0):
+    """Concatenate finalized part banks (comma list) into /data/banks/<out_name>: vecs.f16 (parts in order), records with
+    re-based vec_idx, globally shuffled; build_stats = sums + per-part stats."""
+    import json
+    import sys
+    import time
+
+    import numpy as np
+
+    sys.path.insert(0, "/pmx/helpers")
+    from mxf.config import D_MODEL
+    t0 = time.time()
+    out = f"/data/banks/{out_name}"
+    assert not os.path.exists(f"{out}/build_stats.json"), f"{out} already finalized"
+    os.makedirs(out, exist_ok=True)
+    names = [x.strip() for x in parts.split(",") if x.strip()]
+    stats = [json.load(open(f"/data/banks/{n}/build_stats.json")) for n in names]
+    total = sum(st["n_examples"] for st in stats)
+    vecs = np.memmap(f"{out}/vecs.f16.tmp", np.float16, "w+", shape=(total, D_MODEL))
+    recs, off = [], 0
+    for n, st in zip(names, stats):
+        N = st["n_examples"]
+        src = np.memmap(f"/data/banks/{n}/vecs.f16", np.float16, "r", shape=(N, D_MODEL))
+        for s0 in range(0, N, 200_000):
+            vecs[off + s0 : off + min(N, s0 + 200_000)] = src[s0 : min(N, s0 + 200_000)]
+        with open(f"/data/banks/{n}/records.jsonl") as f:
+            for line in f:
+                r = json.loads(line); r["vec_idx"] += off; r["part"] = n
+                recs.append(r)
+        off += N
+        print(f"[merge] {n}: {N} examples appended ({time.time() - t0:.0f}s)", flush=True)
+    assert off == total and len(recs) == total
+    vecs.flush(); del vecs
+    os.replace(f"{out}/vecs.f16.tmp", f"{out}/vecs.f16")
+    order = np.random.default_rng(seed).permutation(total)
+    with open(f"{out}/records.jsonl.tmp", "w") as f:
+        for i in order:
+            f.write(json.dumps(recs[i], ensure_ascii=False) + "\n")
+    os.replace(f"{out}/records.jsonl.tmp", f"{out}/records.jsonl")
+    merged = {"kind": "merge of " + ", ".join(names) + " (disjoint FineFineWeb files; see parts)", "n_examples": total,
+              "families": {"realact": total}, "parts": {n: st for n, st in zip(names, stats)},
+              "docs_seen": sum(st.get("docs_seen", 0) for st in stats),
+              "docs_excluded_eval_hash": sum(st.get("docs_excluded_eval_hash", 0) for st in stats),
+              "ctx_range": stats[0]["ctx_range"], "w_range": stats[0]["w_range"], "created": time.time(),
+              "files": {"vecs.f16": f"float16 [{total},{D_MODEL}]", "records.jsonl": "shuffled; vec_idx -> row; part = source bank"}}
+    json.dump(merged, open(f"{out}/build_stats.json", "w"), indent=2)
+    vol.commit()
+    print(f"[merge] FINALIZED {out}: {total} examples from {names} in {time.time() - t0:.0f}s", flush=True)
 
 
 @app.function(image=image, gpu=SMOKE_GPU, volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=7200,
@@ -302,9 +386,15 @@ def peek(out_name: str = "realact_short_smoke", n: int = 6):
 
 @app.local_entrypoint()
 def run_collect(n_examples: int = 20_000_000, out_name: str = "realact_short_20m", batch: int = 64, per_window: int = 8,
-                p_lo: int = 8, p_hi: int = 256, w_lo: int = 8, w_hi: int = 32, max_wins: int = 4, seed: int = 7):
+                p_lo: int = 8, p_hi: int = 256, w_lo: int = 8, w_hi: int = 32, max_wins: int = 4, seed: int = 7,
+                exclude_from: str = ""):
     collect.remote(n_examples=n_examples, out_name=out_name, batch=batch, per_window=per_window, p_lo=p_lo, p_hi=p_hi,
-                   w_lo=w_lo, w_hi=w_hi, max_wins=max_wins, seed=seed)
+                   w_lo=w_lo, w_hi=w_hi, max_wins=max_wins, seed=seed, exclude_from=exclude_from)
+
+
+@app.local_entrypoint()
+def run_merge(out_name: str, parts: str, seed: int = 0):
+    merge.remote(out_name=out_name, parts=parts, seed=seed)
 
 
 @app.local_entrypoint()
