@@ -12,8 +12,14 @@ import tempfile
 
 import numpy as np
 import torch
-from peft import LoraConfig, get_peft_model
-from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+if not torch.cuda.is_available():
+    # transformers binds fla's Triton GatedDeltaNet kernel at import time when `fla` is importable; on CPU
+    # there is no Triton driver, so hide fla and take the pure-torch fallback (what the test needs anyway).
+    sys.modules.setdefault("fla", None)
+
+from peft import LoraConfig, get_peft_model  # noqa: E402
+from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pretrain  # noqa: E402  (sft/pretrain.py)

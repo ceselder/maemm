@@ -66,7 +66,7 @@ def open_vec_bank(data_dir, n_vecs):
 
 def gather_rows(vecs, idx):
     """Bank rows -> float32 CPU tensor (f16 banks are upcast here; f32 rows are a plain copy)."""
-    return torch.from_numpy(np.asarray(vecs[idx], dtype=np.float32))
+    return torch.from_numpy(np.array(vecs[idx], dtype=np.float32))   # np.array = always a writable copy
 
 
 class LabelHeadLM(torch.nn.Module):
@@ -85,34 +85,71 @@ class LabelHeadLM(torch.nn.Module):
     def _head_ce_sum(lm_head, h_rows, tgt_rows):
         return F.cross_entropy(lm_head(h_rows).float(), tgt_rows, reduction="sum")
 
-    def forward(self, input_ids, attention_mask, labels, **body_kw):
-        base = self.peft_model.get_base_model()
+    def hidden(self, input_ids, attention_mask, **body_kw):
+        """Final-norm hidden states [B, L, d] from the transformer body (compiled if --compile)."""
         body_kw.setdefault("use_cache", False)
-        h = base.model(input_ids=input_ids, attention_mask=attention_mask, **body_kw).last_hidden_state  # [B, L, d]
+        return self.peft_model.get_base_model().model(
+            input_ids=input_ids, attention_mask=attention_mask, **body_kw).last_hidden_state
+
+    def loss_from_hidden(self, h, labels):
+        lm_head = self.peft_model.get_base_model().lm_head
         tgt = labels[:, 1:]                                                # logits at t predict token t+1
         keep = tgt != -100
         h_sel, tgt_sel = h[:, :-1][keep], tgt[keep]                        # [n, d], [n]
         n = tgt_sel.numel()
         if self.ce_chunk and n > self.ce_chunk:
             # recompute each chunk's head+CE in the backward so peak memory is one chunk of fp32 logits
-            total = sum(checkpoint(self._head_ce_sum, base.lm_head, h_sel[s : s + self.ce_chunk],
+            total = sum(checkpoint(self._head_ce_sum, lm_head, h_sel[s : s + self.ce_chunk],
                                    tgt_sel[s : s + self.ce_chunk], use_reentrant=False)
                         for s in range(0, n, self.ce_chunk))
         else:
-            total = self._head_ce_sum(base.lm_head, h_sel, tgt_sel)
+            total = self._head_ce_sum(lm_head, h_sel, tgt_sel)
         return total / n
+
+    def forward(self, input_ids, attention_mask, labels, **body_kw):
+        return self.loss_from_hidden(self.hidden(input_ids, attention_mask, **body_kw), labels)
+
+
+@contextlib.contextmanager
+def eager_forwards(compiled):
+    """Temporarily undo `mod.forward = torch.compile(mod.forward)` for each (mod, original_forward) pair."""
+    saved = [(m, m.forward) for m, _ in compiled]
+    for m, f in compiled:
+        m.forward = f
+    try:
+        yield
+    finally:
+        for m, f in saved:
+            m.forward = f
 
 
 @torch.no_grad()
-def parity_check(peft_model, label_head, kw, tol=1e-3):
-    """|HF ForCausalLM loss - head-on-labels loss| on one batch (same hooks / autocast / weights)."""
-    loss_hf = peft_model(**kw).loss.float()
-    loss_lh = label_head(**kw).float()
-    diff = (loss_hf - loss_lh).abs().item()
-    print(f"[parity] hf_loss {loss_hf.item():.6f}  head_on_labels_loss {loss_lh.item():.6f}  "
-          f"|diff| {diff:.3e}  ({'OK' if diff < tol else 'FAIL'} @ tol {tol:g})", flush=True)
-    assert diff < tol, f"head-on-labels parity FAILED: |diff| {diff:.3e} >= {tol:g}"
-    return diff
+def parity_check(peft_model, label_head, kw, compiled=(), tol=1e-3):
+    """--parity-check on one batch (same hooks / autocast / weights). Three numbers:
+      (1) eager HF ForCausalLM loss vs eager head-on-labels loss      -> asserted < tol
+      (2) HF's own ForCausalLMLoss on the full logits vs the gathered CE, both from the SAME hidden states
+          of the actual (compiled) training body                      -> asserted < tol (pure loss-math check)
+      (3) the compiled head-on-labels training path vs (1)'s eager HF -> informational: torch.compile's bf16
+          numerics, nothing to do with the loss formulation
+    Eager-vs-eager matters: two different Dynamo graphs of a 27B bf16 body differ by ~1e-2 in loss."""
+    from transformers.loss.loss_utils import ForCausalLMLoss
+
+    with eager_forwards(compiled):
+        loss_hf = peft_model(**kw).loss.float()
+        loss_lh = label_head(**kw).float()
+    d1 = (loss_hf - loss_lh).abs().item()
+    base = peft_model.get_base_model()
+    h = label_head.hidden(**{k: v for k, v in kw.items() if k != "labels"})
+    loss_full = ForCausalLMLoss(base.lm_head(h), kw["labels"], base.config.vocab_size).float()
+    loss_gath = label_head.loss_from_hidden(h, kw["labels"]).float()
+    d2 = (loss_full - loss_gath).abs().item()
+    d3 = (loss_gath - loss_hf).abs().item()
+    ok = d1 < tol and d2 < tol
+    print(f"[parity] (1) eager: hf {loss_hf.item():.6f} head_on_labels {loss_lh.item():.6f} |diff| {d1:.3e} | "
+          f"(2) same hidden states: hf-formula {loss_full.item():.6f} gathered {loss_gath.item():.6f} |diff| {d2:.3e} | "
+          f"(3) compiled-vs-eager |diff| {d3:.3e} (info) -> {'OK' if ok else 'FAIL'} @ tol {tol:g}", flush=True)
+    assert ok, f"head-on-labels parity FAILED: eager |diff| {d1:.3e}, same-hidden |diff| {d2:.3e} (tol {tol:g})"
+    return d1, d2, d3
 
 
 def pack_examples(toks, pack_len, seed=0):
@@ -285,12 +322,11 @@ def main():
     # --head-on-labels: the gather has a data-dependent size, so only the transformer body is compiled
     # (one static graph per padded length); gather + lm_head + CE run eagerly on a few hundred rows.
     label_head = LabelHeadLM(model, a.ce_chunk)
+    compiled = []   # (module, eager forward) pairs, so --parity-check can run the eager reference
     if a.compile:
-        if a.head_on_labels:
-            body = model.get_base_model().model
-            body.forward = torch.compile(body.forward, mode=a.compile_mode)
-        else:
-            model.forward = torch.compile(model.forward, mode=a.compile_mode)
+        target = model.get_base_model().model if a.head_on_labels else model
+        compiled.append((target, target.forward))
+        target.forward = torch.compile(target.forward, mode=a.compile_mode)
     train_mod = label_head if a.head_on_labels else model   # what DDP wraps / the loop calls
     ddp = DDP(train_mod, device_ids=[local]) if world > 1 else train_mod
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
@@ -387,15 +423,17 @@ def main():
                         vlist = [gather_rows(vecs, t[3]).unsqueeze(0) for t in batch]
                         hook_ctx = hooked(submodule, make_inject_hook(
                             vlist, [pos] * len(batch), STEER_COEFF, device, torch.bfloat16))
+                    # use_cache=False explicitly: HF's default (None -> config True) builds a DynamicCache every
+                    # training forward and routes the GDN conv through the cache pad+slice path.
                     kw = dict(input_ids=input_ids.to(device), attention_mask=attn.to(device),
-                              labels=labels.to(device))
+                              labels=labels.to(device), use_cache=False)
                     n_ex_step += len(batch)
                 n_real_step += n_real
                 # ---- forward/backward. DDP all-reduces grads only on the group's last micro-batch. ----
                 sync_ctx = ddp.no_sync() if (world > 1 and mi < len(group) - 1) else contextlib.nullcontext()
                 with hook_ctx, autocast_region(model, a.autocast_bf16), sync_ctx:
                     if not parity_done:
-                        parity_check(model, label_head, kw); parity_done = True
+                        parity_check(model, label_head, kw, compiled); parity_done = True
                     out = ddp(**kw)
                     loss = out if a.head_on_labels else out.loss
                     (loss / len(group)).backward()
