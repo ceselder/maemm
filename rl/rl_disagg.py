@@ -1228,8 +1228,14 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
 
 
 def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag):
-    """Largest micro-batch whose forward+backward at MAX length (prompt + max_new_tokens) fits with <90% of
-    the GPU allocated. Synthetic tokens; same hook, same chunked vocab math as update_disagg."""
+    """Largest micro-batch whose forward+backward at MAX length (prompt + max_new_tokens) fits with <90% of the GPU
+    allocated. Synthetic tokens; same hook, same chunked vocab math as update_disagg.
+
+    Strategy (Sep 3): measure mb=1 and mb=2 (always fit), fit peak ~= fixed + mb * per_seq, predict the largest candidate
+    under 85% of the GPU and VERIFY it (<90%); only on a failed verification step down. The old descending scan started at
+    mb=64 and OOM'd on purpose -- on the H200:4 run a CUDA OOM mid-forward left the partial graph resident (every later
+    candidate saw ~138 GB 'allocated by PyTorch' on a 140 GB card, with only 56.6 GB resident before the scan), so this
+    probe never OOMs by design. Each attempt runs in its own function so no local of a failed attempt can outlive it."""
     import torch
     import torch.nn.functional as F
     import rl_hf as R
@@ -1237,11 +1243,15 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
     L = len(prompt_ids) + a.max_new_tokens
     p_len = len(prompt_ids)
     total = torch.cuda.get_device_properties(0).total_memory
+    GB = 2**30
+    gc.collect(); torch.cuda.empty_cache()
+    base = torch.cuda.memory_allocated()
     free0, _ = torch.cuda.mem_get_info()
-    _log(tag, f"micro-batch probe @ L={L} (prompt {p_len} + {a.max_new_tokens} new): resident {torch.cuda.memory_allocated() / 2**30:.1f} GB, "
-              f"free {free0 / 2**30:.1f} / {total / 2**30:.0f} GB (device {torch.cuda.current_device()}, CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')})")
-    res, chosen = {}, None
-    for mb in cands:
+    _log(tag, f"micro-batch probe @ L={L} (prompt {p_len} + {a.max_new_tokens} new): resident {base / GB:.1f} GB, "
+              f"free {free0 / GB:.1f} / {total / GB:.0f} GB (device {torch.cuda.current_device()}, CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')})")
+
+    def attempt(mb):
+        """-> (ok, peak_bytes | None, err | None). All tensors are locals here and die with the frame."""
         ok, peak, err = False, None, None
         try:
             torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
@@ -1261,19 +1271,50 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
             torch.cuda.synchronize()
             peak = torch.cuda.max_memory_allocated()
             ok = peak < 0.90 * total
-            del new_lp, ent, loss, ids, attn, dirs
         except torch.cuda.OutOfMemoryError as e:
             ok = False
             err = re.sub(r"\s+", " ", str(e))[:420]
         finally:
             opt.zero_grad(set_to_none=True)
             gc.collect(); torch.cuda.empty_cache()
-        res[mb] = {"ok": ok, "peak_gb": (peak / 2**30) if peak else None}
-        _log(tag, f"mb {mb}: {'OK' if ok else 'OOM/too tight'}" + (f" peak {peak / 2**30:.1f} GB / {total / 2**30:.0f}" if peak else "")
-                  + (f" | {err}" if err else ""))
-        if ok:
-            chosen = mb
-            break
+        return ok, peak, err
+
+    res, chosen = {}, None
+
+    def record(mb, ok, peak, err, note=""):
+        res[mb] = {"ok": ok, "peak_gb": (peak / GB) if peak else None}
+        after = torch.cuda.memory_allocated()
+        leak = f" | LEAK: {(after - base) / GB:.1f} GB still allocated after the attempt" if after > base + GB else ""
+        _log(tag, f"mb {mb}: {'OK' if ok else 'OOM/too tight'}" + (f" peak {peak / GB:.1f} GB / {total / GB:.0f}" if peak else "")
+                  + (f" {note}" if note else "") + (f" | {err}" if err else "") + leak)
+        return after > base + GB
+
+    ok1, p1, e1 = attempt(1); record(1, ok1, p1, e1, "(calibration)")
+    ok2, p2, e2 = attempt(2); leaked = record(2, ok2, p2, e2, "(calibration)")
+    if ok1 and ok2 and not leaked:
+        per = max(p2 - p1, 64 * 2**20)
+        fixed = max(p1 - base - per, 0)
+        pred = int((0.85 * total - base - fixed) // per)
+        _log(tag, f"probe fit: {per / GB:.2f} GB/seq + {fixed / GB:.1f} GB fixed on {base / GB:.1f} GB resident -> "
+                  f"predicted max mb {pred} at 85% of {total / GB:.0f} GB")
+        for mb in sorted({c for c in cands if 2 < c <= pred}, reverse=True):
+            ok, peak, err = attempt(mb); leaked = record(mb, ok, peak, err, "(verify)")
+            if ok:
+                chosen = mb
+                break
+            if leaked:
+                _log(tag, "verification OOM leaked GPU memory; not probing further")
+                break
+        if chosen is None and ok2:
+            chosen = 2 if pred >= 2 else 1
+    else:
+        # calibration itself failed (should not happen with >30 GB free) -- fall back to the old descending scan
+        _log(tag, f"calibration failed (ok1={ok1} ok2={ok2} leaked={leaked}); falling back to the descending scan over {cands}")
+        for mb in cands:
+            ok, peak, err = attempt(mb); record(mb, ok, peak, err)
+            if ok:
+                chosen = mb
+                break
     return chosen, res
 
 
