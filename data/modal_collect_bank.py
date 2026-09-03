@@ -298,6 +298,15 @@ def collect_b200(n_examples: int = 9_000_000, out_name: str = "realact_short_20m
     _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from)
 
 
+@app.function(image=image, gpu="B200:4", volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=86400,
+              cpu=16, memory=96 * 1024)
+def collect_b200x4(n_examples: int = 3_000_000, out_name: str = "realact_short_20m_d", batch: int = 64, per_window: int = 8,
+                   p_lo: int = 8, p_hi: int = 256, w_lo: int = 8, w_hi: int = 32, max_wins: int = 4, chunk_examples: int = 50_000,
+                   seed: int = 10, exclude_from: str = "realact_short_20m,realact_short_20m_b,realact_short_20m_c"):
+    """4xB200 part (4-GPU B200 requests schedule far more easily than 8-GPU ones)."""
+    _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from)
+
+
 @app.function(image=image, volumes={"/data": vol}, timeout=4 * 3600, cpu=16, memory=128 * 1024, ephemeral_disk=512 * 1024)
 def merge(out_name: str, parts: str, seed: int = 0):
     """Concatenate finalized part banks (comma list) into /data/banks/<out_name>: vecs.f16 (parts in order), records with
