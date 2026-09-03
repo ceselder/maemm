@@ -134,16 +134,28 @@ class PrefixCache:
             raise RuntimeError("prefix forward returned no cache (use_cache ignored?)")
         return cache
 
-    def forward(self, vecs, targets, autocast=contextlib.nullcontext, max_len=None, prefix_cache=None):
+    def forward(self, vecs, targets, autocast=contextlib.nullcontext, max_len=None, prefix_cache=None, timings=None):
         """Full prefix-cached step. ``autocast``: zero-arg callable returning a context manager (e.g.
-        ``lambda: autocast_region(model, True)``), applied to BOTH forwards. Returns SimpleNamespace(loss, logits,
-        labels, suffix_mask, n_target_tokens, suffix_len, prefix_len)."""
+        ``lambda: autocast_region(model, True)``), applied to BOTH forwards. ``timings``: optional dict that receives
+        CUDA-synchronized phase durations (prefix_fwd_s, expand_s, suffix_fwd_s) -- profiling only, it syncs.
+        Returns SimpleNamespace(loss, logits, labels, suffix_mask, n_target_tokens, suffix_len, prefix_len)."""
+        import time
+
+        def _tick():
+            if timings is None:
+                return None
+            torch.cuda.synchronize()
+            return time.time()
+
         B = len(targets)
         vecs = torch.as_tensor(vecs)
         if vecs.ndim != 2 or vecs.shape[0] != B:
             raise ValueError(f"vecs must be [B={B}, d], got {tuple(vecs.shape)}")
+        t0 = _tick()
         cache = prefix_cache if prefix_cache is not None else self.run_prefix(autocast)
+        t1 = _tick()
         cache.batch_repeat_interleave(B)   # out-of-place in the fork: grads flow back into the prefix graph
+        t2 = _tick()
         P = self.prefix_len
 
         ids, labels, smask, L = self.build_suffix(targets, max_len)
@@ -164,5 +176,8 @@ class PrefixCache:
         # states are 150 MB per example for the 27B).
         del cache
         out.past_key_values = None
+        t3 = _tick()
+        if timings is not None:
+            timings.update(prefix_fwd_s=t1 - t0, expand_s=t2 - t1, suffix_fwd_s=t3 - t2)
         return SimpleNamespace(loss=out.loss, logits=out.logits, labels=labels, suffix_mask=smask,
                                n_target_tokens=int((labels != -100).sum()), suffix_len=L, prefix_len=P)

@@ -410,3 +410,103 @@ def bench(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed: int = 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(res, indent=2))
     print(f"\nwrote {path}")
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# profiling: where does the cached step spend its time? (CUDA-synchronized phases + torch.profiler kernel table)
+# ----------------------------------------------------------------------------------------------------------------
+@app.function(image=image, gpu=GPU, volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=5400)
+def profile_remote(adapter: str = ADAPTER, batch: int = 16, steps: int = 5, seed: int = 0, min_tgt: int = 8, max_tgt: int = 32,
+                   pad_multiple: int = 8, fresh_lora: bool = False, autocast_on: bool = True, naive_batch: int = 16):
+    import sys
+    import time
+    import torch
+
+    sys.path.insert(0, "/pmx/helpers"); sys.path.insert(0, "/pmx")
+    env = _env_report()
+    from mxf.config import D_MODEL, INJECT_LAYER, STEER_COEFF
+    from mxf.inject import get_layer
+    from mxf.prompts import build_prompt_ids
+    from sft import prefix_cache as pcmod
+    from sft.pretrain import autocast_region
+
+    tok, model = _load(adapter, fresh_lora)
+    device = "cuda:0"
+    prompt_ids, mpos = build_prompt_ids(tok)
+    marker = mpos[0]
+    submodule = get_layer(model, INJECT_LAYER)
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=0.0, weight_decay=0.0)
+    gen = torch.Generator().manual_seed(seed)
+    pc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device, pad_multiple=pad_multiple)
+    ac = lambda: autocast_region(model, autocast_on)  # noqa
+    results = {"env": env, "batch": batch, "pad_multiple": pad_multiple, "phases_cached": [], "phases_naive": [], "phases_prefix_only": []}
+
+    def sync():
+        torch.cuda.synchronize(); return time.time()
+
+    def cached_step(record=None):
+        vecs, targets = _random_batch(gen, batch, D_MODEL, tok.vocab_size, min_tgt, max_tgt, tok.eos_token_id)
+        tm = {} if record is not None else None
+        t0 = sync()
+        out = pc.forward(vecs, targets, autocast=ac, timings=tm)
+        t1 = sync(); out.loss.backward(); t2 = sync()
+        torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step(); opt.zero_grad(); t3 = sync()
+        if record is not None:
+            tm.update(backward_s=t2 - t1, opt_s=t3 - t2, total_s=t3 - t0, suffix_len=out.suffix_len)
+            record.append(tm)
+
+    def naive_step(record=None):
+        vecs, targets = _random_batch(gen, naive_batch, D_MODEL, tok.vocab_size, min_tgt, max_tgt, tok.eos_token_id)
+        t0 = sync()
+        out, labels = _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast_on, device)
+        t1 = sync(); out.loss.backward(); t2 = sync()
+        torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step(); opt.zero_grad(); t3 = sync()
+        if record is not None:
+            record.append({"fwd_s": t1 - t0, "backward_s": t2 - t1, "opt_s": t3 - t2, "total_s": t3 - t0, "L": out.logits.shape[1]})
+
+    def prefix_only_step(record=None):
+        """B=1 x prefix-length forward+backward through the same stack: the per-step floor the cached path pays."""
+        ids = pc._prefix_tensor
+        t0 = sync()
+        with ac():
+            out = model(input_ids=ids, labels=ids, use_cache=False)
+        t1 = sync(); out.loss.backward(); t2 = sync(); opt.zero_grad()
+        if record is not None:
+            record.append({"fwd_s": t1 - t0, "backward_s": t2 - t1, "total_s": t2 - t0})
+
+    for _ in range(3):
+        cached_step(); naive_step(); prefix_only_step()
+    for _ in range(steps):
+        cached_step(results["phases_cached"]); naive_step(results["phases_naive"]); prefix_only_step(results["phases_prefix_only"])
+
+    def _mean(rows, k):
+        return sum(r[k] for r in rows) / len(rows)
+    for name, rows in (("cached", results["phases_cached"]), ("naive", results["phases_naive"]), ("prefix_only(B=1)", results["phases_prefix_only"])):
+        print(f"[phases] {name:>17} " + "  ".join(f"{k}={1000 * _mean(rows, k):7.1f}ms" for k in rows[0] if k.endswith("_s")), flush=True)
+
+    # torch.profiler: one cached step and one naive step (kernel table + CPU/GPU totals)
+    from torch.profiler import ProfilerActivity, profile
+    for name, fn in (("cached", cached_step), ("naive", naive_step)):
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            fn()
+        ka = prof.key_averages()
+        cuda_total = sum(getattr(e, "self_device_time_total", getattr(e, "self_cuda_time_total", 0)) for e in ka) / 1e6
+        cpu_total = sum(e.self_cpu_time_total for e in ka) / 1e6
+        results[f"profile_{name}"] = {"self_cuda_total_s": cuda_total, "self_cpu_total_s": cpu_total}
+        print(f"\n[profile] {name}: self CUDA total {cuda_total:.3f}s, self CPU total {cpu_total:.3f}s", flush=True)
+        sort_key = "self_device_time_total" if hasattr(ka[0], "self_device_time_total") else "self_cuda_time_total"
+        print(ka.table(sort_by=sort_key, row_limit=25), flush=True)
+        print(ka.table(sort_by="self_cpu_time_total", row_limit=12), flush=True)
+    return _plain(results)
+
+
+@app.local_entrypoint()
+def profile(adapter: str = ADAPTER, batch: int = 16, steps: int = 5, seed: int = 0, pad_multiple: int = 8,
+            fresh_lora: bool = False, naive_batch: int = 16, out: str = ""):
+    res = profile_remote.remote(adapter=adapter, batch=batch, steps=steps, seed=seed, pad_multiple=pad_multiple,
+                                fresh_lora=fresh_lora, naive_batch=naive_batch)
+    path = Path(out) if out else REPO / "sft" / "results" / "prefix_cache_profile.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(res, indent=2))
+    print(f"\nwrote {path}")
