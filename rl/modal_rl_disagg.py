@@ -51,7 +51,10 @@ image = (
 # uses, so the newer Triton goes into its own dir and ONLY the HF trainer children see it (rl_disagg.run_launch spawn()).
 TRAINER_TRITON = os.environ.get("DISAGG_TRAINER_TRITON", "")
 if TRAINER_TRITON:
-    image = image.run_commands(f"pip install --no-deps --target /opt/triton_{TRAINER_TRITON} triton=={TRAINER_TRITON}")
+    # NOTE: this module is ALSO imported inside the container, where DISAGG_TRAINER_TRITON is not set -- bake the value
+    # into the image env so _env() (which runs in the container) sees it (same bug class as the old N_GPU re-read).
+    image = (image.run_commands(f"pip install --no-deps --target /opt/triton_{TRAINER_TRITON} triton=={TRAINER_TRITON}")
+                  .env({"DISAGG_TRAINER_TRITON": TRAINER_TRITON}))
 image = (
     image
     .add_local_file(REPO / "rl" / "rl.py", "/pmx/RL/rl_hf.py")
