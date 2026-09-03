@@ -11,6 +11,7 @@ import json
 import math
 import os
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -130,6 +131,14 @@ def main():
                          "[marker]+target per example on top of the expanded cache (sft/prefix_cache.py). Exact incl. "
                          "gradients; needs the transformers fork ceselder/transformers@maemm-prefix-cache, --grad-ckpt 0 "
                          "and the per-example path (no --pack-len). Lets --batch-size go to 64-128 on one B200.")
+    ap.add_argument("--prefix-accum", type=int, default=1,
+                    help="with --prefix-cache: split each --batch-size batch into N micro-batches that SHARE one prefix "
+                         "forward (token-weighted losses => identical to one big-batch mean-loss step). Amortizes the "
+                         "B=1 prefix fwd+bwd (~225 ms/step on B200) and lowers peak memory: e.g. --batch-size 128 "
+                         "--prefix-accum 2 fits one B200 where a single 128 micro-batch OOMs.")
+    ap.add_argument("--compile-mlp", action="store_true",
+                    help="regional torch.compile of the 64 MLP blocks only (cache objects never enter a graph, so it is "
+                         "safe with --prefix-cache, unlike --compile which recompiles endlessly on the cache path).")
     ap.add_argument("--log-steps", type=int, default=20,
                     help="synchronize and report MFU every N steps (1 for trustworthy microbenchmarks)")
     ap.add_argument("--save-examples", default="",
@@ -218,9 +227,20 @@ def main():
         # suffix forward through `ddp` (primes DDP's reducer once per step), prefix forward through the bare model
         prefix_cache = PrefixCache(ddp, prompt_ids, mpos[0], tok.pad_token_id, submodule, STEER_COEFF, device,
                                    prefix_model=model, persistent_injector=persistent_injector)
+        assert a.prefix_accum >= 1 and a.batch_size % a.prefix_accum == 0, "--prefix-accum must divide --batch-size"
         if is_main:
             print(f"[pretrain] prefix-cache ON: shared prefix {prefix_cache.prefix_len} tokens, suffix = "
-                  f"{len(prefix_cache.suffix_prompt)} prompt token(s) + target", flush=True)
+                  f"{len(prefix_cache.suffix_prompt)} prompt token(s) + target, prefix shared by {a.prefix_accum} "
+                  f"micro-batch(es) of {a.batch_size // a.prefix_accum}", flush=True)
+    if a.compile_mlp:
+        assert not a.compile, "--compile-mlp and --compile are exclusive"
+        try:
+            from sft.prefix_cache import compile_mlp_blocks
+        except ImportError:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from prefix_cache import compile_mlp_blocks
+        compile_mlp_blocks(model)
 
     # pre-tokenize once. Packed path: shuffle-once greedy packing into fixed pack-len blocks (zero
     # intra-block padding, one static shape for compile). Legacy path: length-bucketed padded batches.
@@ -270,6 +290,7 @@ def main():
                 sched.step(); step += 1
                 continue
             t0 = time.time()
+            backward_done = False   # --prefix-accum runs its backward(s) inside the branch
             if a.pack_len:
                 input_ids, labels, pos_ids, seg, rows, cols, n_real = pack_batch(
                     batch, a.pack_len, tok.pad_token_id)
@@ -286,8 +307,27 @@ def main():
                 n_prompt = len(prompt_ids)
                 targets = [t[0][n_prompt:] for t in batch]
                 vmat = torch.from_numpy(np.asarray(vecs[[t[3] for t in batch]]))
-                out = prefix_cache.forward(vmat, targets, autocast=lambda: autocast_region(model, a.autocast_bf16))
-                n_real = prefix_cache.prefix_len + int(out.suffix_mask.sum())
+                ac = lambda: autocast_region(model, a.autocast_bf16)  # noqa: E731
+                if a.prefix_accum == 1:
+                    out = prefix_cache.forward(vmat, targets, autocast=ac)
+                    n_real = prefix_cache.prefix_len + int(out.suffix_mask.sum())
+                else:
+                    # one prefix forward, N micro-batches on copy-expanded caches; loss_k * (n_k / N_tokens) summed
+                    # == the single mean-over-target-tokens loss, so the update is identical to one big micro-batch
+                    mb = len(batch) // a.prefix_accum
+                    n_tot = sum(len(t) for t in targets)
+                    cache0 = prefix_cache.run_prefix(ac)
+                    loss_sum = 0.0; n_real = prefix_cache.prefix_len
+                    for k in range(a.prefix_accum):
+                        sl = slice(k * mb, (k + 1) * mb)
+                        o = prefix_cache.forward(vmat[sl], targets[sl], autocast=ac, prefix_cache=cache0)
+                        (o.loss * (o.n_target_tokens / n_tot)).backward(retain_graph=k < a.prefix_accum - 1)
+                        loss_sum += o.loss.item() * o.n_target_tokens / n_tot
+                        n_real += int(o.suffix_mask.sum())
+                        del o
+                    del cache0
+                    out = SimpleNamespace(loss=torch.tensor(loss_sum))
+                    backward_done = True
             else:
                 L = max(len(t[0]) for t in batch)
                 L = min(((L + 63) // 64) * 64, a.max_seq)  # round to mult-of-64 → ≤3 static shapes for compile
@@ -314,7 +354,8 @@ def main():
                     with hooked(submodule, hook), autocast_region(model, a.autocast_bf16):
                         out = ddp(input_ids=input_ids.to(device), attention_mask=attn.to(device),
                                   labels=labels.to(device))
-            out.loss.backward()
+            if not backward_done:
+                out.loss.backward()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step(); sched.step(); opt.zero_grad()
             if is_main and step % a.log_steps == 0:
