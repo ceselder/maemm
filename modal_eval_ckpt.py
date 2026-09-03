@@ -59,7 +59,7 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
                        modal.Secret.from_name("maemm-anthropic"), modal.Secret.from_name("maemm-openrouter")],
               timeout=24 * 3600)
 def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once: bool = False, only_step: int = -1,
-           final_step: int = 1000, vllm_gpu_mem: float = 0.45, extra_args: str = ""):
+           final_step: int = 1000, vllm_gpu_mem: float = 0.5, extra_args: str = ""):
     import subprocess
     env = os.environ.copy()
     env["PYTHONPATH"] = "/pmx/helpers:/pmx/eval:/pmx/RL"

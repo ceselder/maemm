@@ -363,7 +363,9 @@ def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
         kw = dict(model=MODEL, tensor_parallel_size=1, gpu_memory_utilization=a.vllm_gpu_mem, max_model_len=max_len,
                   attention_backend="TRITON_ATTN", language_model_only=True, enable_prefix_caching=False,
                   enable_lora=True, max_loras=2, max_lora_rank=64, max_num_seqs=int(max_seqs),   # 2 slots: live policy + eval ckpt
-                  max_num_batched_tokens=max(8192, int(max_seqs) * max_len),   # never chunk a prompt: the marker must be prefilled in a hooked (eager) pass
+                  # never chunk a prompt (the marker must be prefilled in a hooked, eager pass): budget = every seq's full prompt+gen
+                  # unless overridden (the eval daemon uses a smaller budget so the profiling run leaves KV memory for concurrency)
+                  max_num_batched_tokens=int(getattr(a, "max_num_batched_tokens", 0) or 0) or max(8192, int(max_seqs) * max_len),
                   seed=a.seed * 1000 + 500 + rank, dtype="bfloat16")
         if use_graphs:
             kw["enforce_eager"] = False

@@ -59,8 +59,11 @@ def parse_args(argv=None):
     ap.add_argument("--eval-min-new", type=int, default=16)
     ap.add_argument("--max-new-tokens", type=int, default=96, help="engine max_model_len budget (rl.py's rollout cap)")
     # engine
-    ap.add_argument("--vllm-gpu-mem", type=float, default=0.45)
+    ap.add_argument("--vllm-gpu-mem", type=float, default=0.5, help="engine share of the card next to the ~60 GB HF side (0.5 -> 89 GB on B200, 70 GB on H200)")
     ap.add_argument("--max-num-seqs", type=int, default=512)
+    ap.add_argument("--max-num-batched-tokens", type=int, default=24576,
+                    help="prefill token budget per engine step; 512 x 207 = 106k made the profiling run leave only 11 GB of KV (238 concurrent seqs). "
+                         "24k still prefills ~115 whole prompts per step; a prompt is only chunked when the budget is exhausted mid-prompt (rare at 512 seqs)")
     ap.add_argument("--no-cuda-graphs", action="store_true")
     ap.add_argument("--stock-lens-hook", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
