@@ -76,6 +76,7 @@ import glob
 import json
 import math
 import os
+import re
 import pickle
 import shutil
 import subprocess
@@ -1236,9 +1237,12 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
     L = len(prompt_ids) + a.max_new_tokens
     p_len = len(prompt_ids)
     total = torch.cuda.get_device_properties(0).total_memory
+    free0, _ = torch.cuda.mem_get_info()
+    _log(tag, f"micro-batch probe @ L={L} (prompt {p_len} + {a.max_new_tokens} new): resident {torch.cuda.memory_allocated() / 2**30:.1f} GB, "
+              f"free {free0 / 2**30:.1f} / {total / 2**30:.0f} GB (device {torch.cuda.current_device()}, CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')})")
     res, chosen = {}, None
     for mb in cands:
-        ok, peak = False, None
+        ok, peak, err = False, None, None
         try:
             torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
             ids = torch.randint(1000, 100000, (mb, L), device=device)
@@ -1258,13 +1262,15 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
             peak = torch.cuda.max_memory_allocated()
             ok = peak < 0.90 * total
             del new_lp, ent, loss, ids, attn, dirs
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as e:
             ok = False
+            err = re.sub(r"\s+", " ", str(e))[:420]
         finally:
             opt.zero_grad(set_to_none=True)
             gc.collect(); torch.cuda.empty_cache()
         res[mb] = {"ok": ok, "peak_gb": (peak / 2**30) if peak else None}
-        _log(tag, f"mb {mb}: {'OK' if ok else 'OOM/too tight'}" + (f" peak {peak / 2**30:.1f} GB / {total / 2**30:.0f}" if peak else ""))
+        _log(tag, f"mb {mb}: {'OK' if ok else 'OOM/too tight'}" + (f" peak {peak / 2**30:.1f} GB / {total / 2**30:.0f}" if peak else "")
+                  + (f" | {err}" if err else ""))
         if ok:
             chosen = mb
             break
