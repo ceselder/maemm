@@ -65,7 +65,6 @@ TRAIN_ARGS = [
     "--reward-scale", "1",
     "--len-penalty-start", "32",
     "--len-penalty-per-tok", "0.01",
-    "--gate-penalty", "20",
     "--no-gates",
     "--kl-coef", "0.01",
     "--adv-mode", "group",

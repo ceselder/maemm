@@ -107,7 +107,6 @@ TRAIN_ARGS = [
     "--reward-scale", "1",                       # v15: raw cosine (EasyNLA uses raw -MSE; per-group std-norm makes the scale irrelevant except for the shaping terms below)
     "--len-penalty-start", "32",                # v15: EasyNLA hinge = max_new_tokens - 64 (their 256-64=192) -> 96-64 = 32
     "--len-penalty-per-tok", "0.01",            # v15: EasyNLA 0.01/tok past the hinge, in raw reward units
-    "--gate-penalty", "20",                      # v10: x0.8 (same log-reward proportional rescale; was 25)
     "--no-gates",                                # v11: NO fluency/distinct gate (user call; the collapse analysis showed the gate is not the stabilizer — KL is). len-penalty stays.
     "--kl-coef", "0.01",                         # v15: EasyNLA k3 kl_beta default
     "--adv-mode", "group",                      # v15: EasyNLA = standard GRPO (r - group_mean) / (group_std + 1e-6), no batch norm
