@@ -1,0 +1,193 @@
+{
+  "env": {
+    "gpu": "NVIDIA B200",
+    "torch": "2.10.0+cu128",
+    "transformers": "5.15.0",
+    "transformers_fork": true,
+    "peft": "0.20.0",
+    "fla": "0.5.2",
+    "triton": "3.6.0",
+    "tf_spec": "transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
+  },
+  "prompt_len": 103,
+  "marker": 102,
+  "batch": 8,
+  "seed": 1,
+  "target_lens": [
+    12,
+    19,
+    33,
+    21,
+    32,
+    33,
+    19,
+    25
+  ],
+  "trainable_params": 466911232,
+  "runs": {
+    "autocast_bf16=off": {
+      "naive_time_s": 92.00996780395508,
+      "cached_time_s": 45.60575079917908,
+      "loss_naive": 14.296072006225586,
+      "loss_cached": 14.298402786254883,
+      "loss_abs_diff": 0.002330780029296875,
+      "logits": {
+        "max_abs": 0.40625,
+        "mean_abs": 0.021046580746769905,
+        "max_rel_to_scale": 0.014380531385540962,
+        "logprob_max_abs": 0.4058818817138672,
+        "logprob_mean_abs": 0.024438170716166496,
+        "argmax_agree": 0.9900990128517151,
+        "n_positions": 202
+      },
+      "grads": {
+        "cosine": 0.9990381598472595,
+        "rel_l2": 0.04392256960272789,
+        "max_abs": 0.00697195902466774,
+        "norm_ref": 8.830775260925293,
+        "norm_other": 8.844347953796387
+      },
+      "n_target_tokens": 194,
+      "suffix_len_padded": 48,
+      "accum_loss_abs_diff": 0.0015116180341259167,
+      "accum_logits": {
+        "max_abs": 0.5625,
+        "mean_abs": 0.023193659260869026,
+        "max_rel_to_scale": 0.0199115052819252,
+        "logprob_max_abs": 0.5468473434448242,
+        "logprob_mean_abs": 0.026160405948758125,
+        "argmax_agree": 0.9851484894752502,
+        "n_positions": 202
+      },
+      "accum_grads": {
+        "cosine": 0.9982850551605225,
+        "rel_l2": 0.05856795236468315,
+        "max_abs": 0.009366264566779137,
+        "norm_ref": 8.830775260925293,
+        "norm_other": 8.831377983093262
+      },
+      "pfxcompile_first_call_s": 39.13891243934631,
+      "pfxcompile_loss_abs_diff": 0.0014829635620117188,
+      "pfxcompile_logits": {
+        "max_abs": 0.510498046875,
+        "mean_abs": 0.023700935766100883,
+        "max_rel_to_scale": 0.018070727586746216,
+        "logprob_max_abs": 0.5469198226928711,
+        "logprob_mean_abs": 0.025898374617099762,
+        "argmax_agree": 0.9950494766235352,
+        "n_positions": 202
+      },
+      "pfxcompile_grads": {
+        "cosine": 0.9987284541130066,
+        "rel_l2": 0.050490379333496094,
+        "max_abs": 0.007311126217246056,
+        "norm_ref": 8.830775260925293,
+        "norm_other": 8.794865608215332
+      },
+      "pfxcompile_phases_s": {
+        "prefix_fwd_s": 3.400942087173462,
+        "expand_s": 0.018579721450805664,
+        "suffix_fwd_s": 0.3755483627319336
+      },
+      "control_loss_abs_diff": 0.005164490532628463,
+      "control_logits": {
+        "max_abs": 0.40625,
+        "mean_abs": 0.020022781565785408,
+        "max_rel_to_scale": 0.014380531385540962,
+        "logprob_max_abs": 0.46875,
+        "logprob_mean_abs": 0.025059932842850685,
+        "argmax_agree": 0.9950494766235352,
+        "n_positions": 202
+      },
+      "control_grads": {
+        "cosine": 0.9988223314285278,
+        "rel_l2": 0.04852600395679474,
+        "max_abs": 0.0076430924236774445,
+        "norm_ref": 8.830775260925293,
+        "norm_other": 8.812604904174805
+      }
+    },
+    "autocast_bf16=on": {
+      "naive_time_s": 0.6138081550598145,
+      "cached_time_s": 0.8824691772460938,
+      "loss_naive": 14.292414665222168,
+      "loss_cached": 14.298813819885254,
+      "loss_abs_diff": 0.0063991546630859375,
+      "logits": {
+        "max_abs": 0.625,
+        "mean_abs": 0.0207505039870739,
+        "max_rel_to_scale": 0.022123893722891808,
+        "logprob_max_abs": 0.588287353515625,
+        "logprob_mean_abs": 0.025570297613739967,
+        "argmax_agree": 0.9900990128517151,
+        "n_positions": 202
+      },
+      "grads": {
+        "cosine": 0.9978358745574951,
+        "rel_l2": 0.06676578521728516,
+        "max_abs": 0.0096588134765625,
+        "norm_ref": 8.74771499633789,
+        "norm_other": 8.830135345458984
+      },
+      "n_target_tokens": 194,
+      "suffix_len_padded": 48,
+      "accum_loss_abs_diff": 0.006399459445599831,
+      "accum_logits": {
+        "max_abs": 0.625,
+        "mean_abs": 0.0207505039870739,
+        "max_rel_to_scale": 0.022123893722891808,
+        "logprob_max_abs": 0.588287353515625,
+        "logprob_mean_abs": 0.025570297613739967,
+        "argmax_agree": 0.9900990128517151,
+        "n_positions": 202
+      },
+      "accum_grads": {
+        "cosine": 0.9978570938110352,
+        "rel_l2": 0.06658153235912323,
+        "max_abs": 0.0097503662109375,
+        "norm_ref": 8.74771499633789,
+        "norm_other": 8.836771965026855
+      },
+      "pfxcompile_first_call_s": 34.61427092552185,
+      "pfxcompile_loss_abs_diff": 0.0046138763427734375,
+      "pfxcompile_logits": {
+        "max_abs": 0.359375,
+        "mean_abs": 0.021912947297096252,
+        "max_rel_to_scale": 0.012721238657832146,
+        "logprob_max_abs": 0.375,
+        "logprob_mean_abs": 0.024058625102043152,
+        "argmax_agree": 0.9900990128517151,
+        "n_positions": 202
+      },
+      "pfxcompile_grads": {
+        "cosine": 0.9988329410552979,
+        "rel_l2": 0.04880116879940033,
+        "max_abs": 0.0050811767578125,
+        "norm_ref": 8.74771499633789,
+        "norm_other": 8.798620223999023
+      },
+      "pfxcompile_phases_s": {
+        "prefix_fwd_s": 4.580162286758423,
+        "expand_s": 0.010755300521850586,
+        "suffix_fwd_s": 0.4235539436340332
+      },
+      "control_loss_abs_diff": 0.00037535932875165656,
+      "control_logits": {
+        "max_abs": 0.25,
+        "mean_abs": 0.0026429076679050922,
+        "max_rel_to_scale": 0.008849557489156723,
+        "logprob_max_abs": 0.3749980926513672,
+        "logprob_mean_abs": 0.0035531725734472275,
+        "argmax_agree": 1.0,
+        "n_positions": 202
+      },
+      "control_grads": {
+        "cosine": 0.9999653697013855,
+        "rel_l2": 0.008387568406760693,
+        "max_abs": 0.0009765625,
+        "norm_ref": 8.74771499633789,
+        "norm_other": 8.755902290344238
+      }
+    }
+  }
+}
