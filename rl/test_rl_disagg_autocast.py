@@ -46,7 +46,6 @@ class LoraLinear(nn.Module):
         result = self.base(x)
         xx = x.to(self.lora_A.weight.dtype) if self.cast_input_dtype_enabled else x
         a_out = self.lora_A(xx)
-        a_out.register_hook(lambda g: None)                     # keep graph shape identical between paths
         self.saved_dtype = a_out.dtype                          # dtype the LoRA matmul actually produced (== its saved activation)
         return (result + self.lora_B(a_out) * self.scaling).to(result.dtype)
 
@@ -104,7 +103,6 @@ def test_autocast_matches_fp32_within_bf16_tolerance():
             assert p.dtype == torch.float32 and p.grad is not None and p.grad.dtype == torch.float32, n
             cos = F.cosine_similarity(p.grad.flatten(), g32[n].flatten(), dim=0).item()
             assert cos > 0.98, f"grad direction drifted under autocast for {n}: cos {cos:.4f}"
-    assert not torch.autocast(next(m.parameters()).device.type).__enter__ is None   # sanity: autocast usable on this device
 
 
 def test_fp32_head_composes_with_autocast():
