@@ -1,0 +1,1286 @@
+"""Disaggregated GRPO for the MAEMM universal inverter: X vLLM ROLLOUT GPUs + Y HF TRAINER GPUs in ONE
+container (N = X + Y processes, one GPU each), coupled through the container-local filesystem.
+
+Why. train/rl.py hosts BOTH the HF actor (61 GB resident, ~98 GB peak) AND a vLLM engine on EVERY GPU:
+micro-batch is stuck at 3, vLLM gets a third of the GPU, old_logp is recomputed in HF, and the vllm_lens
+hook is O(layers x reqs x keys) per decode step -> 145-250 s per 1024-rollout step on 4 GPUs. Here every
+GPU does ONE job, the trainer never runs vLLM (-> no grad checkpointing, micro-batch 16-32), the sampler's
+own per-token logprobs ARE old_logp (no HF recompute; the 1-2 step policy lag is importance-corrected by
+the PPO clip + TIS cap from rl.py), and rollout GPUs run vLLM at 0.85 memory / 1024 seqs with a fast
+steering hook (train/fast_lens_ext.py) and optional CUDA graphs for decode.
+
+Roles (this file, selected by --role; the launcher spawns the others):
+  launch   parent: N children, CUDA_VISIBLE_DEVICES=<one gpu> each (GPUs [0,Y) trainers, [Y,N) rollouts),
+           streams their stdout with [T<k>]/[R<r>] prefixes, tears everything down when the trainer
+           finishes or anything dies.
+  trainer  DDP group of Y ranks (gloo or nccl) over the HF actor + LoRA + AdamW (+ frozen 'ref' adapter):
+           consume rollout blocks -> reward with rl.py's score() on the clean base -> compute_advantages
+           -> clipped policy gradient with vLLM logprobs as old_lp -> capped-k3 KL to init -> exact
+           token/seq-weighted grad all-reduce -> AdamW -> rank 0 publishes the adapter (+ ||h_marker||)
+           for the rollout ranks every --publish-every steps, checkpoints every --save-every, wandb.
+  rollout  one vLLM engine (TP=1, LoRA, full GPU); loop: pick up the newest published adapter, draw a
+           block of directions from the bank, generate G samples each with per-request steering at the
+           marker, write a rollout block file; block until the queue drains below --max-queue-blocks.
+
+Filesystem protocol (all under --work-dir, default /tmp/disagg):
+  lora/step_<k>/{adapter_model.safetensors, adapter_config.json, meta.json}   vLLM key layout
+      (rl.py _save_adapter_for_vllm) + meta {"step", "hnorm": ||h_marker|| with the adapter ON}
+  lora/latest            the integer k, written atomically (tmp + os.replace); rollouts reload on change
+  queue/blk_<adapter_step>_<t_ns>_<rank>.pt   torch.save dict: dir_idx, dirs [B_r,d], gen_ids, lps
+      (vLLM per-token logprobs; None where the engine dropped the stop token -> ratio 1 there),
+      adapter_step, gen_s, n_tok, rank; written atomically. Trainer consumes FIFO (oldest adapter first)
+      or --drop-stale (newest, older blocks discarded); consumed files are deleted.
+  STOP                   trainer done -> rollout ranks exit.
+
+Sampling rng: rollout rank r draws from numpy default_rng(seed*7919 + 1000 + r) -- per-rank streams,
+NOT rl.py's every-rank-draws-the-same-B-then-slices scheme (there is no shared step any more). The first
+--n-eval-dirs unique bank blocks are reserved exactly as in rl.py.
+
+Metrics keep rl.py's names (reward/mean, policy/entropy, policy/kl_to_init, ratio/mean, ratio/clipfrac,
+grad_norm, rollout/len_mean, time/step_s, var/*, rollouts/samples ...) plus
+policy/offpolicy_lag_steps, policy/sampler_abs_dlogp, time/wait_rollouts_s, time/grad_sync_s,
+rollout/queue_depth, rollout/gen_s, rollout/tok_per_s_per_replica, rollout/blocks_dropped.
+
+Launch inside the container (see modal_rl_disagg.py):
+    python RL/rl_disagg.py --role launch --n-rollout 1 --n-trainer 3 --data-dir <pool> --init-adapter <sft> ...
+"""
+import argparse
+import gc
+import glob
+import json
+import math
+import os
+import pickle
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+
+# ----------------------------------------------------------------------------------------------
+# args (superset of rl.py's flags so the v15 TRAIN_ARGS list can be reused verbatim)
+# ----------------------------------------------------------------------------------------------
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--role", choices=("launch", "bench", "trainer", "rollout", "bench-rollout", "bench-trainer"), default="launch",
+                    help="launch/bench = parent (spawns children); the rest are the per-GPU child roles")
+    ap.add_argument("--n-rollout", type=int, default=1, help="X: vLLM rollout GPUs")
+    ap.add_argument("--n-trainer", type=int, default=3, help="Y: HF trainer GPUs (DDP)")
+    ap.add_argument("--work-dir", default="/tmp/disagg")
+    ap.add_argument("--backend", default="nccl", choices=("gloo", "nccl"),
+                    help="trainer DDP backend (nccl: GPU flat-buffer grad all-reduce; gloo = rl.py's CPU path, ~4.5 s for 2 GB)")
+    ap.add_argument("--master-port", type=int, default=29611)
+    # data / init / resume (rl.py)
+    ap.add_argument("--data-dir", default="data/pretrain")
+    ap.add_argument("--bank-file", default="vecs.f32")
+    ap.add_argument("--direction-source", choices=("cluster", "random"), default="cluster")
+    ap.add_argument("--n-eval-dirs", type=int, default=64)
+    ap.add_argument("--init-adapter", default=None)
+    ap.add_argument("--ref-adapter", default=None)
+    ap.add_argument("--step-offset", type=int, default=0)
+    ap.add_argument("--wandb-id", default=None)
+    ap.add_argument("--save-dir", default="checkpoints/rl_disagg")
+    ap.add_argument("--save-every", type=int, default=500)
+    ap.add_argument("--run-name", default="mxf-rl-disagg")
+    ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--seed", type=int, default=0)
+    # batch / sampling (rl.py)
+    ap.add_argument("--groups-per-step", type=int, default=128, help="B: directions consumed per trainer step (global)")
+    ap.add_argument("--group-size", type=int, default=8)
+    ap.add_argument("--total-steps", type=int, default=400)
+    ap.add_argument("--max-new-tokens", type=int, default=96)
+    ap.add_argument("--min-new-tokens", type=int, default=8)
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--rollout-chunk", type=int, default=64, help="IGNORED (rl.py hf engine)")
+    ap.add_argument("--logp-chunk", type=int, default=16, help="IGNORED (no HF old_logp recompute here)")
+    ap.add_argument("--rollout-engine", default="vllm", help="IGNORED (always vllm)")
+    ap.add_argument("--vllm-gpu-mem", type=float, default=0.85, help="rollout ranks own the GPU: 0.85-0.9")
+    ap.add_argument("--vllm-logp-tol", type=float, default=0.10, help="IGNORED (see policy/sampler_abs_dlogp at step 0)")
+    ap.add_argument("--micro-batch", type=int, default=0, help="0 = auto: largest of --mb-candidates that fits at max length")
+    ap.add_argument("--mb-candidates", default="64,48,40,32,24,16,12,8,6,4")
+    ap.add_argument("--ref-micro-batch", type=int, default=32)
+    ap.add_argument("--score-batch", type=int, default=128)
+    ap.add_argument("--vocab-chunk", type=int, default=32, help="positions per fp32 log_softmax chunk over the 248k vocab")
+    # reward (rl.py)
+    ap.add_argument("--reward-metric", choices=("proj", "cosine"), default="proj")
+    ap.add_argument("--reward-scale", type=float, default=1.0)
+    ap.add_argument("--log-reward", action="store_true")
+    ap.add_argument("--reward-window-last", type=int, default=0)
+    ap.add_argument("--reward-topk", type=int, default=1)
+    ap.add_argument("--reward-pos-penalty", type=float, default=0.0)
+    ap.add_argument("--fluency-floor", type=float, default=-4.5)
+    ap.add_argument("--distinct-floor", type=float, default=0.5)
+    ap.add_argument("--gate-penalty", type=float, default=25.0)
+    ap.add_argument("--len-penalty-start", type=int, default=64)
+    ap.add_argument("--len-penalty-per-tok", type=float, default=0.5)
+    ap.add_argument("--no-gates", action="store_true")
+    ap.add_argument("--no-len-penalty", action="store_true")
+    # optimization (rl.py)
+    ap.add_argument("--lr", type=float, default=1e-6)
+    ap.add_argument("--adam-eps", type=float, default=1e-8)
+    ap.add_argument("--max-grad-norm", type=float, default=1.0)
+    ap.add_argument("--clip-eps", type=float, default=0.2)
+    ap.add_argument("--tis-cap", type=float, default=2.0)
+    ap.add_argument("--adv-mode", choices=["none", "group", "batch"], default=None)
+    ap.add_argument("--loss-agg", choices=["token", "seq"], default="token")
+    ap.add_argument("--trunc-reward", type=float, default=None)
+    ap.add_argument("--adam-betas", type=float, nargs=2, default=(0.9, 0.999), metavar=("B1", "B2"))
+    ap.add_argument("--grad-ckpt", action="store_true", help="IGNORED (never needed off-vLLM)")
+    ap.add_argument("--std-norm", action="store_true")
+    ap.add_argument("--batch-norm", action="store_true")
+    ap.add_argument("--entropy-coef", type=float, default=0.0)
+    ap.add_argument("--kl-coef", type=float, default=0.0)
+    ap.add_argument("--kl-cap", type=float, default=10.0)
+    # inline eval flags accepted for launcher compatibility; see inline_eval_stub()
+    ap.add_argument("--inline-eval-every", type=int, default=0)
+    ap.add_argument("--eval-cache", default="/data/eval_universal_ho/eval_sets_heldout.pt")
+    ap.add_argument("--eval-sae", default="/data/sae/ae.pt")
+    ap.add_argument("--eval-bo", type=int, default=4)
+    ap.add_argument("--eval-temp", type=float, default=1.0)
+    ap.add_argument("--eval-max-new", type=int, default=64)
+    ap.add_argument("--eval-min-new", type=int, default=16)
+    ap.add_argument("--no-extra-evals", action="store_true")
+    ap.add_argument("--eval-n-per-family", type=int, default=0)
+    ap.add_argument("--transcript-every", type=int, default=5)
+    ap.add_argument("--transcript-groups", type=int, default=4)
+    ap.add_argument("--transcript-samples", type=int, default=4)
+    ap.add_argument("--div-coef", type=float, default=0.0)
+    ap.add_argument("--firsttok-coef", type=float, default=0.0)
+    # disaggregation
+    ap.add_argument("--rollout-block-groups", type=int, default=0,
+                    help="directions per rollout block (per generate call); 0 = groups_per_step / n_rollout")
+    ap.add_argument("--max-num-seqs", type=int, default=0, help="vLLM max_num_seqs; 0 = block_groups*group_size")
+    ap.add_argument("--cuda-graphs", action="store_true",
+                    help="vLLM FULL_DECODE_ONLY cudagraphs (compilation mode NONE) instead of the plugin-forced eager")
+    ap.add_argument("--stock-lens-hook", action="store_true", help="use vllm_lens' stock O(reqs x keys x layers) hook (for A/B timing)")
+    ap.add_argument("--max-queue-blocks", type=int, default=0,
+                    help="rollout backpressure: max unconsumed blocks; 0 = one step's worth (lag stays 1 with full overlap)")
+    ap.add_argument("--drop-stale", action="store_true", help="consume the NEWEST blocks and discard older ones (min lag, wastes rollouts)")
+    ap.add_argument("--publish-every", type=int, default=1)
+    ap.add_argument("--keep-loras", type=int, default=3)
+    ap.add_argument("--publish-fp32", action="store_true",
+                    help="publish the adapter in fp32 (rl.py behaviour). Default bf16: vLLM casts LoRA weights to the model dtype (bf16) on load anyway, so the served policy is identical and the write is half the size")
+    ap.add_argument("--no-fla", action="store_true", help="trainer: block the fla (flash-linear-attention) GDN kernels -> HF torch fallback")
+    ap.add_argument("--bench-sizes", default="128,256,512,1024", help="bench-rollout: sequences per generate call")
+    ap.add_argument("--bench-configs", default="eager:512,graphs:512,eager:1024,graphs:1024",
+                    help="bench-rollout: <eager|graphs|stock>:<max_num_seqs> list, sharded over rollout ranks "
+                         "(stock = eager with vllm_lens' stock hook, the rl.py baseline)")
+    ap.add_argument("--bench-rollouts-per-rank", default="128,256,512,1024", help="bench-trainer: update() sizes to time")
+    a = ap.parse_args(argv)
+    assert a.div_coef == 0 and a.firsttok_coef == 0
+    assert not (a.std_norm and a.batch_norm)
+    assert a.temperature == 1.0, "T must be 1.0: the sampler's logprobs are the behaviour policy"
+    if a.no_gates:
+        a.fluency_floor = a.distinct_floor = None
+    if a.no_len_penalty:
+        a.len_penalty_start = None
+    if a.rollout_block_groups <= 0:
+        a.rollout_block_groups = max(1, a.groups_per_step // max(a.n_rollout, 1))
+    assert a.groups_per_step % a.rollout_block_groups == 0, "groups_per_step must be a multiple of rollout_block_groups"
+    a.blocks_per_step = a.groups_per_step // a.rollout_block_groups
+    if a.max_queue_blocks <= 0:
+        a.max_queue_blocks = a.blocks_per_step
+    if a.max_num_seqs <= 0:
+        a.max_num_seqs = a.rollout_block_groups * a.group_size
+    return a
+
+
+# ----------------------------------------------------------------------------------------------
+# small shared helpers (filesystem protocol)
+# ----------------------------------------------------------------------------------------------
+def _atomic_write_text(path, text):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _read_latest(work):
+    p = f"{work}/lora/latest"
+    try:
+        with open(p) as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _queue_files(work):
+    return sorted(glob.glob(f"{work}/queue/blk_*.pt"))
+
+
+def _stop_requested(work):
+    return os.path.exists(f"{work}/STOP")
+
+
+def _log(tag, msg):
+    print(f"[{tag}] {msg}", flush=True)
+
+
+def _bank_open(a):
+    """Direction bank memmap + rl.py's eval-row reservation. Returns (bank, n_vecs, eval_rows)."""
+    import numpy as np
+    from mxf.config import D_MODEL
+    stats_p = f"{a.data_dir}/build_stats.json"
+    n_vecs = (json.load(open(stats_p))["n_examples"] if os.path.exists(stats_p)
+              else os.path.getsize(f"{a.data_dir}/{a.bank_file}") // (4 * D_MODEL))
+    bank = np.memmap(f"{a.data_dir}/{a.bank_file}", dtype=np.float32, mode="r", shape=(n_vecs, D_MODEL))
+    eval_rows = 0
+    if a.n_eval_dirs > 0:
+        blocks, i = 0, 0
+        while i < n_vecs and blocks < a.n_eval_dirs:
+            row = np.asarray(bank[i]); i += 1; blocks += 1
+            while i < n_vecs and np.array_equal(np.asarray(bank[i]), row):
+                i += 1
+        eval_rows = i
+    return bank, n_vecs, eval_rows
+
+
+class _GenCfgStub:
+    """rl.py's _eos_ids(tok, actor) only reads actor.generation_config -- rollout ranks have no actor."""
+    def __init__(self, gen_cfg):
+        self.generation_config = gen_cfg
+
+
+# ==============================================================================================
+# ROLLOUT rank
+# ==============================================================================================
+def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
+    """vLLM engine on this rank's (only visible) GPU. vllm_lens' plugin is loaded first so its
+    LLM.generate/steering patches are live; its EngineArgs patch (which FORCES enforce_eager and
+    installs the slow stock hook) is replaced by ours: fast_lens_ext + our own eager/graph choice."""
+    hidden = {k: os.environ.pop(k) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "GROUP_RANK",
+                                             "ROLE_RANK", "MASTER_ADDR", "MASTER_PORT") if k in os.environ}
+    try:
+        from vllm.plugins import load_general_plugins
+        load_general_plugins()
+        import vllm_lens._activations_plugin as P
+        from vllm import LLM
+        from vllm.engine.arg_utils import EngineArgs
+        orig = P._original_create_engine_config
+        assert orig is not None, "vllm_lens plugin did not register (dist-info missing?)"
+        ext_cls = None if a.stock_lens_hook else "fast_lens_ext.FastSteerExtension"
+
+        def _cfg(self, *args, **kw):
+            if ext_cls and not self.worker_extension_cls:
+                self.worker_extension_cls = ext_cls
+            if not self.worker_extension_cls:
+                self.worker_extension_cls = "vllm_lens._worker_ext.HiddenStatesExtension"
+            return orig(self, *args, **kw)
+        EngineArgs.create_engine_config = _cfg
+        from mxf.config import MODEL
+        max_len = p_len + a.max_new_tokens + 8
+        kw = dict(model=MODEL, tensor_parallel_size=1, gpu_memory_utilization=a.vllm_gpu_mem, max_model_len=max_len,
+                  attention_backend="TRITON_ATTN", language_model_only=True, enable_prefix_caching=False,
+                  enable_lora=True, max_loras=1, max_lora_rank=64, max_num_seqs=int(max_seqs),
+                  max_num_batched_tokens=max(8192, int(max_seqs) * max_len),   # never chunk a prompt: the marker must be prefilled in a hooked (eager) pass
+                  seed=a.seed * 1000 + 500 + rank, dtype="bfloat16")
+        if use_graphs:
+            kw["enforce_eager"] = False
+            kw["compilation_config"] = {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY",
+                                        "max_cudagraph_capture_size": int(max_seqs)}
+        else:
+            kw["enforce_eager"] = True
+        t0 = time.time()
+        llm = LLM(**kw)
+        llm.collective_rpc("install_hooks")
+        _log(tag, f"engine up in {time.time() - t0:.0f}s | graphs={use_graphs} max_num_seqs={max_seqs} "
+                  f"mem={a.vllm_gpu_mem} ext={'stock' if a.stock_lens_hook else 'fast'}")
+        return llm
+    finally:
+        os.environ.update(hidden)
+
+
+def _verify_injection(llm, prompt_ids, marker, hnorm, tag, seed=0):
+    """verify_vllm_injection without an HF actor: the injected vector is ABSOLUTE (norm_match=False), so
+    the captured marker-row delta must equal hnorm*STEER_COEFF*unit(v): cos>0.99, ratio in [0.95,1.05];
+    pre-marker rows untouched. Runs on the BASE weights (no LoRA request), greedy, 1 token."""
+    import torch
+    import torch.nn.functional as F
+    import rl_hf as R
+    from vllm import SamplingParams
+    from mxf.config import D_MODEL, INJECT_LAYER, STEER_COEFF
+    g = torch.Generator().manual_seed(seed)
+    v = F.normalize(torch.randn(D_MODEL, generator=g), dim=0)
+
+    def run(steer):
+        extra = {"output_residual_stream": [INJECT_LAYER]}
+        if steer:
+            extra["apply_steering_vectors"] = [R._steer_vec(v, hnorm, marker)]
+        out = llm.generate([{"prompt_token_ids": list(prompt_ids)}],
+                           [SamplingParams(temperature=0.0, max_tokens=1, extra_args=extra)], use_tqdm=False)[0]
+        act = getattr(out, "activations", None)
+        assert act is not None and "residual_stream" in act, "capture returned nothing -- hooks not live?"
+        return act["residual_stream"][0].float()
+    h_clean, h_steer = run(False), run(True)
+    delta = h_steer[marker] - h_clean[marker]
+    cos = F.cosine_similarity(delta, v, dim=0).item()
+    ratio = (delta.norm() / (STEER_COEFF * hnorm)).item()
+    other = (h_steer[:marker] - h_clean[:marker]).norm(dim=-1).max().item() if marker > 0 else 0.0
+    chk = {"cos": cos, "norm_ratio": ratio, "hnorm_published": hnorm, "hnorm_vllm_base": h_clean[marker].norm().item(),
+           "max_other_row_delta": other, "ok": cos > 0.99 and 0.95 < ratio < 1.05}
+    _log(tag, f"injection check: cos={cos:.4f} ratio={ratio:.3f} ||h||_vllm_base={chk['hnorm_vllm_base']:.1f} "
+              f"(published adapter-on {hnorm:.1f}) pre-marker max|d|={other:.2e} -> {'OK' if chk['ok'] else 'FAIL'}")
+    return chk
+
+
+def _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_ids, key_prefix):
+    """ONE generate() call: one request per direction, n=G, steering keyed by _steering_id (one RPC for
+    the whole block). Returns gen_ids (group-major, stop token kept via _trim_at_stop), per-token vLLM
+    logprobs (None where the engine dropped the stop token and we re-appended it), appended count, gen_s."""
+    import rl_hf as R
+    from vllm import SamplingParams
+    G = a.group_size
+    keys = [f"{key_prefix}_{i}" for i in range(len(dirs))]
+    payload = {k: [R._steer_vec(v, hnorm, marker)] for k, v in zip(keys, dirs)}
+    if a.stock_lens_hook:   # stock plugin protocol: per-request apply_steering_vectors (it does the RPCs itself)
+        params = [SamplingParams(n=G, temperature=a.temperature, top_p=1.0, top_k=0, min_p=0.0, repetition_penalty=1.0,
+                                 max_tokens=a.max_new_tokens, min_tokens=a.min_new_tokens, stop_token_ids=sorted(eos_ids),
+                                 logprobs=0, extra_args={"apply_steering_vectors": payload[k]}) for k in keys]
+    else:
+        llm.collective_rpc("set_steering_data_many", args=(pickle.dumps(payload),))
+        params = [SamplingParams(n=G, temperature=a.temperature, top_p=1.0, top_k=0, min_p=0.0, repetition_penalty=1.0,
+                                 max_tokens=a.max_new_tokens, min_tokens=a.min_new_tokens, stop_token_ids=sorted(eos_ids),
+                                 logprobs=0, extra_args={"_steering_id": k}) for k in keys]
+    reqs = [{"prompt_token_ids": list(prompt_ids)} for _ in keys]
+    t1 = time.time()
+    try:
+        outs = llm.generate(reqs, params, lora_request=lora_req, use_tqdm=False)
+    finally:
+        if not a.stock_lens_hook:
+            llm.collective_rpc("clear_steering_data_many", args=(keys,))
+    gen_s = time.time() - t1
+    gen_ids, lps, appended = [], [], 0
+    for out in outs:
+        assert len(out.outputs) == G, f"expected {G} samples, got {len(out.outputs)}"
+        for o in out.outputs:
+            g = list(o.token_ids)
+            lp = [None] * len(g)
+            if o.logprobs:
+                lp = [(d[t].logprob if (d is not None and t in d) else None) for d, t in zip(o.logprobs, g)]
+            if o.finish_reason == "stop" and (not g or g[-1] not in eos_ids):
+                g.append(int(o.stop_reason) if isinstance(o.stop_reason, int) else int(tok.eos_token_id))
+                lp.append(None); appended += 1
+            g2 = R._trim_at_stop(g, eos_ids)
+            gen_ids.append(g2); lps.append(lp[: len(g2)])
+    return gen_ids, lps, appended, gen_s
+
+
+def run_rollout(a):
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoTokenizer, GenerationConfig
+    import rl_hf as R
+    from mxf.config import D_MODEL, MODEL
+    from mxf.prompts import build_prompt_ids
+    from vllm.lora.request import LoRARequest
+
+    rank = int(os.environ["DISAGG_RANK"]); tag = f"R{rank}"
+    work = a.work_dir
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    prompt_ids, mpos = build_prompt_ids(tok)
+    marker, p_len = mpos[0], len(prompt_ids)
+    eos_ids = R._eos_ids(tok, _GenCfgStub(GenerationConfig.from_pretrained(MODEL)))
+    rng = np.random.default_rng(a.seed * 7919 + 1000 + rank)
+    bank = n_vecs = None; eval_rows = 0
+    if a.direction_source == "cluster":
+        bank, n_vecs, eval_rows = _bank_open(a)
+        assert n_vecs - eval_rows >= a.rollout_block_groups
+    Bb, G = a.rollout_block_groups, a.group_size
+
+    # the engine can load while the trainer is still loading the actor; the first block waits for step 0
+    llm = _build_engine(a, rank, p_len, a.max_num_seqs, a.cuda_graphs, tag)
+    t_wait = time.time()
+    while _read_latest(work) is None:
+        if _stop_requested(work):
+            return
+        time.sleep(1.0)
+    _log(tag, f"first adapter published after {time.time() - t_wait:.0f}s of waiting")
+    cur_step, lora_req, hnorm = None, None, None
+
+    def refresh():
+        nonlocal cur_step, lora_req, hnorm
+        k = _read_latest(work)
+        if k is None or k == cur_step:
+            return False
+        d = f"{work}/lora/step_{k}"
+        meta = json.load(open(f"{d}/meta.json"))
+        hnorm = float(meta["hnorm"])
+        lora_req = LoRARequest(lora_name=f"step{k}", lora_int_id=k + 1, lora_path=d)
+        cur_step = k
+        return True
+    refresh()
+    chk = _verify_injection(llm, prompt_ids, marker, hnorm, tag, seed=a.seed)
+    json.dump(chk, open(f"{work}/verify_r{rank}.json", "w"))
+    if not chk["ok"]:
+        raise RuntimeError(f"vLLM steering does NOT match the HF inject hook: {chk}")
+
+    blk = 0
+    while not _stop_requested(work):
+        while len(_queue_files(work)) >= a.max_queue_blocks:           # backpressure: bounded lag, no wasted rollouts
+            if _stop_requested(work):
+                return
+            time.sleep(0.25)
+        t0 = time.time()
+        swapped = refresh()
+        if a.direction_source == "random":
+            idx = np.full(Bb, -1, dtype=np.int64)
+            dirs = F.normalize(torch.randn(Bb, D_MODEL, dtype=torch.float32), dim=-1)
+        else:
+            idx = eval_rows + np.sort(rng.choice(n_vecs - eval_rows, size=Bb, replace=False))
+            dirs = F.normalize(torch.from_numpy(np.asarray(bank[idx], dtype=np.float32)), dim=-1)
+        gen_ids, lps, appended, gen_s = _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_ids,
+                                                        key_prefix=f"r{rank}b{blk}")
+        n_tok = sum(len(g) for g in gen_ids)
+        rec = {"block": blk, "rank": rank, "adapter_step": cur_step, "dir_idx": idx, "dirs": dirs, "gen_ids": gen_ids,
+               "lps": lps, "appended": appended, "gen_s": gen_s, "n_tok": n_tok, "t_done": time.time(),
+               "lora_swapped": swapped}
+        fn = f"{work}/queue/blk_{cur_step:07d}_{time.time_ns()}_{rank}.pt"
+        torch.save(rec, fn + ".tmp"); os.replace(fn + ".tmp", fn)
+        _log(tag, f"block {blk} | adapter step {cur_step}{' (swapped)' if swapped else ''} | {len(gen_ids)} seqs "
+                  f"{n_tok} tok in gen {gen_s:.1f}s ({n_tok / gen_s:.0f} tok/s, {len(gen_ids) / gen_s:.1f} seq/s) "
+                  f"| appended_stop {appended} | wall {time.time() - t0:.1f}s | queue {len(_queue_files(work))}")
+        blk += 1
+    _log(tag, "STOP seen, exiting")
+
+
+def run_bench_rollout(a):
+    """Rollout throughput table: for each <eager|graphs>:<max_num_seqs> config assigned to this rank
+    (configs[rank::n_rollout]) build an engine, verify injection, then time generate() for every size in
+    --bench-sizes (fresh directions, the SFT adapter converted to vLLM layout, real sampling params).
+    Writes <work>/bench_rollout_r<rank>.json."""
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from safetensors.torch import load_file, save_file
+    from transformers import AutoTokenizer, GenerationConfig
+    import rl_hf as R
+    from mxf.config import D_MODEL, MODEL
+    from mxf.prompts import build_prompt_ids
+    from vllm.lora.request import LoRARequest
+
+    rank = int(os.environ["DISAGG_RANK"]); world = int(os.environ["DISAGG_WORLD"]); tag = f"B{rank}"
+    work = a.work_dir
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    prompt_ids, mpos = build_prompt_ids(tok)
+    marker, p_len = mpos[0], len(prompt_ids)
+    eos_ids = R._eos_ids(tok, _GenCfgStub(GenerationConfig.from_pretrained(MODEL)))
+    # SFT adapter -> vLLM key layout (no actor needed: pure key rename, cf. rl.py _save_adapter_for_vllm)
+    lora_dir = f"{work}/bench_lora_r{rank}"
+    os.makedirs(lora_dir, exist_ok=True)
+    sd = load_file(f"{a.init_adapter}/adapter_model.safetensors")
+    out = {}
+    for k, v in sd.items():
+        k2 = k if "language_model" in k else k.replace("model.layers.", "model.language_model.layers.", 1)
+        out[k2] = v.contiguous()
+    save_file(out, f"{lora_dir}/adapter_model.safetensors", metadata={"format": "pt"})
+    shutil.copy(f"{a.init_adapter}/adapter_config.json", f"{lora_dir}/adapter_config.json")
+    lora_req = LoRARequest(lora_name="bench", lora_int_id=1, lora_path=lora_dir)
+    bank, n_vecs, eval_rows = _bank_open(a)
+    rng = np.random.default_rng(a.seed + rank)
+    configs = [c for c in a.bench_configs.split(",") if c][rank::max(world, 1)]
+    sizes = [int(s) for s in a.bench_sizes.split(",")]
+    results = []
+    _log(tag, f"configs for this rank: {configs} | sizes {sizes}")
+    for cfg in configs:
+        mode, mns = cfg.split(":"); mns = int(mns)
+        a.stock_lens_hook = (mode == "stock")
+        llm = _build_engine(a, rank, p_len, mns, mode == "graphs", tag)
+        # base-weights clean marker norm from a capture is a fine stand-in for the trainer's published hnorm here
+        from vllm import SamplingParams
+        from mxf.config import INJECT_LAYER
+        o = llm.generate([{"prompt_token_ids": list(prompt_ids)}],
+                         [SamplingParams(temperature=0.0, max_tokens=1, extra_args={"output_residual_stream": [INJECT_LAYER]})],
+                         use_tqdm=False)[0]
+        hnorm = o.activations["residual_stream"][0].float()[marker].norm().item()
+        chk = _verify_injection(llm, prompt_ids, marker, hnorm, tag, seed=a.seed)
+        for n_seqs in sizes:
+            if n_seqs > mns * 4:      # more than 4 waves of the engine's capacity is not a config we would run
+                continue
+            Bb = max(1, n_seqs // a.group_size)
+            idx = eval_rows + np.sort(rng.choice(n_vecs - eval_rows, size=Bb, replace=False))
+            dirs = F.normalize(torch.from_numpy(np.asarray(bank[idx], dtype=np.float32)), dim=-1)
+            # warm-up (LoRA load + graph warm) then the timed call
+            _generate_block(llm, a, tok, prompt_ids, marker, dirs[: max(1, Bb // 4)], hnorm, lora_req, eos_ids, f"warm{n_seqs}")
+            gen_ids, lps, appended, gen_s = _generate_block(llm, a, tok, prompt_ids, marker, dirs, hnorm, lora_req, eos_ids, f"bench{n_seqs}")
+            n_tok = sum(len(g) for g in gen_ids)
+            stats = None
+            try:
+                stats = llm.collective_rpc("fast_lens_stats")[0] if not a.stock_lens_hook else None
+            except Exception:  # noqa
+                pass
+            row = {"mode": mode, "max_num_seqs": mns, "n_seqs": len(gen_ids), "gen_s": gen_s, "n_tok": n_tok,
+                   "tok_per_s": n_tok / gen_s, "seq_per_s": len(gen_ids) / gen_s, "len_mean": n_tok / len(gen_ids),
+                   "appended_stop": appended, "verify": chk, "lens_stats": stats,
+                   "sample": tok.decode(gen_ids[0], skip_special_tokens=True)[:100]}
+            results.append(row)
+            _log(tag, f"{mode} mns={mns} n={len(gen_ids)}: {gen_s:.1f}s -> {row['tok_per_s']:.0f} tok/s, {row['seq_per_s']:.1f} seq/s, "
+                      f"len {row['len_mean']:.1f} | appended {appended} | lens {stats}")
+            json.dump(results, open(f"{work}/bench_rollout_r{rank}.json", "w"), indent=1)
+        del llm
+        gc.collect(); torch.cuda.empty_cache()
+        time.sleep(3)
+    _log(tag, "bench done")
+
+
+# ==============================================================================================
+# TRAINER rank
+# ==============================================================================================
+def _sync_grads(params, weight, backend, device):
+    """Exact weighted all-reduce of the LoRA grads (one flat buffer): global grad = sum_r w_r g_r / sum_r w_r.
+    weight = local rollout count (seq-mean loss) or local completion tokens (token-mean loss) -> equals the
+    single-GPU gradient over the union batch even with UNEVEN shards. GPU buffer under nccl, CPU under gloo."""
+    import torch
+    import torch.distributed as dist
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return
+    dev = device if backend == "nccl" else "cpu"
+    flat = torch.cat([g.detach().reshape(-1).float() for g in grads] + [torch.ones(1, device=grads[0].device)]).to(dev)
+    flat.mul_(float(weight))
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat.div_(flat[-1].item())
+    off = 0
+    for g in grads:
+        n = g.numel()
+        g.copy_(flat[off : off + n].view_as(g))
+        off += n
+
+
+def _chunked_logp(logits, targets, vocab_chunk, need_entropy_grad):
+    """log_softmax over the 248k vocab in fp32, `vocab_chunk` positions at a time (bounds the transient to
+    mb*chunk*V*4 bytes). Returns new_lp [mb,T] (with grad) and per-token entropy [mb,T] (no grad unless asked).
+    Math identical to rl.py: log_softmax(logits.float()).gather(targets)."""
+    import torch
+    T = logits.shape[1]
+    lp_chunks, ent_chunks = [], []
+    for c0 in range(0, T, vocab_chunk):
+        c1 = min(c0 + vocab_chunk, T)
+        lpf = torch.log_softmax(logits[:, c0:c1].float(), -1)
+        lp_chunks.append(lpf.gather(-1, targets[:, c0:c1, None]).squeeze(-1))
+        if need_entropy_grad:
+            ent_chunks.append(-(lpf.exp() * lpf).sum(-1))
+        else:
+            with torch.no_grad():
+                ent_chunks.append(-(lpf.exp() * lpf).sum(-1))
+        del lpf
+    return torch.cat(lp_chunks, 1), torch.cat(ent_chunks, 1)
+
+
+def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb):
+    """rl.py update() with: vLLM sampler logprobs as old_lp (ratio := 1 where the sampler logp is unknown, i.e.
+    the re-appended stop token), logits only for the completion positions (logits_to_keep), fp32 vocab math
+    in chunks, use_cache off, exact weighted grad sync. Returns rl.py's stats + sampler_abs_dlogp."""
+    import torch
+    import torch.distributed as dist
+    import rl_hf as R
+    from mxf.config import STEER_COEFF
+    n, L = ids.shape
+    T = L - p_len
+    gen_mask = attn[:, p_len:].bool()
+    total_tok = max(int(gen_mask.sum()), 1)
+    if a.loss_agg == "seq":
+        w_all = gen_mask.float() / gen_mask.sum(1, keepdim=True).clamp(min=1).float() / n
+        sync_w = float(n)
+    else:
+        w_all = gen_mask.float() / total_tok
+        sync_w = float(total_tok)
+    lo, hi = 1 - a.clip_eps, 1 + a.clip_eps
+    t_ref = time.time()
+    # micro-batches of LENGTH-SORTED rollouts, each padded only to ITS longest sequence: the loss weights are
+    # per-sequence and independent of batching, so this is exactly the same gradient as global padding while
+    # most micro-batches run at ~p_len+30 instead of p_len+96 tokens
+    lens = gen_mask.sum(1)
+    order = torch.argsort(lens)
+
+    def chunks(size):
+        for s in range(0, n, size):
+            ix = order[s : s + size]
+            yield ix, p_len + int(lens[ix].max())
+    ref_lp_all = None
+    if a.kl_coef > 0:
+        ref_lp_all = torch.zeros_like(old_lp)
+        actor.set_adapter("ref")
+        try:
+            with torch.no_grad():
+                for ix, Lc in chunks(a.ref_micro_batch):
+                    Tc = Lc - p_len
+                    b_ids, b_attn = ids[ix, :Lc].to(device), attn[ix, :Lc].to(device)
+                    hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[marker]] * len(ix),
+                                              STEER_COEFF, device, torch.bfloat16)
+                    with R.hooked(submodule, hook):
+                        lg = actor(input_ids=b_ids, attention_mask=b_attn, use_cache=False, logits_to_keep=Tc + 1).logits[:, :-1]
+                    for c0 in range(0, Tc, a.vocab_chunk):
+                        c1 = min(c0 + a.vocab_chunk, Tc)
+                        ref_lp_all[ix, c0:c1] = torch.log_softmax(lg[:, c0:c1].float(), -1).gather(
+                            -1, b_ids[:, p_len + c0 : p_len + c1, None]).squeeze(-1).cpu()
+                    del lg
+        finally:
+            actor.set_adapter("default")
+    t_ref = time.time() - t_ref
+    opt.zero_grad(set_to_none=True)
+    loss_sum, clipped_tok, ent_sum, kl_sum, ratio_sum, dlp_sum, dlp_n = 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0
+    t_fb = time.time()
+    for ix, Lc in chunks(mb):
+        Tc = Lc - p_len
+        b_ids, b_attn = ids[ix, :Lc].to(device), attn[ix, :Lc].to(device)
+        m = gen_mask[ix, :Tc].to(device); w = w_all[ix, :Tc].to(device); A = adv[ix, None].to(device)
+        olp = old_lp[ix, :Tc].to(device); kn = known[ix, :Tc].to(device)
+        hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[marker]] * len(ix), STEER_COEFF, device, torch.bfloat16)
+        with R.hooked(submodule, hook):
+            logits = actor(input_ids=b_ids, attention_mask=b_attn, use_cache=False, logits_to_keep=Tc + 1).logits[:, :-1]
+            new_lp, ent = _chunked_logp(logits, b_ids[:, p_len:], a.vocab_chunk, a.entropy_coef > 0)
+            del logits
+            olp_eff = torch.where(kn, olp, new_lp.detach())
+            ratio = torch.exp(new_lp - olp_eff).clamp(max=a.tis_cap)
+            loss = (-torch.minimum(ratio * A, ratio.clamp(lo, hi) * A) * w).sum()
+            ent_sum += float((ent.detach() * m).sum())
+            if a.entropy_coef > 0:
+                loss = loss - a.entropy_coef * (ent * w).sum()
+            if a.kl_coef > 0:
+                ref_lp = ref_lp_all[ix, :Tc].to(device)
+                delta = ref_lp - new_lp
+                kl = (torch.exp(delta) - delta - 1).clamp(0.0, a.kl_cap)
+                loss = loss + a.kl_coef * (kl * w).sum()
+                kl_sum += float((kl.detach() * m).sum())
+            loss.backward()
+        loss_sum += loss.item()
+        clipped_tok += int((((ratio < lo) | (ratio > hi)) & m).sum())
+        ratio_sum += float((ratio.detach() * m).sum())
+        mk = m & kn
+        dlp_sum += float(((new_lp.detach() - olp).abs() * mk).sum()); dlp_n += int(mk.sum())
+        del new_lp, ent, ratio, loss, olp_eff
+    t_fb = time.time() - t_fb
+    params = [p for p in actor.parameters() if p.requires_grad]
+    t_sync = time.time()
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        _sync_grads(params, sync_w, a.backend, device)
+    t_sync = time.time() - t_sync
+    gn = float(torch.nn.utils.clip_grad_norm_(params, a.max_grad_norm))
+    if math.isfinite(gn):
+        opt.step()
+    else:
+        opt.zero_grad(set_to_none=True)
+        print(f"[update] non-finite grad norm ({gn}) -- skipping step", flush=True)
+    return {"loss": loss_sum, "grad_norm": gn, "clipfrac": clipped_tok / total_tok, "entropy": ent_sum / total_tok,
+            "kl": kl_sum / total_tok, "ratio_mean": ratio_sum / total_tok, "sampler_abs_dlogp": dlp_sum / max(dlp_n, 1),
+            "t_ref": t_ref, "t_fb": t_fb, "t_sync": t_sync, "n_unknown_lp": int((gen_mask & ~known).sum())}
+
+
+def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag):
+    """Largest micro-batch whose forward+backward at MAX length (prompt + max_new_tokens) fits with <90% of
+    the GPU allocated. Synthetic tokens; same hook, same chunked vocab math as update_disagg."""
+    import torch
+    import torch.nn.functional as F
+    import rl_hf as R
+    from mxf.config import D_MODEL, STEER_COEFF
+    L = len(prompt_ids) + a.max_new_tokens
+    p_len = len(prompt_ids)
+    total = torch.cuda.get_device_properties(0).total_memory
+    res, chosen = {}, None
+    for mb in cands:
+        ok, peak = False, None
+        try:
+            torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+            ids = torch.randint(1000, 100000, (mb, L), device=device)
+            ids[:, :p_len] = torch.tensor(prompt_ids, device=device)
+            attn = torch.ones_like(ids)
+            dirs = F.normalize(torch.randn(mb, D_MODEL, device=device), dim=-1)
+            hook = R.make_inject_hook([dirs[i : i + 1] for i in range(mb)], [[marker]] * mb, STEER_COEFF, device, torch.bfloat16)
+            with R.hooked(submodule, hook):
+                logits = actor(input_ids=ids, attention_mask=attn, use_cache=False, logits_to_keep=L - p_len + 1).logits[:, :-1]
+                new_lp, ent = _chunked_logp(logits, ids[:, p_len:], a.vocab_chunk, False)
+                del logits
+                loss = new_lp.mean() * 0.0
+                loss.backward()
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated()
+            ok = peak < 0.90 * total
+            del new_lp, ent, loss, ids, attn, dirs
+        except torch.cuda.OutOfMemoryError:
+            ok = False
+        finally:
+            opt.zero_grad(set_to_none=True)
+            gc.collect(); torch.cuda.empty_cache()
+        res[mb] = {"ok": ok, "peak_gb": (peak / 2**30) if peak else None}
+        _log(tag, f"mb {mb}: {'OK' if ok else 'OOM/too tight'}" + (f" peak {peak / 2**30:.1f} GB / {total / 2**30:.0f}" if peak else ""))
+        if ok:
+            chosen = mb
+            break
+    return chosen, res
+
+
+def inline_eval_stub(a, tag):
+    """Inline eval is NOT run in the disaggregated trainer yet. Design for the follow-up: rank 0 writes
+    <work>/eval_req/<ckpt>.json (families, bo, temp, tokens); the rollout ranks pick it up between blocks,
+    generate the held-out texts with the LoRA of that ckpt (vLLM, like rl.py inline_eval) into
+    <work>/eval_gen/<ckpt>_<rank>.pt; the trainer ranks score them on the clean base with eval_universal's
+    score_probe_cos / score_sae_peaks (sharded), all_gather, and log eval/* with x-axis ckpt_step."""
+    if a.inline_eval_every > 0:
+        _log(tag, f"--inline-eval-every {a.inline_eval_every} requested but inline eval is disabled in rl_disagg "
+                  "(dev iteration); see inline_eval_stub() for the planned rollout-generates/trainer-scores protocol")
+
+
+def _save_adapter_for_vllm(actor, lora_dir, dtype):
+    """rl.py's _save_adapter_for_vllm (module names renamed to the Qwen3_5ForConditionalGeneration layout vLLM
+    serves) with a configurable dtype. bf16 halves the write; vLLM casts LoRA weights to the model dtype on
+    load, so the served policy is bit-identical either way. Returns (n_tensors, timings)."""
+    import torch
+    from peft import get_peft_model_state_dict
+    from safetensors.torch import save_file
+    os.makedirs(lora_dir, exist_ok=True)
+    t0 = time.time()
+    sd = get_peft_model_state_dict(actor, adapter_name="default")
+    out = {}
+    for k, v in sd.items():
+        k2 = k if "language_model" in k else k.replace("model.layers.", "model.language_model.layers.", 1)
+        out[k2] = v.detach().to(dtype).to("cpu", copy=True).contiguous()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    save_file(out, f"{lora_dir}/adapter_model.safetensors", metadata={"format": "pt"})
+    actor.peft_config["default"].save_pretrained(lora_dir)
+    t2 = time.time()
+    return len(out), {"state_dict_s": t1 - t0, "write_s": t2 - t1, "bytes": sum(v.numel() * v.element_size() for v in out.values())}
+
+
+def _publish_adapter(actor, submodule, prompt, marker, device, work, step, keep, tag, fp32=False):
+    """rank 0: adapter in vLLM key layout + ||h_marker|| (adapter ON) -> lora/step_<k>, then flip `latest`."""
+    import torch
+    import rl_hf as R
+    t0 = time.time()
+    hnorm = R._marker_norm(actor, submodule, prompt, marker, device, adapter=True)
+    t_norm = time.time() - t0
+    d = f"{work}/lora/step_{step}"
+    n, tm = _save_adapter_for_vllm(actor, d, torch.float32 if fp32 else torch.bfloat16)
+    json.dump({"step": step, "hnorm": hnorm, "n_tensors": n, "t": time.time()}, open(f"{d}/meta.json", "w"))
+    _atomic_write_text(f"{work}/lora/latest", str(step))
+    for old in sorted(glob.glob(f"{work}/lora/step_*"), key=lambda p: int(p.rsplit("_", 1)[-1]))[:-keep]:
+        shutil.rmtree(old, ignore_errors=True)
+    tot = time.time() - t0
+    if step <= 1:
+        _log(tag, f"publish step {step}: hnorm {t_norm:.2f}s | state_dict->cpu {tm['state_dict_s']:.2f}s | write {tm['bytes'] / 2**30:.2f} GB in {tm['write_s']:.2f}s -> {d}")
+    return hnorm, tot
+
+
+def _pick_blocks(work, n_needed, drop_stale):
+    files = _queue_files(work)
+    if len(files) < n_needed:
+        return None, []
+    if drop_stale:
+        take, stale = files[-n_needed:], files[:-n_needed]
+    else:
+        take, stale = files[:n_needed], []
+    return take, stale
+
+
+def run_trainer(a):
+    import numpy as np
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+    if a.no_fla:
+        sys.modules["fla"] = None      # transformers' use_kernel_func_from_hub_with_fallback then keeps the torch GDN path
+    from peft import LoraConfig, PeftModel, get_peft_model
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import wandb
+    import rl_hf as R
+    from mxf.config import D_MODEL, INJECT_LAYER, MODEL, TrainConfig
+    from mxf.inject import get_layer
+    from mxf.prompts import build_prompt_ids
+
+    rank = int(os.environ["DISAGG_RANK"]); world = int(os.environ["DISAGG_WORLD"]); is_main = rank == 0
+    tag = f"T{rank}"
+    work = a.work_dir
+    torch.manual_seed(a.seed + rank)
+    torch.cuda.set_device(0)
+    device = "cuda:0"
+    if world > 1:
+        dist.init_process_group(a.backend, init_method=f"tcp://127.0.0.1:{a.master_port}", rank=rank, world_size=world)
+    try:
+        import fla  # noqa
+        fla_v = getattr(fla, "__version__", "?")
+    except Exception:  # noqa
+        fla_v = None
+    _log(tag, f"world {world} backend {a.backend} | fla {'v' + str(fla_v) if fla_v else 'ABSENT (torch GDN fallback)'} "
+              f"| torch {torch.__version__} | gpu {torch.cuda.get_device_name(0)} {torch.cuda.get_device_properties(0).total_memory / 2**30:.0f} GB")
+
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    prompt_ids, mpos = build_prompt_ids(tok)
+    marker, p_len = mpos[0], len(prompt_ids)
+    prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+    B, G = a.groups_per_step, a.group_size
+    tr = TrainConfig()
+
+    t0 = time.time()
+    actor = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+    if a.init_adapter:
+        actor = PeftModel.from_pretrained(actor, a.init_adapter, is_trainable=True)
+    else:
+        actor = get_peft_model(actor, LoraConfig(r=tr.lora_r, lora_alpha=tr.lora_alpha, lora_dropout=0.0, use_rslora=True,
+                                                 target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
+    actor.train()
+    opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0,
+                            eps=a.adam_eps, betas=tuple(a.adam_betas))
+    optim_p = os.path.join(a.init_adapter or "", "optim.pt")
+    if a.init_adapter and os.path.exists(optim_p):
+        opt.load_state_dict(torch.load(optim_p, map_location="cpu"))
+        _log(tag, f"AdamW state restored from {optim_p}")
+    submodule = get_layer(actor, INJECT_LAYER)
+    if a.kl_coef > 0:
+        ref_src = a.ref_adapter or a.init_adapter
+        assert ref_src, "--kl-coef needs --init-adapter or --ref-adapter"
+        actor.load_adapter(ref_src, adapter_name="ref")
+        actor.set_adapter("default")
+    n_train = sum(p.numel() for p in actor.parameters() if p.requires_grad)
+    _log(tag, f"actor ready in {time.time() - t0:.0f}s | trainable {n_train / 1e6:.0f}M | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB")
+
+    # publish the init policy FIRST so the rollout ranks start generating while we tune the micro-batch
+    if is_main:
+        for d in ("lora", "queue"):
+            os.makedirs(f"{work}/{d}", exist_ok=True)
+        hnorm0, t_pub = _publish_adapter(actor, submodule, prompt, marker, device, work, a.step_offset, a.keep_loras, tag, a.publish_fp32)
+        _log(tag, f"published init adapter as step {a.step_offset} (||h_marker|| = {hnorm0:.2f}) in {t_pub:.1f}s")
+
+    mb = a.micro_batch
+    mb_res = {}
+    if mb <= 0:
+        cands = [int(x) for x in a.mb_candidates.split(",")]
+        mb, mb_res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag)
+        assert mb is not None, f"no micro-batch candidate fits: {mb_res}"
+        if world > 1:
+            t = torch.tensor([mb], dtype=torch.int64, device=device if a.backend == "nccl" else "cpu")
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            mb = int(t.item())
+    _log(tag, f"micro-batch = {mb} (no gradient checkpointing)")
+    inline_eval_stub(a, tag)
+
+    adv_mode = a.adv_mode or ("batch" if a.batch_norm else ("group" if a.std_norm else "none"))
+    use_gates = a.fluency_floor is not None or a.distinct_floor is not None
+    tgt_map = {}
+    if is_main and a.transcript_every > 0 and a.direction_source == "cluster" and os.path.exists(f"{a.data_dir}/records.jsonl"):
+        with open(f"{a.data_dir}/records.jsonl") as f:
+            for i, line in enumerate(f):
+                try:
+                    rec = json.loads(line)
+                except Exception:  # noqa
+                    continue
+                vi = rec.get("vec_idx", i)
+                if vi not in tgt_map and rec.get("target_text") is not None:
+                    tgt_map[vi] = (rec.get("family"), rec["target_text"][:240])
+    if is_main:
+        _log(tag, f"B={B} groups x G={G} per step from {a.blocks_per_step} block(s) of {a.rollout_block_groups} | adv {adv_mode} "
+                  f"| gates {use_gates} | mb {mb} | ref-mb {a.ref_micro_batch} | queue cap {a.max_queue_blocks} | {'drop-stale' if a.drop_stale else 'FIFO'}")
+        if not a.no_wandb:
+            wandb.init(project="maxact-fast", name=a.run_name, config={**vars(a), "micro_batch_used": mb, "mb_search": mb_res,
+                                                                        "fla": fla_v, "disagg": True},
+                       id=a.wandb_id or None, resume="must" if a.wandb_id else None)
+        os.makedirs(a.save_dir, exist_ok=True)
+        json.dump({"micro_batch": mb, "search": mb_res}, open(f"{work}/trainer_mb.json", "w"))
+    eos_set = set(R._eos_ids(tok, actor))
+    step_hist = []
+
+    for step in range(a.step_offset, a.total_steps):
+        t0 = time.time()
+        # ---- rank 0 picks the blocks; everyone loads them (shared /tmp) and takes its whole-group shard ----
+        pick = [None, None]
+        if is_main:
+            while True:
+                take, stale = _pick_blocks(work, a.blocks_per_step, a.drop_stale)
+                if take is not None:
+                    break
+                time.sleep(0.2)
+            pick = [take, stale]
+        if world > 1:
+            dist.broadcast_object_list(pick, src=0)
+        take, stale = pick
+        t_wait = time.time() - t0
+        blocks = [torch.load(f, weights_only=False) for f in take]
+        if world > 1:
+            dist.barrier()
+        if is_main:
+            for f in take + stale:
+                try:
+                    os.remove(f)
+                except FileNotFoundError:
+                    pass
+        dirs_all = torch.cat([b["dirs"] for b in blocks])                       # [B, d]
+        idx_all = np.concatenate([np.asarray(b["dir_idx"]) for b in blocks])
+        gen_all = [g for b in blocks for g in b["gen_ids"]]
+        lps_all = [l for b in blocks for l in b["lps"]]
+        assert dirs_all.shape[0] == B and len(gen_all) == B * G, f"batch shape {dirs_all.shape[0]} groups / {len(gen_all)} seqs"
+        lag = float(np.mean([step - b["adapter_step"] for b in blocks]))
+        gen_s = float(np.mean([b["gen_s"] for b in blocks]))
+        blk_tok = float(np.sum([b["n_tok"] for b in blocks]))
+        my_groups = np.array_split(np.arange(B), world)[rank]
+        g0, g1 = int(my_groups[0]), int(my_groups[-1]) + 1
+        Bl = g1 - g0
+        dirs = dirs_all[g0:g1]
+        idx = idx_all[g0:g1]
+        gen_ids = gen_all[g0 * G : g1 * G]
+        lps = lps_all[g0 * G : g1 * G]
+        texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
+        dirs_rep = dirs.repeat_interleave(G, 0).to(device)
+
+        # ---- reward + shaping (identical to rl.py main) ----
+        t_sc = time.time()
+        if use_gates:
+            r, flu, dis = R.score(texts, dirs_rep, actor, tok, device, a, with_fluency=True)
+        else:
+            r = R.score(texts, dirs_rep, actor, tok, device, a)
+        r = r * a.reward_scale
+        trunc = torch.tensor([len(g) >= a.max_new_tokens and (not g or g[-1] not in eos_set) for g in gen_ids])
+        trunc_frac = trunc.float().mean().item()
+        if a.trunc_reward is not None and bool(trunc.any()):
+            r[trunc] = a.trunc_reward
+        raw_r, gate_frac = r.clone(), 1.0
+        gate = torch.ones(Bl * G, dtype=torch.bool)
+        if use_gates:
+            if a.fluency_floor is not None:
+                gate &= flu >= a.fluency_floor
+            if a.distinct_floor is not None:
+                gate &= dis >= a.distinct_floor
+            r = r - a.gate_penalty * (~gate).float()
+            gate_frac = gate.float().mean().item()
+        if a.len_penalty_start is not None:
+            over = torch.tensor([max(0, len(g) - a.len_penalty_start) for g in gen_ids], dtype=torch.float32)
+            r = r - a.len_penalty_per_tok * over * gate.float()
+        adv = R.compute_advantages(r, Bl, G, adv_mode)
+        t_sc = time.time() - t_sc
+
+        _table = None
+        if is_main and a.transcript_every > 0 and step % a.transcript_every == 0:
+            rows_t = []
+            for g in range(min(a.transcript_groups, Bl)):
+                vi = int(idx[g])
+                fam, tgt = tgt_map.get(vi, (None, None))
+                for j in range(min(a.transcript_samples, G)):
+                    i = g * G + j
+                    rows_t.append({"step": step, "group": g, "vec_idx": vi, "family": fam, "target": tgt, "text": texts[i],
+                                   "cos": float(raw_r[i]) / a.reward_scale, "reward": float(r[i]), "adv": float(adv[i]), "n_tok": len(gen_ids[i])})
+            with open(f"{a.save_dir}/transcripts.jsonl", "a") as f:
+                for row in rows_t:
+                    f.write(json.dumps(row) + "\n")
+            if not a.no_wandb:
+                _table = wandb.Table(columns=list(rows_t[0].keys()), data=[list(x.values()) for x in rows_t])
+
+        # ---- pad + update (old_lp = the SAMPLER's logprobs) ----
+        L = p_len + max(len(g) for g in gen_ids)
+        ids = torch.full((Bl * G, L), tok.pad_token_id, dtype=torch.long)
+        attn = torch.zeros((Bl * G, L), dtype=torch.long)
+        old_lp = torch.zeros((Bl * G, L - p_len))
+        known = torch.zeros((Bl * G, L - p_len), dtype=torch.bool)
+        pt = torch.tensor(prompt_ids, dtype=torch.long)
+        for i, (g, lp) in enumerate(zip(gen_ids, lps)):
+            ids[i, :p_len] = pt
+            ids[i, p_len : p_len + len(g)] = torch.tensor(g)
+            attn[i, : p_len + len(g)] = 1
+            for j, v in enumerate(lp):
+                if v is not None:
+                    old_lp[i, j] = float(v); known[i, j] = True
+        t_up = time.time()
+        stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb)
+        t_up = time.time() - t_up
+
+        # ---- publish the new policy for the rollout ranks ----
+        t_pub, hnorm = 0.0, float("nan")
+        if is_main and a.publish_every > 0 and (step + 1) % a.publish_every == 0:
+            hnorm, t_pub = _publish_adapter(actor, submodule, prompt, marker, device, work, step + 1, a.keep_loras, tag, a.publish_fp32)
+
+        # ---- logging (reward stats over ALL trainer ranks; uneven shards -> weighted) ----
+        secs = time.time() - t0
+        mem_alloc = torch.cuda.memory_allocated(device) / 2**30
+        mem_peak = torch.cuda.max_memory_allocated(device) / 2**30
+        torch.cuda.reset_peak_memory_stats(device)
+        n_gen = float(sum(len(g) for g in gen_ids))
+        _rg = raw_r.view(Bl, G)
+        loc = torch.tensor([n_gen, gate_frac * Bl, r.view(Bl, G).std(1).sum().item(), Bl,
+                            _rg.std(1).sum().item(), (_rg.std(1) < 1e-6).float().sum().item(),
+                            adv.pow(2).sum().item(), adv.abs().sum().item(), float(Bl * G),
+                            stats["n_unknown_lp"]], dtype=torch.float64)
+        gmin, gmax = torch.tensor([_rg.std(1).min().item()]), torch.tensor([_rg.std(1).max().item()])
+        if world > 1:
+            dev = device if a.backend == "nccl" else "cpu"
+            raw_list = [None] * world; r_list = [None] * world; gm_list = [None] * world
+            dist.all_gather_object(raw_list, raw_r); dist.all_gather_object(r_list, r); dist.all_gather_object(gm_list, _rg.mean(1))
+            raw_r_all, r_all, gmeans = torch.cat(raw_list), torch.cat(r_list), torch.cat(gm_list)
+            loc = loc.to(dev); dist.all_reduce(loc); loc = loc.cpu()
+            gmin, gmax = gmin.to(dev), gmax.to(dev)
+            dist.all_reduce(gmin, op=dist.ReduceOp.MIN); dist.all_reduce(gmax, op=dist.ReduceOp.MAX)
+            gmin, gmax = gmin.cpu(), gmax.cpu()
+        else:
+            raw_r_all, r_all, gmeans = raw_r, r, _rg.mean(1)
+        n_gen_all, n_groups_all, n_seq_all = float(loc[0]), float(loc[3]), float(loc[8])
+        log = {"reward/mean": raw_r_all.mean().item(), "reward/std": raw_r_all.std().item(), "reward/max": raw_r_all.max().item(),
+               "reward/shaped_mean": r_all.mean().item(), "reward/within_group_std": float(loc[2] / n_groups_all),
+               "reward/gate_frac": float(loc[1] / n_groups_all), "reward/trunc_frac": trunc_frac,
+               "ratio/clipfrac": stats["clipfrac"], "ratio/mean": stats["ratio_mean"],
+               "policy/entropy": stats["entropy"], "policy/kl_to_init": stats["kl"],
+               "policy/sampler_abs_dlogp": stats["sampler_abs_dlogp"], "policy/offpolicy_lag_steps": lag,
+               "loss": stats["loss"], "grad_norm": stats["grad_norm"], "grad_norm_did_clip": float(stats["grad_norm"] > a.max_grad_norm),
+               "rollout/mean_logp": float(old_lp[known].mean()) if bool(known.any()) else float("nan"),
+               "rollout/len_mean": n_gen_all / (B * G), "tokens_per_sec": n_gen_all / secs,
+               "rollout/gen_s": gen_s, "rollout/tok_per_s_per_replica": blk_tok / max(gen_s * len(blocks), 1e-6),
+               "rollout/appended_stop": float(sum(b["appended"] for b in blocks)), "rollout/marker_hnorm": hnorm,
+               "rollout/queue_depth": float(len(_queue_files(work))), "rollout/blocks_dropped": float(len(stale)),
+               "rollout/unknown_lp_tokens": float(loc[9]),
+               "time/step_s": secs, "time/wait_rollouts_s": t_wait, "time/score_s": t_sc, "time/update_s": t_up,
+               "time/ref_pass_s": stats["t_ref"], "time/fwd_bwd_s": stats["t_fb"], "time/grad_sync_s": stats["t_sync"],
+               "time/publish_s": t_pub, "time/rollout_s": gen_s,
+               "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, "micro_batch": mb}
+        if R.SCORE_STATS.get("peak_dist"):
+            _pd = torch.cat(R.SCORE_STATS["peak_dist"]); log["reward/peak_dist_mean"] = _pd.mean().item()
+            log["reward/peak_in_last5_frac"] = (_pd <= 4).float().mean().item()
+        w_std = float(loc[4] / n_groups_all)
+        b_std = float(gmeans.std().item()) if len(gmeans) > 1 else 0.0
+        log.update({"var/within_group_std_raw": w_std, "var/between_group_std_raw": b_std,
+                    "var/zero_var_group_frac": float(loc[5] / n_groups_all),
+                    "var/adv_std": float(math.sqrt(max(loc[6] / n_seq_all, 0.0))),   # advantages are zero-mean per group -> std = rms
+                    "var/adv_abs_mean": float(loc[7] / n_seq_all),
+                    "var/group_std_min": float(gmin), "var/group_std_max": float(gmax), "var/signal_ratio": w_std / (b_std + 1e-9)})
+        if _table is not None:
+            log["rollouts/samples"] = _table
+        step_hist.append({"step": step, "step_s": secs, "wait_s": t_wait, "update_s": t_up, "score_s": t_sc, "lag": lag,
+                          "gen_s": gen_s, "reward": log["reward/mean"], "entropy": log["policy/entropy"], "ratio": log["ratio/mean"],
+                          "clipfrac": log["ratio/clipfrac"], "dlogp": log["policy/sampler_abs_dlogp"], "len": log["rollout/len_mean"],
+                          "peak_gb": mem_peak, "t_ref": stats["t_ref"], "t_fb": stats["t_fb"], "t_sync": stats["t_sync"], "t_pub": t_pub,
+                          "n_local": Bl * G})
+        if is_main:
+            print(f"step {step:05d} | r {log['reward/mean']:.3f} (max {log['reward/max']:.2f}) | ent {log['policy/entropy']:.2f} "
+                  f"| ratio {log['ratio/mean']:.3f} clip {log['ratio/clipfrac']:.2%} |dlogp| {log['policy/sampler_abs_dlogp']:.4f} lag {lag:.1f} "
+                  f"| kl {log['policy/kl_to_init']:.4f} | len {log['rollout/len_mean']:.0f} | gnorm {log['grad_norm']:.3f} "
+                  f"| {secs:.0f}s (wait {t_wait:.0f} score {t_sc:.0f} update {t_up:.0f} [ref {stats['t_ref']:.0f} fb {stats['t_fb']:.0f} sync {stats['t_sync']:.1f}] pub {t_pub:.0f}) "
+                  f"| gen {gen_s:.0f}s | peak {mem_peak:.0f}G | queue {int(log['rollout/queue_depth'])}", flush=True)
+            if step % 10 == 0:
+                print(f"  sample r={raw_r[0]:.2f}: {texts[0][:110]!r}", flush=True)
+            if not a.no_wandb:
+                wandb.log(log, step=step)
+            json.dump(step_hist, open(f"{work}/trainer_steps.json", "w"))
+            if a.save_every and step and step % a.save_every == 0:
+                actor.save_pretrained(f"{a.save_dir}/step_{step}")
+                torch.save(opt.state_dict(), f"{a.save_dir}/step_{step}/optim.pt")
+                stale_o = os.path.join(a.save_dir, f"step_{step - 2 * a.save_every}", "optim.pt")
+                if os.path.exists(stale_o):
+                    os.remove(stale_o)
+    if is_main:
+        actor.save_pretrained(f"{a.save_dir}/final")
+        if a.save_every:
+            torch.save(opt.state_dict(), f"{a.save_dir}/final/optim.pt")
+        # rl.py-format round trip: the checkpoint must load as a PEFT adapter next to the live one
+        try:
+            actor.load_adapter(f"{a.save_dir}/final", adapter_name="chk_final")
+            actor.set_adapter("default")
+            _log(tag, f"checkpoint {a.save_dir}/final loads via PeftModel.load_adapter: OK")
+        except Exception as e:  # noqa
+            _log(tag, f"checkpoint load-back FAILED: {type(e).__name__}: {e}")
+        _atomic_write_text(f"{work}/STOP", "done")
+        print("RL_DONE", flush=True)
+    if world > 1:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def run_bench_trainer(a):
+    """Trainer-side cost model: micro-batch search, then score()+update_disagg() wall time for several
+    rollouts-per-rank sizes on SYNTHETIC rollouts at realistic lengths (uniform 8..96 gen tokens, mean ~40),
+    on world = n_trainer ranks (so grad sync is included). Writes <work>/bench_trainer_r<rank>.json."""
+    import numpy as np
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+    if a.no_fla:
+        sys.modules["fla"] = None
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import rl_hf as R
+    from mxf.config import D_MODEL, INJECT_LAYER, MODEL
+    from mxf.inject import get_layer
+    from mxf.prompts import build_prompt_ids
+    rank = int(os.environ["DISAGG_RANK"]); world = int(os.environ["DISAGG_WORLD"]); tag = f"BT{rank}"
+    torch.cuda.set_device(0); device = "cuda:0"
+    if world > 1:
+        dist.init_process_group(a.backend, init_method=f"tcp://127.0.0.1:{a.master_port}", rank=rank, world_size=world)
+    try:
+        import fla  # noqa
+        fla_v = getattr(fla, "__version__", "?")
+    except Exception:  # noqa
+        fla_v = None
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    prompt_ids, mpos = build_prompt_ids(tok)
+    marker, p_len = mpos[0], len(prompt_ids)
+    prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+    t0 = time.time()
+    actor = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+    actor = PeftModel.from_pretrained(actor, a.init_adapter, is_trainable=True)
+    actor.train()
+    opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0, eps=a.adam_eps, betas=tuple(a.adam_betas))
+    submodule = get_layer(actor, INJECT_LAYER)
+    if a.kl_coef > 0:
+        actor.load_adapter(a.ref_adapter or a.init_adapter, adapter_name="ref"); actor.set_adapter("default")
+    resident = torch.cuda.memory_allocated() / 2**30
+    _log(tag, f"actor in {time.time() - t0:.0f}s | resident {resident:.1f} GB | fla {fla_v} | world {world} {a.backend}")
+    out = {"fla": fla_v, "resident_gb": resident, "gpu": torch.cuda.get_device_name(0), "world": world, "backend": a.backend}
+    mb = a.micro_batch
+    if mb <= 0:
+        mb, res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, [int(x) for x in a.mb_candidates.split(",")], tag)
+        out["mb_search"] = res
+        if world > 1:
+            t = torch.tensor([mb], dtype=torch.int64, device=device if a.backend == "nccl" else "cpu")
+            dist.all_reduce(t, op=dist.ReduceOp.MIN); mb = int(t.item())
+    out["micro_batch"] = mb
+    t_pub = time.time()
+    hn = R._marker_norm(actor, submodule, prompt, marker, device, adapter=True)
+    _, tm32 = _save_adapter_for_vllm(actor, f"{a.work_dir}/bench_pub32", torch.float32)
+    _, tm16 = _save_adapter_for_vllm(actor, f"{a.work_dir}/bench_pub16", torch.bfloat16)
+    out["publish_s"] = time.time() - t_pub; out["hnorm"] = hn; out["publish_fp32"] = tm32; out["publish_bf16"] = tm16
+    _log(tag, f"mb {mb} | publish fp32 {tm32} | bf16 {tm16}")
+    rng = np.random.default_rng(0)
+    G = a.group_size
+    rows = []
+    for n_roll in [int(x) for x in a.bench_rollouts_per_rank.split(",")]:
+        Bl = max(1, n_roll // G)
+        lens = rng.integers(a.min_new_tokens, a.max_new_tokens + 1, size=Bl * G)
+        gen_ids = [list(rng.integers(1000, 100000, size=int(l))) + [tok.eos_token_id] for l in lens]
+        texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
+        dirs = F.normalize(torch.randn(Bl, D_MODEL), dim=-1)
+        dirs_rep = dirs.repeat_interleave(G, 0).to(device)
+        torch.cuda.synchronize(); t_s = time.time()
+        r = R.score(texts, dirs_rep, actor, tok, device, a)
+        torch.cuda.synchronize(); t_s = time.time() - t_s
+        adv = R.compute_advantages(r, Bl, G, "group")
+        L = p_len + max(len(g) for g in gen_ids)
+        ids = torch.full((Bl * G, L), tok.pad_token_id, dtype=torch.long); attn = torch.zeros((Bl * G, L), dtype=torch.long)
+        old_lp = torch.zeros((Bl * G, L - p_len)); known = torch.zeros((Bl * G, L - p_len), dtype=torch.bool)
+        for i, g in enumerate(gen_ids):
+            ids[i, :p_len] = prompt.cpu(); ids[i, p_len : p_len + len(g)] = torch.tensor(g); attn[i, : p_len + len(g)] = 1
+            old_lp[i, : len(g)] = -2.5; known[i, : len(g)] = True
+        torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); t_u = time.time()
+        st = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb)
+        torch.cuda.synchronize(); t_u = time.time() - t_u
+        row = {"rollouts_per_rank": Bl * G, "score_s": t_s, "update_s": t_u, "ref_s": st["t_ref"], "fwd_bwd_s": st["t_fb"], "sync_s": st["t_sync"],
+               "peak_gb": torch.cuda.max_memory_allocated() / 2**30, "len_mean": float(lens.mean()), "L": L}
+        rows.append(row)
+        _log(tag, f"{Bl * G} rollouts/rank (L={L}): score {t_s:.1f}s | update {t_u:.1f}s (ref {st['t_ref']:.1f} fb {st['t_fb']:.1f} sync {st['t_sync']:.1f}) "
+                  f"| peak {row['peak_gb']:.0f} GB")
+        out["rows"] = rows
+        json.dump(out, open(f"{a.work_dir}/bench_trainer_r{rank}.json", "w"), indent=1)
+    if world > 1:
+        dist.barrier(); dist.destroy_process_group()
+    _log(tag, "bench done")
+
+
+# ==============================================================================================
+# LAUNCHER
+# ==============================================================================================
+def _n_gpus():
+    try:
+        out = subprocess.check_output(["nvidia-smi", "-L"], text=True)
+        return sum(1 for l in out.splitlines() if l.startswith("GPU "))
+    except Exception:  # noqa
+        return 0
+
+
+def run_launch(a, argv):
+    n = _n_gpus()
+    X, Y = a.n_rollout, a.n_trainer
+    bench = a.role == "bench"
+    assert X + Y == n, f"n_rollout + n_trainer = {X + Y} but the container has {n} GPUs"
+    work = a.work_dir
+    if os.path.isdir(work):
+        shutil.rmtree(work, ignore_errors=True)
+    for d in ("lora", "queue"):
+        os.makedirs(f"{work}/{d}", exist_ok=True)
+    base_env = os.environ.copy()
+    for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
+        base_env.pop(k, None)
+    procs = []
+
+    def spawn(role, gpu, rank, world):
+        env = dict(base_env, CUDA_VISIBLE_DEVICES=str(gpu), DISAGG_RANK=str(rank), DISAGG_WORLD=str(world))
+        child_argv = [x for x in argv]
+        child_argv[child_argv.index("--role") + 1] = role
+        tagp = {"trainer": "T", "rollout": "R", "bench-rollout": "B", "bench-trainer": "BT"}[role] + str(rank)
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + child_argv, env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        procs.append((tagp, role, p))
+
+        def pump():
+            for line in p.stdout:
+                sys.stdout.write(f"[{tagp}] {line}"); sys.stdout.flush()
+        threading.Thread(target=pump, daemon=True).start()
+        return p
+
+    if bench:   # trainer bench on GPUs [0,Y) and rollout bench on [Y,N), concurrently, independent
+        for k in range(Y):
+            spawn("bench-trainer", k, k, Y)
+        for r in range(X):
+            spawn("bench-rollout", Y + r, r, X)
+    else:
+        for k in range(Y):
+            spawn("trainer", k, k, Y)
+        for r in range(X):
+            spawn("rollout", Y + r, r, X)
+    print(f"[launch] {len(procs)} processes on {n} GPUs: {[(t, role) for t, role, _ in procs]}", flush=True)
+    rc = 0
+    try:
+        while True:
+            alive = [(t, role, p) for t, role, p in procs if p.poll() is None]
+            dead = [(t, role, p) for t, role, p in procs if p.poll() is not None]
+            for t, role, p in dead:
+                if p.returncode != 0 and (role != "rollout" or not _stop_requested(work)):
+                    if bench:   # benches are independent: let the others finish, report the failure at the end
+                        if getattr(p, "_reported", False) is False:
+                            print(f"[launch] {t} ({role}) exited rc={p.returncode}", flush=True); p._reported = True
+                        rc = rc or p.returncode
+                    else:
+                        print(f"[launch] {t} ({role}) exited rc={p.returncode} -> aborting", flush=True); rc = p.returncode
+            if rc and not bench:
+                break
+            if bench:
+                if not alive:
+                    break
+            else:
+                if not [x for x in alive if x[1] == "trainer"]:
+                    _atomic_write_text(f"{work}/STOP", "trainers exited")
+                    t_end = time.time()
+                    while any(p.poll() is None for _, _, p in procs) and time.time() - t_end < 60:
+                        time.sleep(1)
+                    break
+            time.sleep(2)
+    finally:
+        for t, role, p in procs:
+            if p.poll() is None:
+                p.terminate()
+        time.sleep(5)
+        for t, role, p in procs:
+            if p.poll() is None:
+                p.kill()
+    print(f"[launch] done rc={rc}", flush=True)
+    return rc
+
+
+def main():
+    argv = sys.argv[1:]
+    a = parse_args(argv)
+    if a.role in ("launch", "bench"):
+        sys.exit(run_launch(a, argv))
+    if a.role == "trainer":
+        run_trainer(a)
+    elif a.role == "rollout":
+        run_rollout(a)
+    elif a.role == "bench-rollout":
+        run_bench_rollout(a)
+    elif a.role == "bench-trainer":
+        run_bench_trainer(a)
+
+
+if __name__ == "__main__":
+    main()
