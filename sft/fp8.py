@@ -50,7 +50,7 @@ from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
 MIN_DIM = 1024                                  # both in/out features must be >= this (and multiples of 16)
 EXCLUDE_FQN = ("lora_", "lm_head", "embed")     # substrings of the module FQN that are never converted
 DEFAULT_RECIPE = "rowwise"
-RECOMPILE_LIMIT = 64                            # torch._dynamo recompile_limit floor once fp8 layers exist (see convert)
+RECOMPILE_LIMIT = 256                           # torch._dynamo recompile_limit floor once fp8 layers exist (see convert)
 
 
 @torch._dynamo.allow_in_graph
@@ -195,8 +195,11 @@ def convert_frozen_base_to_fp8(model, recipe=None, emulate=False, verbose=True):
     # 1.19 ms vs compiled fp8 0.51 ms vs bf16 0.70 ms). Dynamo's default recompile_limit (8) is exceeded by transformers'
     # per-layer cache guards (`cache_params.layers[i].device is None` -- Qwen3.5 builds a DynamicCache in every training
     # forward unless use_cache=False is passed) and by the decoder-layer mask-rank guard, after which those frames silently
-    # fall back to eager. Passing use_cache=False in the training forward removes the cache guards; this is the belt.
-    for name in ("recompile_limit", "cache_size_limit"):  # 2.10 name / pre-2.10 alias (both still honoured)
+    # fall back to eager. With the cache present the GatedDeltaNet forward needs one entry per (layer, padded length):
+    # 48 x 3 = 144 for pretrain.py's 64/128/192 buckets (measured: limit 64 still tripped in the smoke run), hence 256.
+    # Passing use_cache=False in the training forward removes the per-layer guards entirely (3 entries); this is the belt.
+    for name in ("recompile_limit", "cache_size_limit",  # 2.10 name / pre-2.10 alias (both still honoured)
+                 "accumulated_recompile_limit", "accumulated_cache_size_limit"):  # total across all `self` of one code object
         if getattr(torch._dynamo.config, name, RECOMPILE_LIMIT) < RECOMPILE_LIMIT:
             setattr(torch._dynamo.config, name, RECOMPILE_LIMIT)
     if verbose:
