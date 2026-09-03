@@ -320,8 +320,11 @@ def main():
                     loss_sum = 0.0; n_real = prefix_cache.prefix_len
                     for k in range(a.prefix_accum):
                         sl = slice(k * mb, (k + 1) * mb)
-                        o = prefix_cache.forward(vmat[sl], targets[sl], autocast=ac, prefix_cache=cache0)
-                        (o.loss * (o.n_target_tokens / n_tot)).backward(retain_graph=k < a.prefix_accum - 1)
+                        last = k == a.prefix_accum - 1
+                        # DDP: all-reduce only on the last micro-batch (no_sync must wrap the forward too)
+                        with (ddp.no_sync() if (world > 1 and not last) else contextlib.nullcontext()):
+                            o = prefix_cache.forward(vmat[sl], targets[sl], autocast=ac, prefix_cache=cache0)
+                            (o.loss * (o.n_target_tokens / n_tot)).backward(retain_graph=not last)
                         loss_sum += o.loss.item() * o.n_target_tokens / n_tot
                         n_real += int(o.suffix_mask.sum())
                         del o
