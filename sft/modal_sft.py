@@ -78,6 +78,7 @@ image = (
     .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/SL/prefix_cache.py")   # --prefix-cache sibling import
     .add_local_file(REPO / "sft" / "fp8.py", "/pmx/SL/fp8.py")            # --fp8-base (imported by pretrain.py)
     .add_local_file(REPO / "sft" / "fp8_eval.py", "/pmx/SL/fp8_eval.py")  # fp8 speed/fidelity harness (fp8_eval fn)
+    .add_local_file(REPO / "sft" / "fp8_microbench.py", "/pmx/SL/fp8_microbench.py")  # fp8 GEMM/layer/profile bench
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 
@@ -358,30 +359,35 @@ def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: 
     ],
     timeout=3 * 3600,
 )
-def fp8_eval(data_dir: str, n_records: int = 6400, extra_args: str = ""):
+def fp8_eval(data_dir: str, n_records: int = 6400, extra_args: str = "", script: str = "SL/fp8_eval.py"):
     """1 GPU: sft/fp8_eval.py -- bf16 vs --fp8-base speed (meter TFLOP/s, examples/s, peak mem), same-weights logit
     KL / top-1, and N-step loss curves from one LoRA init on one batch order. Tiny bank = first n_records (the harness
     needs train-steps*batch + kl batches). extra_args are appended (e.g. "--train-steps 300 --bench-batch-sizes 16,32").
+    script=SL/fp8_microbench.py runs the GEMM/layer/profiler microbenchmark instead (no bank; synthetic tokens).
     Result JSON is printed and copied to /data/sft_mix/_fp8_eval/<utc>.json."""
     import os
     import shutil
     import time
 
-    if not data_dir.startswith("/"):
-        data_dir = f"/data/{data_dir}"
-    _, local_bank, _ = _preflight("smoke", data_dir, n_ckpts=2, resume_from="")
-    tiny = "/root/bank_fp8eval"
-    if not os.path.exists(tiny):
-        os.makedirs(tiny)
-        with open(f"{local_bank}/records.jsonl") as fin, open(f"{tiny}/records.jsonl", "w") as fout:
-            for i, line in enumerate(fin):
-                if i >= n_records:
-                    break
-                fout.write(line)
-        shutil.copy(f"{local_bank}/vecs.f32", f"{tiny}/vecs.f32")
-    print(f"[modal-fp8-eval] tiny bank: first {n_records} records", flush=True)
     out = "/tmp/fp8_eval.json"
-    cmd = ["python", "SL/fp8_eval.py", "--data-dir", tiny, "--out", out]
+    if script.endswith("fp8_microbench.py"):
+        os.environ["HF_HOME"] = "/data/hf_cache"  # --profile-model loads the (already cached) base model
+        cmd = ["python", script, "--out", out]
+    else:
+        if not data_dir.startswith("/"):
+            data_dir = f"/data/{data_dir}"
+        _, local_bank, _ = _preflight("smoke", data_dir, n_ckpts=2, resume_from="")
+        tiny = "/root/bank_fp8eval"
+        if not os.path.exists(tiny):
+            os.makedirs(tiny)
+            with open(f"{local_bank}/records.jsonl") as fin, open(f"{tiny}/records.jsonl", "w") as fout:
+                for i, line in enumerate(fin):
+                    if i >= n_records:
+                        break
+                    fout.write(line)
+            shutil.copy(f"{local_bank}/vecs.f32", f"{tiny}/vecs.f32")
+        print(f"[modal-fp8-eval] tiny bank: first {n_records} records", flush=True)
+        cmd = ["python", script, "--data-dir", tiny, "--out", out]
     if extra_args:
         cmd += extra_args.split()
     rc = _stream(cmd, _train_env("nccl"), "modal-fp8-eval")
@@ -533,8 +539,9 @@ def run_prewarm():
 
 
 @app.local_entrypoint()
-def run_fp8_eval(data_dir: str, n_records: int = 6400, extra_args: str = ""):
-    fp8_eval.remote(data_dir=data_dir, n_records=n_records, extra_args=extra_args)
+def run_fp8_eval(data_dir: str = "banks/last5_rp", n_records: int = 6400, extra_args: str = "",
+                 script: str = "SL/fp8_eval.py"):
+    fp8_eval.remote(data_dir=data_dir, n_records=n_records, extra_args=extra_args, script=script)
 
 
 @app.local_entrypoint()

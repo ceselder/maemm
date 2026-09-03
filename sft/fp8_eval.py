@@ -57,7 +57,15 @@ def main():
     ap.add_argument("--no-autocast-bf16", action="store_true")
     ap.add_argument("--no-fp8", action="store_true", help="bf16 phase only")
     ap.add_argument("--skip-train", action="store_true")
+    ap.add_argument("--use-cache-false", action="store_true",
+                    help="pass use_cache=False to the model forward (pretrain.py's padded path does NOT today, so HF builds a "
+                         "DynamicCache every training step: per-layer guards -> Dynamo recompile_limit -> eager fallback)")
+    ap.add_argument("--recompile-limit", type=int, default=0,
+                    help=">0: torch._dynamo.config.recompile_limit for BOTH phases (fp8.py raises it to 64 on its own)")
     a = ap.parse_args()
+    if a.recompile_limit:
+        torch._dynamo.config.recompile_limit = a.recompile_limit
+        torch._dynamo.config.cache_size_limit = a.recompile_limit
     compile_on, autocast_on = not a.no_compile, not a.no_autocast_bf16
     bench_sizes = [int(x) for x in a.bench_batch_sizes.split(",") if x.strip()]
     device = "cuda:0"
@@ -142,8 +150,9 @@ def main():
     def forward(batch):
         input_ids, attn, labels, vmat, n_real = collate(batch)
         injector.set_vectors(vmat)
+        kw = {"use_cache": False} if a.use_cache_false else {}
         with autocast_region(model, autocast_on):
-            out = model(input_ids=input_ids, attention_mask=attn, labels=labels)
+            out = model(input_ids=input_ids, attention_mask=attn, labels=labels, **kw)
         return out, labels, n_real
 
     def train_step(opt, sched, batch):

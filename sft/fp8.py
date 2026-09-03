@@ -50,6 +50,7 @@ from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
 MIN_DIM = 1024                                  # both in/out features must be >= this (and multiples of 16)
 EXCLUDE_FQN = ("lora_", "lm_head", "embed")     # substrings of the module FQN that are never converted
 DEFAULT_RECIPE = "rowwise"
+RECOMPILE_LIMIT = 64                            # torch._dynamo recompile_limit floor once fp8 layers exist (see convert)
 
 
 @torch._dynamo.allow_in_graph
@@ -189,6 +190,15 @@ def convert_frozen_base_to_fp8(model, recipe=None, emulate=False, verbose=True):
     swap_linear_layers(model, lambda m: FrozenBaseFloat8Linear.from_frozen(m, config), module_filter_fn=filt)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()  # the bf16 masters of converted layers are gone; return their blocks to the allocator
+    # fp8 must never run in eager: the unfused cast (to(fp32) * scale -> clamp -> to(fp8)) + post-scale is ~5 ATen passes
+    # over every activation and grad_output, ~2x SLOWER than a bf16 layer (B200, 5120->17408, M=3072 fwd+bwd: eager fp8
+    # 1.19 ms vs compiled fp8 0.51 ms vs bf16 0.70 ms). Dynamo's default recompile_limit (8) is exceeded by transformers'
+    # per-layer cache guards (`cache_params.layers[i].device is None` -- Qwen3.5 builds a DynamicCache in every training
+    # forward unless use_cache=False is passed) and by the decoder-layer mask-rank guard, after which those frames silently
+    # fall back to eager. Passing use_cache=False in the training forward removes the cache guards; this is the belt.
+    for name in ("recompile_limit", "cache_size_limit"):  # 2.10 name / pre-2.10 alias (both still honoured)
+        if getattr(torch._dynamo.config, name, RECOMPILE_LIMIT) < RECOMPILE_LIMIT:
+            setattr(torch._dynamo.config, name, RECOMPILE_LIMIT)
     if verbose:
         print(f"[fp8] recipe={recipe} converted {summary['converted']} frozen linears "
               f"({summary['params_fp8'] / 1e9:.2f}B params) to fp8; skipped {summary['skipped']}; "
