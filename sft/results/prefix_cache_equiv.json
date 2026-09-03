@@ -1,0 +1,106 @@
+{
+  "source": "reconstructed from /tmp/pfx_logs/equiv_run1.log (client-side unpickle of the return value failed: TorchVersion; fixed afterwards)",
+  "runs": {
+    "autocast_bf16=off": {
+      "loss_naive": 14.221162,
+      "loss_cached": 14.22084,
+      "loss_abs_diff": 0.000322,
+      "control_loss_abs_diff": 0.000933,
+      "logits": {
+        "max_abs": 0.4375,
+        "mean_abs": 0.023339,
+        "max_rel_to_scale": 0.015152,
+        "logprob_max_abs": 0.416311,
+        "logprob_mean_abs": 0.026551,
+        "argmax_agree": 0.99495,
+        "n_positions": 198
+      },
+      "control_logits": {
+        "max_abs": 0.28125,
+        "mean_abs": 0.020526,
+        "max_rel_to_scale": 0.00974,
+        "logprob_max_abs": 0.5,
+        "logprob_mean_abs": 0.02492,
+        "argmax_agree": 1.0,
+        "n_positions": 198
+      },
+      "grads": {
+        "cosine": 0.999307,
+        "rel_l2": 0.037285,
+        "max_abs": 0.002771,
+        "norm_ref": 8.150492,
+        "norm_other": 8.163862
+      },
+      "control_grads": {
+        "cosine": 0.99961,
+        "rel_l2": 0.027938,
+        "max_abs": 0.003088,
+        "norm_ref": 8.150492,
+        "norm_other": 8.14833
+      }
+    },
+    "autocast_bf16=on": {
+      "loss_naive": 14.220427,
+      "loss_cached": 14.222775,
+      "loss_abs_diff": 0.00235,
+      "control_loss_abs_diff": 0.00111,
+      "logits": {
+        "max_abs": 0.34375,
+        "mean_abs": 0.023279,
+        "max_rel_to_scale": 0.011957,
+        "logprob_max_abs": 0.453125,
+        "logprob_mean_abs": 0.027024,
+        "argmax_agree": 0.984848,
+        "n_positions": 198
+      },
+      "control_logits": {
+        "max_abs": 0.351562,
+        "mean_abs": 0.022358,
+        "max_rel_to_scale": 0.012228,
+        "logprob_max_abs": 0.462034,
+        "logprob_mean_abs": 0.026804,
+        "argmax_agree": 1.0,
+        "n_positions": 198
+      },
+      "grads": {
+        "cosine": 0.999398,
+        "rel_l2": 0.034685,
+        "max_abs": 0.002914,
+        "norm_ref": 8.151658,
+        "norm_other": 8.143005
+      },
+      "control_grads": {
+        "cosine": 0.9993,
+        "rel_l2": 0.037414,
+        "max_abs": 0.004211,
+        "norm_ref": 8.151658,
+        "norm_other": 8.151317
+      }
+    }
+  },
+  "seed": 0,
+  "env": {
+    "gpu": "NVIDIA B200",
+    "torch": "2.10.0+cu128",
+    "transformers": "5.15.0",
+    "transformers_fork": true,
+    "peft": "0.20.0",
+    "fla": "0.5.2",
+    "triton": "3.6.0",
+    "tf_spec": "transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
+  },
+  "prompt_len": 103,
+  "marker": 102,
+  "trainable_params_M": 466.9,
+  "batch": 8,
+  "target_lens": [
+    23,
+    19,
+    30,
+    23,
+    21,
+    18,
+    32,
+    24
+  ]
+}
