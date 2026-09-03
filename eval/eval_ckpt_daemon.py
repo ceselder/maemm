@@ -238,6 +238,7 @@ def main():
             log(f"pending {todo} -> evaluating LATEST step {s} first")
         t1 = time.time()
         name = f"ck{s}"
+        log(f"evaluating step {s} ({ck})")   # the launcher pauses volume reloads while an eval is in progress
         try:
             actor.load_adapter(ck, adapter_name=name)
             actor.set_adapter(name)
