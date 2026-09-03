@@ -46,6 +46,22 @@ _LAYER_DICT_ATTRS = ("conv_states", "recurrent_states", "is_conv_states_initiali
                      "is_recurrent_states_initialized", "has_previous_state", "conv_kernel_size")
 
 
+def compile_mlp_blocks(model, dynamic=True):
+    """Regional torch.compile: only each decoder layer's MLP (3 LoRA linears + SiLU-mul) -- no cache objects cross the
+    compiled boundary, so Dynamo does not recompile per step (whole-forward compile does: see the report). Returns a
+    zero-arg undo callable. Both the prefix and the suffix forward benefit (the eager step is launch-bound)."""
+    base = unwrap_base(model)
+    layers = base.model.layers
+    originals = [layer.mlp for layer in layers]
+    for layer in layers:
+        layer.mlp = torch.compile(layer.mlp, dynamic=dynamic)
+
+    def undo():
+        for layer, mlp in zip(layers, originals):
+            layer.mlp = mlp
+    return undo
+
+
 def expand_cache_copy(cache, repeats):
     """A NEW cache whose per-layer tensors are ``cache``'s repeated ``repeats`` times along the batch dim; ``cache``
     itself is left untouched (so one prefix cache can feed several micro-batches -- grad accumulation). Shallow copies
@@ -86,7 +102,7 @@ class PrefixCache:
     """Shared-prefix forward for a fixed prompt. Construct once (prompt is fixed), call ``forward`` per micro-batch."""
 
     def __init__(self, model, prompt_ids, marker, pad_id, inject_module, coeff, device,
-                 inject_dtype=torch.bfloat16, inject_mode="add", pad_multiple=16, prefix_model=None,
+                 inject_dtype=torch.bfloat16, inject_mode="add", pad_multiple=8, prefix_model=None,
                  persistent_injector=None, compile_prefix=None):
         """
         model: the model to run (PEFT-wrapped, possibly DDP-wrapped) -- used for the SUFFIX forward.

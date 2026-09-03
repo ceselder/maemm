@@ -61,7 +61,7 @@ ADAPTER = "/data/sft_mix/last5_rp/final"
 # ----------------------------------------------------------------------------------------------------------------
 # container-side helpers
 # ----------------------------------------------------------------------------------------------------------------
-def _load(adapter: str, fresh_lora: bool):
+def _load(adapter: str, fresh_lora: bool, dtype: str = "bfloat16"):
     import sys
     import torch
     from peft import LoraConfig, PeftModel, get_peft_model
@@ -74,7 +74,7 @@ def _load(adapter: str, fresh_lora: bool):
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa",
+    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=getattr(torch, dtype), attn_implementation="sdpa",
                                                  device_map={"": "cuda:0"})
     model.enable_input_require_grads()
     if fresh_lora or not os.path.exists(adapter):
@@ -122,7 +122,7 @@ def _random_batch(gen, B, d_model, vocab, min_tgt, max_tgt, eos):
 
 
 def _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast_on, device, max_seq=192, use_cache=None,
-                   injector=None, fwd=None):
+                   injector=None, fwd=None, inject_dtype=None):
     """Exactly sft/pretrain.py's per-example padded path (L rounded to 64, <= max_seq; hook at the absolute marker).
     ``injector``/``fwd``: pretrain.py's --compile variant (FixedPositionInjector registered once + compiled forward)."""
     import contextlib
@@ -144,7 +144,7 @@ def _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast
     if injector is not None:
         injector.set_vectors(torch.as_tensor(vecs).to(device, injector.vectors.dtype)); hook_cm = contextlib.nullcontext()
     else:
-        hook = make_inject_hook([v[None] for v in vecs], [[marker]] * B, STEER_COEFF, device, torch.bfloat16)
+        hook = make_inject_hook([v[None] for v in vecs], [[marker]] * B, STEER_COEFF, device, inject_dtype or torch.bfloat16)
         hook_cm = hooked(submodule, hook)
     kw = {} if use_cache is None else {"use_cache": use_cache}
     call = fwd if fwd is not None else model
@@ -183,7 +183,9 @@ def _cmp_grads(g1, g2):
 # ----------------------------------------------------------------------------------------------------------------
 @app.function(image=image, gpu=GPU, volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=5400)
 def equiv_remote(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt: int = 8, max_tgt: int = 32,
-                 fresh_lora: bool = False, stock_demo: bool = False, compile_prefix: str = ""):
+                 fresh_lora: bool = False, stock_demo: bool = False, compile_prefix: str = "", dtype: str = "bfloat16"):
+    """dtype="float32": whole model in fp32 (fits one B200 at small batch) -- without bf16 rounding the naive and cached
+    paths must agree to ~1e-5 relative, which separates 'exact algorithm + bf16 noise' from a real bug."""
     import sys
     import time
     import torch
@@ -200,9 +202,10 @@ def equiv_remote(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt:
         pcmod.check_transformers = lambda: None
 
     t0 = time.time()
-    tok, model = _load(adapter, fresh_lora)
-    print(f"[load] {time.time() - t0:.0f}s", flush=True)
+    tok, model = _load(adapter, fresh_lora, dtype)
+    print(f"[load] {time.time() - t0:.0f}s dtype={dtype}", flush=True)
     device = "cuda:0"
+    tdtype = getattr(torch, dtype)
     prompt_ids, mpos = build_prompt_ids(tok)
     marker = mpos[0]
     print(f"[prompt] len={len(prompt_ids)} marker={marker} tail_after_marker={len(prompt_ids) - marker - 1}", flush=True)
@@ -214,19 +217,22 @@ def equiv_remote(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt:
     gen = torch.Generator().manual_seed(seed)
     vecs, targets = _random_batch(gen, batch, D_MODEL, tok.vocab_size, min_tgt, max_tgt, tok.eos_token_id)
     print(f"[batch] B={batch} target lens {[len(t) for t in targets]}", flush=True)
-    results = {"env": env, "prompt_len": len(prompt_ids), "marker": marker, "batch": batch, "seed": seed,
+    results = {"env": env, "prompt_len": len(prompt_ids), "marker": marker, "batch": batch, "seed": seed, "dtype": dtype,
                "target_lens": [len(t) for t in targets], "trainable_params": n_train, "runs": {}}
 
-    pc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device)
+    pc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device, inject_dtype=tdtype)
     suffix_lens = [len(pc.suffix_prompt) + len(t) for t in targets]
+    if dtype == "float32":
+        compile_prefix = ""   # numerics test only
 
-    for autocast_on in (False, True):
-        tag = f"autocast_bf16={'on' if autocast_on else 'off'}"
+    for autocast_on in ((False,) if dtype == "float32" else (False, True)):
+        tag = f"autocast_bf16={'on' if autocast_on else 'off'}" + (f" dtype={dtype}" if dtype != "bfloat16" else "")
         r = {}
         # ---- naive (reference) ----
         model.zero_grad(set_to_none=True)
         torch.cuda.synchronize(); t0 = time.time()
-        out_n, labels_n = _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast_on, device)
+        out_n, labels_n = _naive_forward(model, prompt_ids, marker, vecs, targets, submodule, autocast_on, device,
+                                         inject_dtype=tdtype)
         out_n.loss.backward(); torch.cuda.synchronize()
         r["naive_time_s"] = time.time() - t0
         g_naive = _flat_grads(params)
@@ -312,7 +318,8 @@ def equiv_remote(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt:
         model.zero_grad(set_to_none=True)
         loss_ctrl = 0.0; ctrl_sel = []
         for lo, hi in ((0, half), (half, batch)):
-            out_h, labels_h = _naive_forward(model, prompt_ids, marker, vecs[lo:hi], targets[lo:hi], submodule, autocast_on, device)
+            out_h, labels_h = _naive_forward(model, prompt_ids, marker, vecs[lo:hi], targets[lo:hi], submodule, autocast_on, device,
+                                             inject_dtype=tdtype)
             n_h = int((labels_h != -100).sum())
             (out_h.loss * (n_h / N)).backward()
             loss_ctrl += out_h.loss.item() * n_h / N
@@ -336,10 +343,11 @@ def equiv_remote(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt:
 
 @app.local_entrypoint()
 def equiv(adapter: str = ADAPTER, batch: int = 8, seed: int = 0, min_tgt: int = 8, max_tgt: int = 32,
-          fresh_lora: bool = False, stock_demo: bool = False, compile_prefix: str = "", out: str = ""):
+          fresh_lora: bool = False, stock_demo: bool = False, compile_prefix: str = "", dtype: str = "bfloat16", out: str = ""):
     res = equiv_remote.remote(adapter=adapter, batch=batch, seed=seed, min_tgt=min_tgt, max_tgt=max_tgt,
-                              fresh_lora=fresh_lora, stock_demo=stock_demo, compile_prefix=compile_prefix)
-    path = Path(out) if out else REPO / "sft" / "results" / ("prefix_cache_equiv_stock.json" if stock_demo else "prefix_cache_equiv.json")
+                              fresh_lora=fresh_lora, stock_demo=stock_demo, compile_prefix=compile_prefix, dtype=dtype)
+    default_name = "prefix_cache_equiv_stock.json" if stock_demo else ("prefix_cache_equiv_fp32.json" if dtype == "float32" else "prefix_cache_equiv.json")
+    path = Path(out) if out else REPO / "sft" / "results" / default_name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(res, indent=2))
     print(f"\nwrote {path}")
@@ -402,18 +410,19 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
             handle.remove(); torch._dynamo.reset()
         return step, cleanup
 
-    def make_cached(B, use_compile, n_accum=1, compile_prefix=None):
+    def make_cached(B, use_compile, n_accum=1, compile_prefix=None, compile_mlp=False, pad_multiple=8):
         """n_accum > 1: ONE prefix per optimizer step shared by n_accum micro-batches of B (token-weighted losses, so
         the step equals a single mean-loss step over n_accum*B examples). compile_prefix: torch.compile the static
-        prefix call only."""
+        prefix call only. compile_mlp: regional torch.compile of the 64 MLP blocks (cache never enters a graph)."""
         inj = None
+        undo_mlp = pcmod.compile_mlp_blocks(model) if compile_mlp else None
         if use_compile:
             inj = FixedPositionInjector(B, D_MODEL, 0, STEER_COEFF, device, torch.bfloat16)
             handle = submodule.register_forward_hook(inj.hook)
             torch._dynamo.config.cache_size_limit = 64
             fwd = torch.compile(model.forward, dynamic=True)
         pc = pcmod.PrefixCache(model, prompt_ids, marker, tok.pad_token_id, submodule, STEER_COEFF, device,
-                               persistent_injector=inj, compile_prefix=compile_prefix)
+                               persistent_injector=inj, compile_prefix=compile_prefix, pad_multiple=pad_multiple)
         if use_compile:
             class _Wrap:  # route both forwards through the compiled function
                 def __call__(self, **kw):
@@ -445,7 +454,9 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
         def cleanup():
             if use_compile:
                 handle.remove()
-            if use_compile or compile_prefix:
+            if undo_mlp is not None:
+                undo_mlp()
+            if use_compile or compile_prefix or compile_mlp:
                 torch._dynamo.reset()
         return step, cleanup
 
@@ -467,8 +478,17 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
             torch.cuda.synchronize(); dt = time.time() - t0
             row.update({"examples_per_s": n_ex / dt, "target_tokens_per_s": n_tok / dt, "ms_per_step": 1000 * dt / steps,
                         "peak_mem_gb": torch.cuda.max_memory_allocated() / 2**30, "mean_seq_len": sum(seq) / len(seq)})
+            # diagnostic: the same steps with a device sync after each one (per-step distribution; also tells whether
+            # letting the CPU run ahead of the GPU helps or hurts this launch-heavy path)
+            per = []
+            for _ in range(steps):
+                ts = time.time(); fn(); torch.cuda.synchronize(); per.append(time.time() - ts)
+            per_s = sorted(per)
+            row.update({"ms_per_step_synced": 1000 * sum(per) / len(per), "ms_step_min": 1000 * per_s[0],
+                        "ms_step_median": 1000 * per_s[len(per) // 2], "ms_step_max": 1000 * per_s[-1]})
             print(f"[bench] {name:>14} mb={B:<4} {row['examples_per_s']:8.2f} ex/s  {row['target_tokens_per_s']:8.0f} tgt-tok/s  "
-                  f"{row['ms_per_step']:8.1f} ms/step  peak {row['peak_mem_gb']:.1f} GB  L={row['mean_seq_len']:.0f}  first {row['first_step_s']:.1f}s", flush=True)
+                  f"{row['ms_per_step']:8.1f} ms/step  peak {row['peak_mem_gb']:.1f} GB  L={row['mean_seq_len']:.0f}  first {row['first_step_s']:.1f}s  "
+                  f"| synced {row['ms_per_step_synced']:.0f} ms (min {row['ms_step_min']:.0f} / med {row['ms_step_median']:.0f} / max {row['ms_step_max']:.0f})", flush=True)
         except torch.OutOfMemoryError as e:
             row["error"] = f"OOM: {str(e)[:300]}"; print(f"[bench] {name} mb={B} OOM", flush=True)
             opt.zero_grad(); torch.cuda.empty_cache()
@@ -498,6 +518,10 @@ def bench_remote(adapter: str = ADAPTER, steps: int = 10, warmup: int = 3, seed:
             fn, cl = make_cached(B, False, n_acc, compile_prefix="default"); run_case(label, B * n_acc, fn, cl)
         elif kind == "cached_compile":
             fn, cl = make_cached(B, True, n_acc); run_case(label, B * n_acc, fn, cl)
+        elif kind == "cached_mlpcompile":
+            fn, cl = make_cached(B, False, n_acc, compile_mlp=True); run_case(label, B * n_acc, fn, cl)
+        elif kind == "cached_pad16":
+            fn, cl = make_cached(B, False, n_acc, pad_multiple=16); run_case(label, B * n_acc, fn, cl)
         else:
             raise ValueError(spec)
     if compile_:
