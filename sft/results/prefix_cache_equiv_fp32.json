@@ -1,0 +1,85 @@
+{
+  "env": {
+    "gpu": "NVIDIA B200",
+    "torch": "2.10.0+cu128",
+    "transformers": "5.15.0",
+    "transformers_fork": true,
+    "peft": "0.20.0",
+    "fla": "0.5.2",
+    "triton": "3.6.0",
+    "tf_spec": "transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
+  },
+  "prompt_len": 103,
+  "marker": 102,
+  "batch": 4,
+  "seed": 0,
+  "dtype": "float32",
+  "target_lens": [
+    23,
+    30,
+    31,
+    10
+  ],
+  "trainable_params": 466911232,
+  "runs": {
+    "autocast_bf16=off dtype=float32": {
+      "naive_time_s": 111.22715020179749,
+      "cached_time_s": 24.76134967803955,
+      "loss_naive": 13.992255210876465,
+      "loss_cached": 13.992159843444824,
+      "loss_abs_diff": 9.5367431640625e-05,
+      "logits": {
+        "max_abs": 0.011473655700683594,
+        "mean_abs": 0.0007137046195566654,
+        "max_rel_to_scale": 0.0004131032037548721,
+        "logprob_max_abs": 0.011862754821777344,
+        "logprob_mean_abs": 0.000724990211892873,
+        "argmax_agree": 1.0,
+        "n_positions": 98
+      },
+      "grads": {
+        "cosine": 0.9999986886978149,
+        "rel_l2": 0.001630214974284172,
+        "max_abs": 0.0010506490943953395,
+        "norm_ref": 9.405640602111816,
+        "norm_other": 9.405470848083496
+      },
+      "n_target_tokens": 94,
+      "suffix_len_padded": 32,
+      "accum_loss_abs_diff": 9.36122650792015e-05,
+      "accum_logits": {
+        "max_abs": 0.011595964431762695,
+        "mean_abs": 0.0007085378747433424,
+        "max_rel_to_scale": 0.00041750684613361955,
+        "logprob_max_abs": 0.011956214904785156,
+        "logprob_mean_abs": 0.0007451053825207055,
+        "argmax_agree": 1.0,
+        "n_positions": 98
+      },
+      "accum_grads": {
+        "cosine": 0.9999985694885254,
+        "rel_l2": 0.0017034356715157628,
+        "max_abs": 0.001031191204674542,
+        "norm_ref": 9.405640602111816,
+        "norm_other": 9.405611991882324
+      },
+      "control_loss_abs_diff": 8.256384666971428e-05,
+      "control_logits": {
+        "max_abs": 0.00435185432434082,
+        "mean_abs": 0.0002853384939953685,
+        "max_rel_to_scale": 0.0001566863211337477,
+        "logprob_max_abs": 0.006481170654296875,
+        "logprob_mean_abs": 0.0003236377378925681,
+        "argmax_agree": 1.0,
+        "n_positions": 98
+      },
+      "control_grads": {
+        "cosine": 0.9999997019767761,
+        "rel_l2": 0.0007303330348804593,
+        "max_abs": 0.00027397676603868604,
+        "norm_ref": 9.405640602111816,
+        "norm_other": 9.405241966247559
+      }
+    }
+  }
+}

@@ -91,6 +91,10 @@ class FixedPositionInjector(torch.nn.Module):
         if mode not in {"add", "replace"}:
             raise ValueError(f"unknown injection mode: {mode}")
         self.mode = mode
+        # ``active=False`` turns the hook into a no-op. Prefix-cache path (sft/prefix_cache.py): the hook is
+        # registered permanently for torch.compile but must not fire on the shared-prefix forward, only on the
+        # suffix forward whose index 0 is the marker. Plain Python bool -> a single Dynamo guard.
+        self.active = True
         self.register_buffer("vectors", torch.empty(max_batch, d_model, device=device, dtype=dtype),
                              persistent=False)
 
@@ -104,6 +108,8 @@ class FixedPositionInjector(torch.nn.Module):
         self.vectors[: len(vectors)].copy_(vectors)
 
     def hook(self, _module, _inputs, output):
+        if not self.active:
+            return output
         h = output[0] if isinstance(output, tuple) else output
         if h.shape[1] <= 1:
             return output

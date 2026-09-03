@@ -1,0 +1,238 @@
+"""Prefix-cached SFT forward: run the shared prompt prefix ONCE per micro-batch, expand its cache to the batch,
+and run only ``[marker] + prompt tail + target`` per example -- exact (gradients included) w.r.t. the naive
+full-sequence forward, modulo bf16 kernel noise.
+
+Why it is exact. Every SFT example is the same prompt (``mxf.prompts.build_prompt_ids``) followed by its target;
+the direction is injected at the marker token's residual at ``INJECT_LAYER``. Everything strictly BEFORE the marker
+is identical across examples and -- causality -- unaffected by the injection, so its forward (and the backward
+through it) can be shared. For Qwen3.5/3.6's hybrid stack that means: the attention layers' K/V for the prefix,
+and for the gated-delta-net layers the last ``conv_kernel_size`` conv inputs plus the recurrent state at the end
+of the prefix. transformers' ``DynamicCache`` already carries exactly those (see ``LinearAttentionLayer``), and the
+GDN layer already honours them for a multi-token continuation (conv gets ``cat(conv_state, new)`` and the chunk
+kernel gets ``initial_state``). What stock transformers (5.15.0) does NOT support is doing this under autograd:
+the cache writes are in-place ``copy_`` into buffers that FLA's chunk kernel has saved for backward (version-counter
+error), and the linear-attention layers have no batch expansion. Both are fixed in the fork this module requires:
+
+    pip install git+https://github.com/ceselder/transformers@maemm-prefix-cache
+
+(``PrefixCache.check_transformers`` refuses to run on stock transformers.)
+
+Usage (mirrors sft/pretrain.py's per-example path)::
+
+    pc = PrefixCache(model, prompt_ids, marker, tok.pad_token_id, get_layer(model, INJECT_LAYER), STEER_COEFF, device)
+    out = pc.forward(vecs, targets, autocast=lambda: autocast_region(model, a.autocast_bf16))
+    out.loss.backward()
+
+``vecs``: [B, d] direction rows (any float dtype, CPU or GPU); ``targets``: list of B token-id lists (already
+including EOS if you want it, exactly what ``build_sft_ids`` appends). ``out.loss`` is HF's ForCausalLM loss --
+mean over target tokens (labels -100 on marker/tail/pad) -- so it matches the naive ``model(..., labels=...).loss``.
+"""
+import contextlib
+import copy
+from types import SimpleNamespace
+
+import torch
+
+from mxf.inject import hooked, make_inject_hook
+
+
+def unwrap_base(model):
+    """HF base model through DDP + PEFT wrappers."""
+    m = model.module if hasattr(model, "module") else model
+    return m.get_base_model() if hasattr(m, "get_base_model") else m
+
+
+_LAYER_DICT_ATTRS = ("conv_states", "recurrent_states", "is_conv_states_initialized",
+                     "is_recurrent_states_initialized", "has_previous_state", "conv_kernel_size")
+
+
+def compile_mlp_blocks(model, dynamic=True):
+    """Regional torch.compile: only each decoder layer's MLP (3 LoRA linears + SiLU-mul) -- no cache objects cross the
+    compiled boundary, so Dynamo does not recompile per step (whole-forward compile does). Returns a zero-arg undo
+    callable. MEASURED (B200, mb64): no speed gain (62.5 vs 62.4 ex/s), -5 GB peak -- the launch-bound part of the step
+    is not in the MLPs. Kept for the bench (test_prefix_cache.py cached_mlpcompile); not wired into pretrain.py.
+    Note: a compiled backward + retain_graph=True (shared-prefix accumulation) fails with 'donated buffers' unless
+    torch._functorch.config.donated_buffer=False."""
+    base = unwrap_base(model)
+    layers = base.model.layers
+    originals = [layer.mlp for layer in layers]
+    for layer in layers:
+        layer.mlp = torch.compile(layer.mlp, dynamic=dynamic)
+
+    def undo():
+        for layer, mlp in zip(layers, originals):
+            layer.mlp = mlp
+    return undo
+
+
+def expand_cache_copy(cache, repeats):
+    """A NEW cache whose per-layer tensors are ``cache``'s repeated ``repeats`` times along the batch dim; ``cache``
+    itself is left untouched (so one prefix cache can feed several micro-batches -- grad accumulation). Shallow copies
+    of the Cache and its layer objects (+ their state dicts); tensors are shared until ``batch_repeat_interleave``
+    replaces them out-of-place, so autograd still points back at the single prefix forward."""
+    new = copy.copy(cache)
+    new.layers = []
+    for layer in cache.layers:
+        l2 = copy.copy(layer)
+        for attr in _LAYER_DICT_ATTRS:
+            if hasattr(l2, attr):
+                setattr(l2, attr, dict(getattr(l2, attr)))
+        new.layers.append(l2)
+    new.batch_repeat_interleave(repeats)
+    return new
+
+
+def check_transformers():
+    """Refuse stock transformers: it lacks the autograd-safe linear-attention cache writes + batch expansion."""
+    import transformers
+    from transformers import cache_utils
+
+    layer_cls = getattr(cache_utils, "LinearAttentionLayer", None)
+    ok = (
+        layer_cls is not None
+        and hasattr(layer_cls, "batch_repeat_interleave")
+        and hasattr(cache_utils, "_write_cached_state")
+    )
+    if not ok:
+        raise RuntimeError(
+            f"transformers {transformers.__version__} at {transformers.__file__} is not the prefix-cache fork: "
+            "install `pip install git+https://github.com/ceselder/transformers@maemm-prefix-cache` "
+            "(autograd-safe LinearAttentionLayer state writes + batch_repeat_interleave)."
+        )
+
+
+class PrefixCache:
+    """Shared-prefix forward for a fixed prompt. Construct once (prompt is fixed), call ``forward`` per micro-batch."""
+
+    def __init__(self, model, prompt_ids, marker, pad_id, inject_module, coeff, device,
+                 inject_dtype=torch.bfloat16, inject_mode="add", pad_multiple=8, prefix_model=None,
+                 persistent_injector=None, compile_prefix=None):
+        """
+        model: the model to run (PEFT-wrapped, possibly DDP-wrapped) -- used for the SUFFIX forward.
+        prefix_model: module used for the PREFIX forward. Under DDP pass the unwrapped ``ddp.module`` so DDP's reducer
+            is primed by exactly one forward (the suffix) per backward; defaults to ``model``.
+        prompt_ids / marker: from ``build_prompt_ids(tok)`` -> (prompt_ids, mpos); marker = mpos[0].
+        inject_module: ``get_layer(model, INJECT_LAYER)``; coeff: STEER_COEFF.
+        persistent_injector: optional ``mxf.inject.FixedPositionInjector(position=0, ...)`` whose ``.hook`` the
+            caller registered on ``inject_module`` (torch.compile path: no per-step Python hook). It is switched
+            ``active=False`` for the prefix forward and ``True`` for the suffix forward.
+        compile_prefix: None | "default" | "reduce-overhead" -- torch.compile ONLY the prefix call (fully static
+            shape [1, prefix_len]; the eager 64-layer PEFT forward+backward at batch 1 is launch/Python-bound).
+            The suffix forward stays eager (its cache inputs make Dynamo recompile endlessly).
+        """
+        check_transformers()
+        if not (0 < marker < len(prompt_ids)):
+            raise ValueError(f"marker {marker} must be inside the prompt (len {len(prompt_ids)}) and not at 0")
+        if persistent_injector is not None and persistent_injector.position != 0:
+            raise ValueError("persistent_injector.position must be 0 (the marker is suffix index 0)")
+        self.model = model
+        self.prefix_model = prefix_model if prefix_model is not None else model
+        self.prefix_ids = list(prompt_ids[:marker])          # shared, injection-free
+        self.suffix_prompt = list(prompt_ids[marker:])       # [marker] + tail (tail is empty for the current prompt)
+        self.pad_id = pad_id
+        self.inject_module = inject_module
+        self.coeff = coeff
+        self.device = device
+        self.inject_dtype = inject_dtype
+        self.inject_mode = inject_mode
+        self.pad_multiple = pad_multiple
+        self.persistent_injector = persistent_injector
+        self._prefix_tensor = torch.tensor(self.prefix_ids, dtype=torch.long, device=device)[None]
+        self.compile_prefix = compile_prefix
+        if compile_prefix:
+            fwd = self.prefix_model.forward if hasattr(self.prefix_model, "forward") else self.prefix_model
+            self._prefix_fn = torch.compile(fwd, mode=None if compile_prefix == "default" else compile_prefix, dynamic=False)
+        else:
+            self._prefix_fn = self.prefix_model
+
+    @property
+    def prefix_len(self):
+        return len(self.prefix_ids)
+
+    def build_suffix(self, targets, max_len=None):
+        """Right-padded suffix batch. Returns (input_ids [B,L], labels [B,L], suffix_mask [B,L] bool, L)."""
+        rows = [self.suffix_prompt + list(t) for t in targets]
+        if max_len is not None:
+            rows = [r[:max_len] for r in rows]
+        L = max(len(r) for r in rows)
+        L = ((L + self.pad_multiple - 1) // self.pad_multiple) * self.pad_multiple
+        B = len(rows)
+        ids = torch.full((B, L), self.pad_id, dtype=torch.long)
+        labels = torch.full((B, L), -100, dtype=torch.long)
+        mask = torch.zeros((B, L), dtype=torch.bool)
+        n_prompt = len(self.suffix_prompt)
+        for i, r in enumerate(rows):
+            ids[i, : len(r)] = torch.tensor(r)
+            mask[i, : len(r)] = True
+            if len(r) > n_prompt:
+                labels[i, n_prompt : len(r)] = torch.tensor(r[n_prompt:])
+        return ids, labels, mask, L
+
+    def run_prefix(self, autocast=contextlib.nullcontext):
+        """One forward over the shared prefix with grad enabled; returns the (batch-1) cache."""
+        inj = self.persistent_injector
+        if inj is not None:
+            inj.active = False
+        try:
+            with autocast():
+                out = self._prefix_fn(input_ids=self._prefix_tensor, use_cache=True, logits_to_keep=1)
+        finally:
+            if inj is not None:
+                inj.active = True
+        cache = out.past_key_values
+        if cache is None:
+            raise RuntimeError("prefix forward returned no cache (use_cache ignored?)")
+        return cache
+
+    def forward(self, vecs, targets, autocast=contextlib.nullcontext, max_len=None, prefix_cache=None, timings=None):
+        """Full prefix-cached step. ``autocast``: zero-arg callable returning a context manager (e.g.
+        ``lambda: autocast_region(model, True)``), applied to BOTH forwards. ``timings``: optional dict that receives
+        CUDA-synchronized phase durations (prefix_fwd_s, expand_s, suffix_fwd_s) -- profiling only, it syncs.
+        Returns SimpleNamespace(loss, logits, labels, suffix_mask, n_target_tokens, suffix_len, prefix_len)."""
+        import time
+
+        def _tick():
+            if timings is None:
+                return None
+            torch.cuda.synchronize()
+            return time.time()
+
+        B = len(targets)
+        vecs = torch.as_tensor(vecs)
+        if vecs.ndim != 2 or vecs.shape[0] != B:
+            raise ValueError(f"vecs must be [B={B}, d], got {tuple(vecs.shape)}")
+        t0 = _tick()
+        if prefix_cache is not None:
+            # caller-owned prefix (shared across micro-batches of one optimizer step): expand a COPY, keep theirs intact
+            t1 = _tick()
+            cache = expand_cache_copy(prefix_cache, B)
+        else:
+            cache = self.run_prefix(autocast)
+            t1 = _tick()
+            cache.batch_repeat_interleave(B)   # out-of-place in the fork: grads flow back into the prefix graph
+        t2 = _tick()
+        P = self.prefix_len
+
+        ids, labels, smask, L = self.build_suffix(targets, max_len)
+        full_mask = torch.cat([torch.ones((B, P), dtype=torch.bool), smask], dim=1).to(self.device)
+        position_ids = torch.arange(P, P + L, device=self.device)[None].expand(B, -1)
+        if self.persistent_injector is not None:   # compile path: registered once, reads a stable buffer
+            self.persistent_injector.set_vectors(vecs.to(self.device, self.persistent_injector.vectors.dtype))
+            self.persistent_injector.active = True
+            hook_cm = contextlib.nullcontext()
+        else:                                      # legacy path: one Python hook per micro-batch
+            hook = make_inject_hook([v[None] for v in vecs], [[0]] * B, self.coeff, self.device,
+                                    self.inject_dtype, mode=self.inject_mode)   # marker == suffix index 0
+            hook_cm = hooked(self.inject_module, hook)
+        with hook_cm, autocast():
+            out = self.model(input_ids=ids.to(self.device), attention_mask=full_mask, position_ids=position_ids,
+                             past_key_values=cache, use_cache=True, labels=labels.to(self.device))
+        # The suffix's final GDN states / KV are useless for training: drop them before backward (fp32 recurrent
+        # states are 150 MB per example for the 27B).
+        del cache
+        out.past_key_values = None
+        t3 = _tick()
+        if timings is not None:
+            timings.update(prefix_fwd_s=t1 - t0, expand_s=t2 - t1, suffix_fwd_s=t3 - t2)
+        return SimpleNamespace(loss=out.loss, logits=out.logits, labels=labels, suffix_mask=smask,
+                               n_target_tokens=int((labels != -100).sum()), suffix_len=L, prefix_len=P)

@@ -1,0 +1,105 @@
+{
+  "env": {
+    "gpu": "NVIDIA B200",
+    "torch": "2.10.0+cu128",
+    "transformers": "5.15.0",
+    "transformers_fork": true,
+    "peft": "0.20.0",
+    "fla": "0.5.2",
+    "triton": "3.6.0",
+    "tf_spec": "transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
+  },
+  "prompt_len": 103,
+  "marker": 102,
+  "steps": 10,
+  "warmup": 3,
+  "autocast_bf16": true,
+  "target_len_range": [
+    8,
+    32
+  ],
+  "rows": [
+    {
+      "config": "naive",
+      "micro_batch": 16,
+      "first_step_s": 88.54984664916992,
+      "shape_warmup_s": 18.671208381652832,
+      "examples_per_s": 24.00642843725665,
+      "target_tokens_per_s": 507.28584091477956,
+      "ms_per_step": 666.4881467819214,
+      "peak_mem_gb": 135.5443115234375,
+      "mean_seq_len": 192.0
+    },
+    {
+      "config": "naive_compile",
+      "micro_batch": 16,
+      "first_step_s": 51.11198019981384,
+      "shape_warmup_s": 11.735494375228882,
+      "examples_per_s": 28.92871337423224,
+      "target_tokens_per_s": 622.690555380349,
+      "ms_per_step": 553.0837059020996,
+      "peak_mem_gb": 119.7730884552002,
+      "mean_seq_len": 192.0
+    },
+    {
+      "config": "cached",
+      "micro_batch": 16,
+      "first_step_s": 46.548084020614624,
+      "shape_warmup_s": 1.585350751876831,
+      "examples_per_s": 21.34003642081814,
+      "target_tokens_per_s": 451.07501984504347,
+      "ms_per_step": 749.7644186019897,
+      "peak_mem_gb": 83.1661148071289,
+      "mean_seq_len": 38.4
+    },
+    {
+      "config": "cached",
+      "micro_batch": 64,
+      "first_step_s": 4.58442497253418,
+      "shape_warmup_s": 1.8748502731323242,
+      "examples_per_s": 60.39893628211614,
+      "target_tokens_per_s": 1277.7206223805788,
+      "ms_per_step": 1059.6213102340698,
+      "peak_mem_gb": 154.915620803833,
+      "mean_seq_len": 48.0
+    },
+    {
+      "config": "cached_pfxcompile",
+      "micro_batch": 16,
+      "first_step_s": 46.92650365829468,
+      "shape_warmup_s": 13.402458667755127,
+      "examples_per_s": 2.143289987362072,
+      "target_tokens_per_s": 44.55364061228907,
+      "ms_per_step": 7465.158748626709,
+      "peak_mem_gb": 82.83004856109619,
+      "mean_seq_len": 43.2
+    },
+    {
+      "config": "cached_pfxcompile",
+      "micro_batch": 64,
+      "first_step_s": 19.35389757156372,
+      "shape_warmup_s": 16.273653507232666,
+      "examples_per_s": 7.1064211679038065,
+      "target_tokens_per_s": 148.7351742876117,
+      "ms_per_step": 9005.939626693726,
+      "peak_mem_gb": 154.5795545578003,
+      "mean_seq_len": 48.0
+    },
+    {
+      "config": "cached 64x2",
+      "micro_batch": 128,
+      "first_step_s": 3.340484619140625,
+      "shape_warmup_s": 3.2881546020507812,
+      "examples_per_s": 66.04168729427973,
+      "target_tokens_per_s": 1395.7497849100432,
+      "ms_per_step": 1938.1697416305542,
+      "peak_mem_gb": 157.69120836257935,
+      "mean_seq_len": 48.0
+    },
+    {
+      "config": "cached_pfxcompile 64x2",
+      "micro_batch": 128,
+      "error": "RuntimeError: This backward function was compiled with non-empty donated buffers which requires create_graph=False and retain_graph=False. Please keep backward(create_graph=False, retain_graph=False) across all backward() function calls, or set torch._functorch.config.donated_buffer=False to disable donated buffer."
+    }
+  ]
+}
