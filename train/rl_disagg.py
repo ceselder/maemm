@@ -134,6 +134,12 @@ def parse_args(argv=None):
     ap.add_argument("--std-norm", action="store_true")
     ap.add_argument("--batch-norm", action="store_true")
     ap.add_argument("--entropy-coef", type=float, default=0.0)
+    ap.add_argument("--entropy-target", type=float, default=0.0,
+                    help="adaptive entropy bonus: after each step coef *= exp(rate*(target - H)) so the policy's per-token "
+                         "entropy is held near TARGET nats (0 = fixed --entropy-coef). Replaces the KL leash as the anti-collapse term.")
+    ap.add_argument("--entropy-adapt-rate", type=float, default=0.05)
+    ap.add_argument("--entropy-coef-max", type=float, default=0.05)
+    ap.add_argument("--entropy-coef-min", type=float, default=1e-4)
     ap.add_argument("--kl-coef", type=float, default=0.0)
     ap.add_argument("--kl-cap", type=float, default=10.0)
     # inline eval flags accepted for launcher compatibility; see inline_eval_stub()
@@ -1389,6 +1395,9 @@ def run_trainer(a):
                 _g["lr"] = a.lr * min(1.0, (step + 1) / a.warmup_steps)
 
         stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb)
+        if a.entropy_target > 0:   # SAC-style temperature adaptation on the measured per-token entropy of this step
+            a.entropy_coef = float(min(a.entropy_coef_max, max(a.entropy_coef_min,
+                                   a.entropy_coef * math.exp(a.entropy_adapt_rate * (a.entropy_target - stats["entropy"])))))
         t_up = time.time() - t_up
 
         # ---- publish the new policy for the rollout ranks ----
@@ -1427,7 +1436,7 @@ def run_trainer(a):
                "reward/shaped_mean": r_all.mean().item(), "reward/within_group_std": float(loc[2] / n_groups_all),
                "reward/gate_frac": float(loc[1] / n_groups_all), "reward/trunc_frac": trunc_frac,
                "ratio/clipfrac": stats["clipfrac"], "ratio/mean": stats["ratio_mean"],
-               "policy/entropy": stats["entropy"], "policy/kl_to_init": stats["kl"],
+               "policy/entropy": stats["entropy"], "policy/kl_to_init": stats["kl"], "policy/entropy_coef": a.entropy_coef,
                "policy/sampler_abs_dlogp": stats["sampler_abs_dlogp"], "policy/offpolicy_lag_steps": lag,
                "loss": stats["loss"], "grad_norm": stats["grad_norm"], "grad_norm_did_clip": float(stats["grad_norm"] > a.max_grad_norm),
                "rollout/mean_logp": float(old_lp[known].mean()) if bool(known.any()) else float("nan"),
