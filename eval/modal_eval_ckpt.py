@@ -86,11 +86,16 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
     print("[modal] launching:", " ".join(cmd), flush=True)
     p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     # The daemon polls the volume from a SUBPROCESS, where `modal.Volume.from_name(...).reload()` is not the mounted
-    # handle (it silently no-ops) -> it would never see checkpoints committed after it started. Refresh the mount here.
+    # handle (it silently no-ops) -> it would never see checkpoints committed after it started. Refresh the mount from
+    # THIS process instead — but only while the daemon is idle: a reload during its model/asset load or a checkpoint
+    # eval invalidates open file handles (that is how the first attempt died with LocalEntryNotFoundError).
     import threading
     _stop = threading.Event()
+    _state = {"loaded": False, "busy": False}
     def _reload_loop():
-        while not _stop.wait(45):
+        while not _stop.wait(30):
+            if not _state["loaded"] or _state["busy"]:
+                continue
             try:
                 vol.reload()
             except Exception as e:  # noqa
@@ -98,6 +103,12 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
     threading.Thread(target=_reload_loop, daemon=True).start()
     for line in p.stdout:
         print(line, end="", flush=True)
+        if "previously evaled:" in line:
+            _state["loaded"] = True
+        if "evaluating LATEST step" in line or "-> evaluating" in line or "] evaluating step" in line:
+            _state["busy"] = True
+        if "evaled in" in line or "adapter load failed" in line or "nothing pending" in line:
+            _state["busy"] = False
     rc = p.wait()
     _stop.set()
     vol.commit()
