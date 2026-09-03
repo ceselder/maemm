@@ -138,12 +138,30 @@ def _work_dir():
 
 
 def _run(cmd, env):
+    """Run torchrun as its own process group and KILL it if this function is cancelled or errors —
+    otherwise a Modal cancel only interrupts this Python thread and the trainer keeps running as a
+    zombie in the warm container (happened 2026-09-03: a cancelled 8x128 leg trained on for 20 min)."""
+    import os
+    import signal
     import subprocess
     print("[modal] launching:", " ".join(cmd), flush=True)
-    p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in p.stdout:
-        print(line, end="", flush=True)
-    return p.wait()
+    p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         start_new_session=True)
+    try:
+        for line in p.stdout:
+            print(line, end="", flush=True)
+        return p.wait()
+    finally:
+        if p.poll() is None:
+            print("[modal] terminating trainer process group (cancel/error)", flush=True)
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+                p.wait(timeout=20)
+            except Exception:  # noqa
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except Exception:  # noqa
+                    pass
 
 
 def _collect(work="/tmp/disagg"):
