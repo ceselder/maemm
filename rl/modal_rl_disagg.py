@@ -25,7 +25,7 @@ from pathlib import Path
 import modal
 
 REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
-app = modal.App("maemm-rl-disagg")
+app = modal.App(os.environ.get("DISAGG_APP", "maemm-rl-disagg"))   # DISAGG_APP=maemm-rl-disagg-x4 + DISAGG_GPU=B200:4 = parallel 4-GPU deployment
 GPU = os.environ.get("DISAGG_GPU", "B200:4")
 
 image = (
