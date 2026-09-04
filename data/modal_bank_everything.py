@@ -129,7 +129,7 @@ BUILD_GPUS = ["H100", "A100-80GB", "L40S", "A100-40GB"]
 def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 7, threads: int = 48,
           chunk: int = 50_000, doc_cap: int = 8, bsf_scan_seqs: int = 30_000, bsf_cap: int = 4, bsf_ranks: int = 8,
           short_p_lo: int = 14, short_p_hi: int = 91, long_p_lo: int = 256, long_p_hi: int = 511,
-          w_lo: int = 16, w_hi: int = 64, overwrite_smoke: bool = False):
+          w_lo: int = 16, w_hi: int = 64, overwrite_smoke: bool = False, sae_windows: int = 1):
     import json, os, random, shutil, time
     from concurrent.futures import ThreadPoolExecutor
     import sys
@@ -334,21 +334,31 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     cand = np.flatnonzero(alive & ~excl_mask)
     n_sae = min(n_per_family, len(cand))
     feats = np.sort(nrng.choice(cand, n_sae, replace=False))
-    vec_sae = np.memmap("/root/bank/stage_sae.f32", np.float32, "w+", shape=(n_sae, D_MODEL))
-    for c0 in range(0, n_sae, 8192):
-        vec_sae[c0:c0 + 8192] = sae.enc_dirs(feats[c0:c0 + 8192].tolist()).float().cpu().numpy()
-    rec_sae = []
-    win_tok, win_act = ma["max_tokens"][:, 0], ma["max_acts"][:, 0]          # top-1 window per feature [F, 32]
-    for f in feats.tolist():
-        ids = win_tok[f].tolist()
-        acts = win_act[f]
-        rec_sae.append({"family": "sae", "feature": f, "target_text": tok.decode(ids), "n_tok": len(ids),
-                        "peak_idx": int(acts.argmax()), "corpus_peak": float(peak[f]), "window_peak": float(acts.max())})
+    # sae_windows > 1: the same unit direction paired with its top-k max-activating corpus windows (k rows per feature),
+    # for SFT banks that need more SAE examples than there are alive non-eval features (~118k).
+    K = max(1, min(int(sae_windows), int(ma["max_tokens"].shape[1])))
+    dirs_f = np.concatenate([sae.enc_dirs(feats[c0:c0 + 8192].tolist()).float().cpu().numpy() for c0 in range(0, n_sae, 8192)])
+    rec_sae, rows_sae = [], []
+    for k in range(K):
+        win_tok, win_act = ma["max_tokens"][:, k], ma["max_acts"][:, k]      # k-th window per feature [F, 32]
+        for i, f in enumerate(feats.tolist()):
+            acts = win_act[f]
+            if k > 0 and float(acts.max()) <= 0:
+                continue                                                   # feature has no k-th firing window
+            ids = win_tok[f].tolist()
+            rows_sae.append(i)
+            rec_sae.append({"family": "sae", "feature": f, "window_rank": k, "target_text": tok.decode(ids), "n_tok": len(ids),
+                            "peak_idx": int(acts.argmax()), "corpus_peak": float(peak[f]), "window_peak": float(acts.max())})
+    vec_sae = np.memmap("/root/bank/stage_sae.f32", np.float32, "w+", shape=(len(rows_sae), D_MODEL))
+    for c0 in range(0, len(rows_sae), 8192):
+        vec_sae[c0:c0 + 8192] = dirs_f[np.array(rows_sae[c0:c0 + 8192])]
+    del dirs_f
+    n_sae = len(rows_sae)
     stage["sae"] = (vec_sae, rec_sae)
     fam_stats["sae"] = {"source": SAE_PT, "hf": SAE_HF, "d_sae": Fd, "dead": int((~alive).sum()),
                         "excluded": len(excl_sae), "candidates": int(len(cand)), "taken": n_sae,
                         "shortfall": n_per_family - n_sae, "dir": "unit(W_enc[:, f]) (mxf.sae.enc_dirs)",
-                        "target": "top-1 max-activating 32-token corpus window from /data/sae/maxacts.pt"}
+                        "target": f"top-{K} max-activating 32-token corpus window(s) from /data/sae/maxacts.pt", "windows_per_feature": K}
     del sae, ma
     torch.cuda.empty_cache()
     log(f"sae: {n_sae}/{n_per_family} (alive {int(alive.sum())}, excluded {len(excl_sae)}, cand {len(cand)}, "
@@ -1003,8 +1013,8 @@ def run_smoke(out_name: str = "banks/everything_smoke", n: int = 1000, bsf_scan_
 
 
 @app.local_entrypoint()
-def run_build(out_name: str = OUT_DEFAULT, n: int = 100_000, bsf_scan_seqs: int = 30_000, seed: int = 7):
-    print(build.remote(out_name=out_name, n_per_family=n, bsf_scan_seqs=bsf_scan_seqs, seed=seed))
+def run_build(out_name: str = OUT_DEFAULT, n: int = 100_000, bsf_scan_seqs: int = 30_000, seed: int = 7, sae_windows: int = 1):
+    print(build.remote(out_name=out_name, n_per_family=n, bsf_scan_seqs=bsf_scan_seqs, seed=seed, sae_windows=sae_windows))
     print(verify.remote(out_name=out_name))
 
 
