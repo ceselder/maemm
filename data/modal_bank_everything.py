@@ -852,6 +852,150 @@ def peek(out_name: str = OUT_DEFAULT, n: int = 3):
     return st["n_examples"]
 
 
+@app.function(image=image, gpu=BUILD_GPUS, cpu=8, memory=65536, ephemeral_disk=512 * 1024, volumes={"/data": vol},
+              timeout=4 * 3600)
+def build_randctx(out_a: str = "banks/rl_randctx", out_b: str = "banks/rl_randctx_probes", n_realact: int = 200_000,
+                  p_lo: int = 8, p_hi: int = 511, doc_cap: int = 8, seed: int = 11, w_lo: int = 16, w_hi: int = 64,
+                  probe_src: str = "banks/everything"):
+    """Two RL direction banks for the parallel RL runs (Sep 4):
+      A  out_a = realact directions at UNIFORMLY RANDOM context lengths: p ~ U[p_lo, p_hi] over acts27b TRAIN rows
+         (first 95% of sequences; the eval's realact hold-out is the last 5%), dir = unit(act - mu), 10x-median norm filter,
+         <= doc_cap per sequence, direction-level leak check (max cos < LEAK_COS vs every eval-cache direction family and
+         every pool_heldout row; leakers dropped and re-sampled).
+      B  out_b = A's rows + the `cluster` (probe) rows of probe_src (already eval-excluded by build()), shuffled.
+    Bank format == build(): vecs.f32 + records.jsonl (line i == vec_idx i) + build_stats.json."""
+    import json, os, random, shutil, time
+    import sys
+    sys.path.insert(0, "/pmx/helpers")
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from mxf.config import D_MODEL, MODEL
+    os.environ.setdefault("HF_HOME", "/data/hf_cache")
+    from transformers import AutoTokenizer
+    t0 = time.time()
+    dev = "cuda"
+
+    def log(msg):
+        print(f"[randctx +{time.time() - t0:.0f}s] {msg}", flush=True)
+    tok = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
+    for o in (out_a, out_b):
+        assert not os.path.exists(f"/data/{o}/build_stats.json"), f"/data/{o} already built"
+        os.makedirs(f"/data/{o}", exist_ok=True)
+    meta = json.load(open(f"{ACTS}/meta.json"))
+    NS, T = int(meta["n_seq"]), int(meta["seq_len"])
+    n_train = int(np.ceil(NS * 0.95))
+    assert p_hi <= T - 1
+    mu = np.load(f"{ACTS}/whiten_mu.npy").astype(np.float32)
+    toks = np.fromfile(f"{ACTS}/toks.i32", dtype=np.int32).reshape(NS, T)
+    afd = os.open(f"{ACTS}/acts.f16", os.O_RDONLY)
+    rng = np.random.default_rng(seed); wrng = random.Random(seed)
+
+    def read_act(s, p):
+        return np.frombuffer(_pread_full(afd, D_MODEL * 2, ((s * T) + p) * D_MODEL * 2), np.float16).astype(np.float32)
+
+    # norm filter threshold from a presample (same convention as build())
+    pre = np.array([np.linalg.norm(read_act(int(rng.integers(0, n_train)), int(rng.integers(p_lo, p_hi + 1))))
+                    for _ in range(2000)])
+    cap = NORM_FILTER_MULT * float(np.median(pre))
+    log(f"randctx: NS {NS} T {T} n_train {n_train} | norm median {np.median(pre):.1f} cap {cap:.1f} | p in [{p_lo},{p_hi}]")
+
+    # reference directions for the leak check: every eval-cache dir family + all pool_heldout rows
+    es = torch.load(EVAL_CACHE, map_location="cpu", weights_only=False)
+    refs = [F.normalize(v.float(), dim=-1) for k, v in es.items() if k.endswith("_dirs") and torch.is_tensor(v) and v.ndim == 2]
+    if not refs:   # older cache layout: dict of families -> {"dirs": tensor}
+        refs = [F.normalize(torch.as_tensor(fam["dirs"]).float(), dim=-1) for fam in es.get("families", {}).values() if "dirs" in fam]
+    ho_n = os.path.getsize(f"{POOL_HELDOUT}/vecs.f32") // (4 * D_MODEL)
+    ho = np.memmap(f"{POOL_HELDOUT}/vecs.f32", np.float32, "r", shape=(ho_n, D_MODEL))
+    refs.append(F.normalize(torch.from_numpy(np.asarray(ho)).float(), dim=-1))
+    ref = torch.cat(refs).to(dev)
+    log(f"randctx: leak reference = {ref.shape[0]} directions ({len(refs)} groups)")
+
+    per_doc = np.zeros(n_train, np.int32)
+    vecs, recs, n_norm, n_leak, n_cap = [], [], 0, 0, 0
+    batch_v, batch_meta = [], []
+
+    def flush_batch():
+        nonlocal n_leak
+        if not batch_v:
+            return
+        x = F.normalize(torch.from_numpy(np.stack(batch_v)).to(dev), dim=-1)
+        mc = (x @ ref.T).max(1).values.cpu().numpy()
+        for v, m, mcos in zip(batch_v, batch_meta, mc):
+            if mcos > LEAK_COS:
+                n_leak += 1
+                continue
+            vecs.append(v.astype(np.float32)); recs.append(m)
+        batch_v.clear(); batch_meta.clear()
+
+    while len(vecs) + len(batch_v) < n_realact:
+        s = int(rng.integers(0, n_train)); p = int(rng.integers(p_lo, p_hi + 1))
+        if per_doc[s] >= doc_cap:
+            n_cap += 1
+            continue
+        a = read_act(s, p)
+        if np.linalg.norm(a) > cap:
+            n_norm += 1
+            continue
+        per_doc[s] += 1
+        d = a - mu; d /= (np.linalg.norm(d) + 1e-8)
+        W = wrng.randint(w_lo, w_hi); start = max(0, p - W + 1)
+        txt = tok.decode(toks[s, start:p + 1].tolist())
+        batch_v.append(d); batch_meta.append({"family": "realact", "target_text": txt, "seq": s, "pos": p, "ctx_len": p + 1, "W": p + 1 - start})
+        if len(batch_v) >= 4096:
+            flush_batch()
+            if len(vecs) % 40960 < 4096:
+                log(f"randctx: {len(vecs)}/{n_realact} ({time.time() - t0:.0f}s, norm-dropped {n_norm}, leak-dropped {n_leak}, cap-skips {n_cap})")
+    flush_batch()
+    vecs = vecs[:n_realact]; recs = recs[:n_realact]
+    ctx = np.array([r["ctx_len"] for r in recs])
+    log(f"randctx: realact done {len(vecs)} | ctx_len mean {ctx.mean():.1f} min {ctx.min()} max {ctx.max()} | norm-dropped {n_norm} leak-dropped {n_leak}")
+
+    def write_bank(out, rows, metas, note):
+        order = rng.permutation(len(rows))
+        mm = np.memmap(f"/data/{out}/vecs.f32.tmp", np.float32, "w+", shape=(len(rows), D_MODEL))
+        for i, j in enumerate(order):
+            mm[i] = rows[j]
+        mm.flush(); del mm
+        os.replace(f"/data/{out}/vecs.f32.tmp", f"/data/{out}/vecs.f32")
+        with open(f"/data/{out}/records.jsonl.tmp", "w") as f:
+            for i, j in enumerate(order):
+                r = dict(metas[j]); r["vec_idx"] = i
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(f"/data/{out}/records.jsonl.tmp", f"/data/{out}/records.jsonl")
+        fams = {}
+        for m in metas:
+            fams[m["family"]] = fams.get(m["family"], 0) + 1
+        st = {"kind": note, "n": len(rows), "families": fams, "p_range": [p_lo, p_hi], "ctx_len_mean": float(ctx.mean()),
+              "acts_train_rows": [0, n_train - 1], "norm_cap": cap, "norm_dropped": n_norm, "leak_dropped": n_leak,
+              "leak_cos": LEAK_COS, "leak_ref_dirs": int(ref.shape[0]), "seed": seed, "created": time.time(), "wall_s": time.time() - t0}
+        json.dump(st, open(f"/data/{out}/build_stats.json", "w"), indent=2)
+        log(f"randctx: wrote /data/{out}: {st['families']}")
+
+    write_bank(out_a, vecs, recs, "RL bank A: realact directions at uniformly random context lengths (acts27b train rows)")
+
+    # bank B: + cluster (probe) rows from probe_src (already eval-excluded by build())
+    n_src = os.path.getsize(f"/data/{probe_src}/vecs.f32") // (4 * D_MODEL)
+    src = np.memmap(f"/data/{probe_src}/vecs.f32", np.float32, "r", shape=(n_src, D_MODEL))
+    prows, pmeta = [], []
+    with open(f"/data/{probe_src}/records.jsonl") as f:
+        for i, line in enumerate(f):
+            r = json.loads(line)
+            if r.get("family") == "cluster":
+                assert int(r["vec_idx"]) == i
+                prows.append(np.asarray(src[i], dtype=np.float32).copy())
+                pmeta.append({"family": "cluster", "target_text": r.get("target_text", ""), "src_bank": probe_src, "src_vec_idx": i})
+    log(f"randctx: {len(prows)} cluster rows from {probe_src}")
+    write_bank(out_b, vecs + prows, recs + pmeta, f"RL bank B: bank-A realact (random ctx) + cluster probes from {probe_src}")
+    vol.commit()
+    return {"a": out_a, "b": out_b, "n_realact": len(vecs), "n_cluster": len(prows), "wall_s": time.time() - t0}
+
+
+@app.local_entrypoint()
+def run_randctx(n_realact: int = 200_000, p_lo: int = 8, p_hi: int = 511, seed: int = 11):
+    print(build_randctx.remote(n_realact=n_realact, p_lo=p_lo, p_hi=p_hi, seed=seed))
+
+
 @app.local_entrypoint()
 def run_smoke(out_name: str = "banks/everything_smoke", n: int = 1000, bsf_scan_seqs: int = 256):
     print(build.remote(out_name=out_name, n_per_family=n, bsf_scan_seqs=bsf_scan_seqs, overwrite_smoke=True))
