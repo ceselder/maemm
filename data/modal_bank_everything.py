@@ -966,7 +966,7 @@ def build_randctx(out_a: str = "banks/rl_randctx", out_b: str = "banks/rl_randct
         fams = {}
         for m in metas:
             fams[m["family"]] = fams.get(m["family"], 0) + 1
-        st = {"kind": note, "n": len(rows), "families": fams, "p_range": [p_lo, p_hi], "ctx_len_mean": float(ctx.mean()),
+        st = {"kind": note, "n": len(rows), "n_examples": len(rows), "families": fams, "p_range": [p_lo, p_hi], "ctx_len_mean": float(ctx.mean()),
               "acts_train_rows": [0, n_train - 1], "norm_cap": cap, "norm_dropped": n_norm, "leak_dropped": n_leak,
               "leak_cos": LEAK_COS, "leak_ref_dirs": int(ref.shape[0]), "seed": seed, "created": time.time(), "wall_s": time.time() - t0}
         json.dump(st, open(f"/data/{out}/build_stats.json", "w"), indent=2)
