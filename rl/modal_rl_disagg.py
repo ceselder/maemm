@@ -123,18 +123,19 @@ def _env():
     return env
 
 
-def _stage():
+def _stage(pool_dir: str = ""):
     import shutil
     import time
     os.environ["HF_HOME"] = "/data/hf_cache"
-    for p in (f"{POOL_DIR}/vecs.f32", f"{POOL_DIR}/records.jsonl", f"{POOL_DIR}/build_stats.json",
+    pool = pool_dir or POOL_DIR
+    for p in (f"{pool}/vecs.f32", f"{pool}/records.jsonl", f"{pool}/build_stats.json",
               f"{SFT_INIT}/adapter_model.safetensors", f"{SFT_INIT}/adapter_config.json"):
         assert os.path.exists(p), f"missing {p}"
     t0 = time.time()
     local_pool = "/root/pool"
     if not os.path.exists(local_pool):
-        shutil.copytree(POOL_DIR, local_pool)
-    print(f"[modal] pool staged to {local_pool} ({time.time() - t0:.0f}s)", flush=True)
+        shutil.copytree(pool, local_pool)
+    print(f"[modal] pool {pool} staged to {local_pool} ({time.time() - t0:.0f}s)", flush=True)
     return local_pool
 
 
@@ -197,8 +198,9 @@ def _collect(work="/tmp/disagg"):
                        modal.Secret.from_name("maemm-openrouter"),   # judge fallback
                        modal.Secret.from_name("maemm-anthropic")],   # native Sonnet 5 judge: ANTHROPIC_API_KEY + ANTHROPIC_WORKSPACE_ID
               timeout=24 * 3600)
-def train(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_args: str = "", no_wandb: bool = False):
-    local_pool = _stage()
+def train(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_args: str = "", no_wandb: bool = False,
+          pool_dir: str = ""):
+    local_pool = _stage(pool_dir)   # pool_dir: a different direction bank than POOL_DIR (e.g. /data/banks/rl_randctx)
     args = list(TRAIN_ARGS)
     if no_wandb:
         args.append("--no-wandb")
