@@ -17,7 +17,7 @@ OUT = os.path.expanduser("~/shared/reports/maemm-sft-20m")
 os.makedirs(f"{OUT}/data", exist_ok=True)
 PROJ = "octahedral-systems/maxact-fast"
 TRAIN_ID, EVAL_NAME, EFF_BATCH = "da7cxuz3", "realact20m_prefix_lr1e-4_eval", 512
-OLD = {"name": "sft_big_rp_eval", "eff_batch": 128, "label": "2.5M realact+probes SFT (Sep 1)"}
+OLD = {"name": "sft_big_rp_eval", "eff_batch": 128, "label": "2.5M realact+probes SFT (Sep 1; only its first 3 ckpts were evaluated)"}
 REF = {"old 500k SFT init (realact+probes)": {"eval/mean_all": 0.359, "eval/sae/norm_act": 0.61},
        "best RL (16x128 ScaleRL ckpt 300)": {"eval/mean_all": 0.4104, "eval/sae/norm_act": 0.795, "eval/sae/rank1_frac": 0.320, "eval/realact/cos": 0.525},
        "8x256 ScaleRL ckpt 160": {"eval/sae/norm_act": 0.820, "eval/sae/rank1_frac": 0.363}}
@@ -85,10 +85,10 @@ for ax, (m, label) in zip(axes.flat, METRICS):
     ax.tick_params(labelsize=8)
 for ax in axes[1]:
     ax.set_xlabel("examples seen (millions, log)", fontsize=9)
-handles, labels = axes[0, 0].get_legend_handles_labels()
 seen = {}
-for h, l in zip(handles, labels):
-    seen.setdefault(l, h)
+for ax in axes.flat:                      # legend entries from every panel (the SAE-only reference lines live in panels 3-4)
+    for h, l in zip(*ax.get_legend_handles_labels()):
+        seen.setdefault(l, h)
 fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=3, frameon=False, fontsize=8.5, bbox_to_anchor=(0.5, -0.01))
 fig.suptitle("Held-out fidelity is flat from 0.6M to 11.5M examples of realact-only SFT while RL (dotted) is the only thing that moved it",
              fontsize=11, y=0.995)
