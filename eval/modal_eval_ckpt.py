@@ -22,7 +22,7 @@ from pathlib import Path
 import modal
 
 REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
-app = modal.App("maemm-eval-ckpt")
+app = modal.App(os.environ.get("EVAL_APP", "maemm-eval-ckpt"))   # EVAL_APP=maemm-eval-ckpt-h200 + EVAL_GPU=H200:1 = a second deployment for Hopper evaluators
 GPU = os.environ.get("EVAL_GPU", "B200:1")
 
 image = (
