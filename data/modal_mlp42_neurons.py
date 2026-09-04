@@ -9,6 +9,9 @@ Outputs land on the `maemm-data` volume under /data/mlp42/ (nothing needs recomp
     peak_context.npz     at each neuron's peak token: cos(h - mu, dir), write-norm share, SAE features active
     dirs_analysis.npz    BSF top-block energy fraction, cluster-probe NN cosine, neuron-neuron NN (+ random / SAE-dec controls)
     verbalize_<tag>.*    inverter generations (RL-A adapter) + clean-base scoring incl. neuron fire-back
+    pairs_cofire.npz     co-firing pairs on ~200k tokens (counts, lift, Poisson p, co-firing activations), sparse x sparse block
+    pairs_sae.npz        nearest-SAE cosine of composite pair/triple directions vs singles, with random / token-top-k controls
+    verbalize_pairs.*    inverter generations for co-firing pairs, random pairs, member singles, co-firing triples
 
 Run (profile safety-sahan) — deployed app + spawn survives the launching client:
     modal deploy data/modal_mlp42_neurons.py
@@ -29,9 +32,10 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch==2.10.0", index_url="https://download.pytorch.org/whl/cu128")
     .pip_install("transformers==5.15.0", "peft==0.20.0", "accelerate==1.14.0", "numpy==2.4.6", "safetensors==0.8.0",
-                 "huggingface_hub==1.27.0", "tokenizers==0.22.2", "hf_xet")
+                 "huggingface_hub==1.27.0", "tokenizers==0.22.2", "hf_xet", "scipy==1.17.1")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
     .add_local_file(REPO / "data" / "mlp42_neurons_worker.py", "/pmx/helpers/mlp42_neurons_worker.py")
+    .add_local_file(REPO / "data" / "mlp42_pairs_worker.py", "/pmx/helpers/mlp42_pairs_worker.py")
 )
 vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
 GPUS = ["B200", "H200"]          # forward-only work: whichever schedules first
@@ -128,6 +132,34 @@ def verbalize(sparse_ids: list, dense_ids: list, tag: str = "rlA", adapter: str 
     g = torch.Generator().manual_seed(seed)
     sets.append({"name": "random", "ids": list(range(n_random)), "dirs": F.normalize(torch.randn(n_random, D_MODEL, generator=g), dim=1)})
     W.log("sets: " + ", ".join(f"{s['name']}={len(s['ids'])}" for s in sets))
+    summ = W.run_verbalize(base, tok, adapter, sets, sae, tag, dev=dev, bo=bo, temp=temp, max_new=max_new, min_new=min_new)
+    vol.commit()
+    return summ
+
+
+@app.function(image=image, gpu=GPUS, cpu=8, memory=98304, volumes={"/data": vol},
+              secrets=[modal.Secret.from_name("maemm-hf")], timeout=3 * 3600)
+def pairs(sparse_ids: list, tag: str = "pairs", adapter: str = ADAPTER_DEFAULT, n_windows: int = 800, win_len: int = 256,
+          batch: int = 16, rel_thr: float = 0.10, seed: int = 0, n_verb_pairs: int = 128, n_verb_random: int = 64,
+          n_single_pairs: int = 32, n_verb_tri: int = 32, bo: int = 4, temp: float = 1.0, max_new: int = 48, min_new: int = 16):
+    """Sparse COMBINATIONS: co-firing pairs / triples on ~200k tokens, composite-direction SAE matching, and inverter
+    verbalization of co-firing pairs vs random pairs vs their member singles (same adapter / sampling / scoring)."""
+    _env()
+    import torch
+    import mlp42_neurons_worker as W
+    import mlp42_pairs_worker as PW
+    from mxf.sae import load_sae
+    torch.backends.cuda.matmul.allow_tf32 = True
+    dev = "cuda:0"
+    vol.reload()
+    tok, base = _load_base(dev)
+    sae = load_sae(path=W.SAE_PT, device=dev, dtype=torch.float32)
+    Rp = PW.run_pairs(base, tok, sae, sparse_ids, n_windows=n_windows, win_len=win_len, batch=batch, rel_thr=rel_thr, seed=seed, dev=dev)
+    vol.commit()
+    sets = PW.build_verbalize_sets(Rp, n_pairs=n_verb_pairs, n_random=n_verb_random, n_single_pairs=n_single_pairs, n_tri=n_verb_tri, seed=seed)
+    PW.save_verbalize_sets_meta(sets, f"{W.OUT}/verbalize_{tag}_sets.json")
+    W.log("verbalize sets: " + ", ".join(f"{s['name']}={len(s['ids'])}" for s in sets))
+    torch.cuda.empty_cache()
     summ = W.run_verbalize(base, tok, adapter, sets, sae, tag, dev=dev, bo=bo, temp=temp, max_new=max_new, min_new=min_new)
     vol.commit()
     return summ

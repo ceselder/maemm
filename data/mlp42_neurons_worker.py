@@ -380,7 +380,8 @@ def run_dirs(signed, R, Wd_sample, dev="cuda:0"):
 @torch.no_grad()
 def reencode(texts, actor, tok, dev, layer, mlp, neuron_ids, sbatch=32):
     """Clean-base re-encode (== eval_universal._reencode: right pad, BOS sink, 10x-median norm filter) that ALSO returns
-    the layer-42 MLP neuron value of each row's paired neuron. Yields (s, h [b,T,d], keep [b,T], a_sel [b,T], last5 [b,T])."""
+    the layer-42 MLP neuron values of each row's paired neuron(s). neuron_ids: list of int (k=1) or list of k-lists.
+    Yields (s, h [b,T,d], keep [b,T], a_sel [b,k,T], last5 [b,T])."""
     prev = tok.padding_side; tok.padding_side = "right"
     sink = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id   # == eval_universal._reencode
     try:
@@ -408,8 +409,10 @@ def reencode(texts, actor, tok, dev, layer, mlp, neuron_ids, sbatch=32):
             finally:
                 h1.remove(); h2.remove()
             h = cap["h"]
-            nid = torch.as_tensor(neuron_ids[s:s + B], device=dev, dtype=torch.long)
-            a_sel = cap["a"].float()[torch.arange(B, device=dev), :, nid]     # [b, T] each row's own neuron
+            nid = torch.as_tensor(neuron_ids[s:s + B], device=dev, dtype=torch.long)          # [b, k] neurons per row
+            if nid.dim() == 1:
+                nid = nid[:, None]
+            a_sel = cap["a"].float()[torch.arange(B, device=dev)[:, None], :, nid]           # [b, k, T]
             keep = am.bool().clone(); keep[:, 0] = False
             nrm = h.norm(dim=-1)
             med = nrm.masked_fill(~keep, float("nan")).nanmedian(dim=1, keepdim=True).values
@@ -458,6 +461,7 @@ def run_verbalize(base, tok, adapter, sets, sae, tag, dev="cuda:0", bo=4, temp=1
                 texts = tok.batch_decode(gen[:, len(prompt_ids):], skip_special_tokens=True)
                 rdirs = dirs[rows]
                 nids = [S["neuron"][i] if S.get("neuron") is not None else 0 for i in rows]
+                nids = [n if isinstance(n, (list, tuple)) else [n] for n in nids]           # k members per row
                 for s2, h, keep, a_sel, last5 in reencode(texts, actor, tok, dev, layer, mlp, nids):
                     b = h.shape[0]
                     d = rdirs[s2:s2 + b]
@@ -469,9 +473,14 @@ def run_verbalize(base, tok, adapter, sets, sae, tag, dev="cuda:0", bo=4, temp=1
                     cc_l5 = cos_c.masked_fill(~last5, -1.0).max(1).values
                     n_keep = keep.sum(1)
                     if S.get("neuron") is not None:
-                        pol = torch.tensor([S["polarity"][i] for i in rows[s2:s2 + b]], device=dev)
-                        av = (a_sel * pol[:, None]).masked_fill(~keep, -float("inf")).max(1).values
-                        av_l5 = (a_sel * pol[:, None]).masked_fill(~last5, -float("inf")).max(1).values
+                        def _k(v):
+                            return v if isinstance(v, (list, tuple)) else [v]
+                        pol = torch.tensor([_k(S["polarity"][i]) for i in rows[s2:s2 + b]], device=dev, dtype=torch.float32)   # [b,k]
+                        rmx = torch.tensor([_k(S["ref_max"][i]) for i in rows[s2:s2 + b]], device=dev, dtype=torch.float32)    # [b,k]
+                        av_k = (a_sel * pol[:, :, None]).masked_fill(~keep[:, None, :], -float("inf")).max(2).values          # [b,k]
+                        av5_k = (a_sel * pol[:, :, None]).masked_fill(~last5[:, None, :], -float("inf")).max(2).values
+                        na_k = av_k / rmx.clamp_min(1e-6)
+                        av, av_l5 = av_k[:, 0], av5_k[:, 0]
                     else:
                         av = av_l5 = torch.full((b,), float("nan"), device=dev)
                     if S.get("sae_feat") is not None:
@@ -487,9 +496,12 @@ def run_verbalize(base, tok, adapter, sets, sae, tag, dev="cuda:0", bo=4, temp=1
                              "n_tok": int(n_keep[j]), "cos_all": float(cu_all[j]), "cos_last5": float(cu_l5[j]),
                              "cosc_all": float(cc_all[j]), "cosc_last5": float(cc_l5[j])}
                         if S.get("neuron") is not None:
-                            rm = float(S["ref_max"][i])
-                            r.update({"neuron_act": float(av[j]), "neuron_act_last5": float(av_l5[j]), "corpus_max": rm,
-                                      "norm_act": float(av[j]) / rm if rm > 0 else float("nan")})
+                            k_members = _k(S["neuron"][i])
+                            na_row = na_k[j].tolist()
+                            # norm_act = the WEAKEST member's fire-back (k=1: the neuron itself); *_max = the strongest member
+                            r.update({"members": [int(m) for m in k_members], "neuron_act": float(av[j]), "neuron_act_last5": float(av_l5[j]),
+                                      "corpus_max": _k(S["ref_max"][i])[0], "norm_act_members": na_row,
+                                      "norm_act": float(min(na_row)), "norm_act_max": float(max(na_row))})
                         if S.get("sae_feat") is not None:
                             rm = float(S["ref_max"][i])
                             r.update({"sae_act": float(fa[j]), "corpus_peak": rm, "norm_act": float(fa[j]) / rm if rm > 0 else float("nan")})
@@ -512,6 +524,10 @@ def run_verbalize(base, tok, adapter, sets, sae, tag, dev="cuda:0", bo=4, temp=1
                          "fired25_bo": float(np.nanmean(na > 0.25)), "fired50_bo": float(np.nanmean(na > 0.50)),
                          "beat_corpus_bo": float(np.nanmean(na > 1.0)),
                          "norm_act_mean1": float(np.nanmean([r["norm_act"] for r in recs]))})
+            if len(recs[0].get("members", [0])) > 1:
+                nx = np.array([max(x["norm_act_max"] for x in v) for v in by.values()], np.float64)
+                summ.update({"k": len(recs[0]["members"]), "any_fired10_bo": float(np.nanmean(nx > 0.10)),
+                             "any_fired25_bo": float(np.nanmean(nx > 0.25)), "any_fired50_bo": float(np.nanmean(nx > 0.50))})
         if "sae_act" in recs[0]:
             sa = np.array([max(x["sae_act"] for x in v) for v in by.values()], np.float64)
             summ["sae_fired_bo"] = float(np.mean(sa > 1.0))
