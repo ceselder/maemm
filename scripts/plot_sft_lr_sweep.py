@@ -256,8 +256,8 @@ ax.set_xlabel("examples seen (millions)"); ax.set_ylabel(f"next-token CE on targ
 if loss_summary:
     lo = min(v["last10_mean"] for v in loss_summary.values() if v["last10_mean"] is not None)
     ax.set_ylim(top=min(10.5, max(v["first10_mean"] for v in loss_summary.values() if v["first10_mean"]) + 0.3), bottom=max(0.0, lo - 0.3))
-ax.set_title("Training loss per learning rate on the same 2M real-activation examples: LoRA r64 (solid) vs full fine-tuning (dashed) "
-             "(eff. batch 512, OneCycle 2% warmup + linear anneal)", fontsize=9.5)
+ax.set_title(textwrap.fill("Training loss per learning rate on the same 2M real-activation examples: LoRA r64 (solid) vs full fine-tuning (dashed); "
+                           "lr >= 1e-3 blows up right after the 78-step warmup (eff. batch 512, OneCycle 2% warmup + linear anneal)", 110), fontsize=9)
 ax.grid(alpha=0.25); ax.legend(frameon=False, fontsize=8.5)
 fig.tight_layout()
 for ext in ("png", "pdf"):
