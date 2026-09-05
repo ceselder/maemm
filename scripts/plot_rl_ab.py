@@ -56,9 +56,9 @@ for ax, (k, title) in zip(axes, [("reward/mean", "training reward (max cos, last
         ax.set_yscale("log"); ax.axhline(1.0, color="#333333", ls=":", lw=1, label="clip (max-grad-norm 1.0)")
     ax.set_title(title, fontsize=9.5); ax.set_xlabel("RL step (4096 rollouts each)", fontsize=8.5); ax.grid(alpha=0.25); ax.tick_params(labelsize=8)
 axes[0].legend(frameon=False, fontsize=8.5)
-fig.suptitle("Training dynamics of the five RL runs: C, D and E all collapse under a constant learning rate (grad norm explodes once entropy falls to ~1.1: "
-             "C at step ~300, D at ~273, E at ~261), A and B on the smaller banks do not", fontsize=10.5)
-fig.tight_layout(rect=(0, 0, 1, 0.93))
+fig.suptitle("Training dynamics of the five RL runs: C, D and E (all-families 1.1M banks, constant lr) collapse once the grad norm crosses the clip (C step ~300, D ~273, E ~261);\n"
+             "A and B (200-300k banks) keep grad norm below the clip and do not collapse even with B's entropy at 0.5 — so the trigger is the gradient explosion, not low entropy per se", fontsize=10)
+fig.tight_layout(rect=(0, 0, 1, 0.90))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/rl_ab_train.{ext}", dpi=160)
 plt.close(fig)
@@ -80,10 +80,10 @@ seen = {}
 for ax in axes.flat:
     for h, l in zip(*ax.get_legend_handles_labels()):
         seen.setdefault(l, h)
-fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=2, frameon=False, fontsize=8, bbox_to_anchor=(0.5, -0.03))
-fig.suptitle("Held-out fidelity per RL checkpoint: from the realact+all-families SFT init, lr 1e-5 (D, E) beats lr 7e-6 (C) at every matched checkpoint and all three reach "
-             "mean ~0.42 / SAE ~0.90 by step 200-250, then the constant-lr collapse drags step 300+ back down; adding the MLP family (E) costs nothing on the other families", fontsize=10, y=0.995)
-fig.tight_layout(rect=(0, 0.13, 1, 0.965))
+fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=2, frameon=False, fontsize=8, bbox_to_anchor=(0.5, 0.0))
+fig.suptitle("Held-out fidelity per RL checkpoint: from the realact+all-families SFT init, lr 1e-5 (D, E) beats lr 7e-6 (C) at every matched checkpoint and all three reach mean ~0.42 / SAE ~0.90\n"
+             "by step 200-250, then the constant-lr collapse drags step 300+ back down; adding the MLP family (E) costs nothing on the other families", fontsize=10, y=0.995)
+fig.tight_layout(rect=(0, 0.14, 1, 0.945))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/rl_ab_evals.{ext}", dpi=160)
 plt.close(fig)
