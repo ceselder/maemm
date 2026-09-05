@@ -47,6 +47,7 @@ for ax, (m, title) in zip(axes.flat, METRICS):
         if m in vals:
             ax.axhline(vals[m], color=vals["color"], ls=":", lw=1.1, label=f"{name} (before RL)")
     ax.set_xscale("log"); ax.set_title(title, fontsize=9.5); ax.grid(alpha=0.25); ax.tick_params(labelsize=8)
+    ax.set_xticks([0.05, 0.1, 0.2, 0.4, 0.8]); ax.set_xticklabels(["0.05", "0.1", "0.2", "0.4", "0.8"]); ax.minorticks_off()
 for ax in axes[1]:
     ax.set_xlabel("rollouts seen (millions, log)", fontsize=9)
 seen = {}
@@ -54,8 +55,8 @@ for ax in axes.flat:
     for h, l in zip(*ax.get_legend_handles_labels()):
         seen.setdefault(l, h)
 fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=3, frameon=False, fontsize=8.5, bbox_to_anchor=(0.5, -0.02))
-fig.suptitle("Same all-families RL recipe, different starting points: the 23M-activation pretrain (+ mix midtrain) starts lower but overtakes the 500k-SFT "
-             "start on every family within ~0.4M rollouts and reaches a higher plateau", fontsize=10, y=0.995)
+fig.suptitle("Same all-families RL recipe, different starting points: the 23M-activation pretrain (+ mix midtrain) starts lower but overtakes the 500k-SFT start "
+             "on the mean, SAE features, real activations and J-lens by ~0.4M rollouts; still behind on BSF and cluster probes", fontsize=10, y=0.995)
 fig.tight_layout(rect=(0, 0.08, 1, 0.965))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/rl_pretrain_effect.{ext}", dpi=160)
