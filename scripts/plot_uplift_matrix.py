@@ -242,41 +242,75 @@ def heatmap(M, title, subtitle, fname, vlim=0.10, ref_row=None):
     plt.close(fig)
 
 
+def all_families_row(table, budget):
+    """Reference row: the everything-mixed run (RL-E, 1.1M all-families midtrain -> RL on the 7-family bank) at the same RL step (100),
+    as delta vs the same init. Fetched from wandb; None if unavailable."""
+    ref = budget.get("reference_all_families")
+    if not ref:
+        return None
+    try:
+        import wandb
+        rs = list(wandb.Api().runs(PROJ, filters={"display_name": ref["rl"]["eval_run"]}, order="-created_at"))
+        row = next(r for r in rs[0].history(pandas=False) if r.get("ckpt_step") == ref["rl"]["ckpt"] and r.get("eval/mean_all") is not None)
+    except Exception as e:
+        print("[plot] all-families reference row unavailable:", e); return None
+    init = (table["init"] or {}).get("metrics", {})
+    return {"label": f"all 7 families mixed*  ·  {ref['midtrain']['target_tokens_est'] / 1e6:.0f}M tok",
+            "delta": {k: (row[k] - init[k]) if (row.get(k) is not None and init.get(k) is not None) else np.nan for k, _ in CORE_COLS},
+            "abs": {k: row.get(k) for k, _ in CORE_COLS}, "source": ref}
+
+
 def heatmap_clean(table, fname, budget):
-    """Headline: delta vs the shared init after midtrain + RL@100, core columns only, per-row training budget in the label."""
+    """Headline: delta vs the shared init after midtrain + RL@100, core columns only, per-row training budget in the label,
+    plus (below a gap) the everything-mixed reference run at the same RL step."""
     import textwrap
     cols = [k for k, _ in CORE_COLS]; full = [k for k, _, _ in COLS]
     M_full = matrix(table, 100, "init"); M = M_full[:, [full.index(k) for k in cols]]
-    fig = plt.figure(figsize=(14.5, 6.0))
-    ax = fig.add_axes([0.215, 0.16, 0.66, 0.60])   # [left, bottom, width, height] — fixed so the cells stay wide
+    extra = all_families_row(table, budget)
+    mt = budget["midtrain"]
+    rows = [f"{ARM_ROW[a]}  ·  {mt[a]['target_tokens'] / 1e6:.1f}M tok" for a in ARMS]
+    if extra:
+        M = np.vstack([M, np.full((1, len(cols)), np.nan), np.array([[extra["delta"][k] for k in cols]])])   # blank spacer row, then the reference
+        rows += ["", extra["label"]]
+        json.dump({"row": extra["label"], "delta_vs_init": {k: (None if np.isnan(v) else float(v)) for k, v in extra["delta"].items()}, "absolute": extra["abs"],
+                   "source": extra["source"]}, open(f"{OUT}/data/all_families_reference_row.json", "w"), indent=1)
+    n_rows = M.shape[0]
+    fig = plt.figure(figsize=(14.5, 6.0 + (0.9 if extra else 0)))
+    ax = fig.add_axes([0.215, 0.15, 0.66, 0.62])   # [left, bottom, width, height] — fixed so the cells stay wide
     vlim = 0.10
     im = ax.imshow(np.ma.masked_invalid(M), cmap=DIVERGING, norm=TwoSlopeNorm(vmin=-vlim, vcenter=0.0, vmax=vlim), aspect="auto")
     ax.set_xticks(range(len(cols))); ax.set_xticklabels([l for _, l in CORE_COLS], fontsize=9.5)
-    mt = budget["midtrain"]
-    ax.set_yticks(range(len(ARMS))); ax.set_yticklabels([f"{ARM_ROW[a]}  ·  {mt[a]['target_tokens'] / 1e6:.1f}M tok" for a in ARMS], fontsize=10.5)
+    ax.set_yticks(range(n_rows)); ax.set_yticklabels(rows, fontsize=10.5)
     ax.tick_params(length=0)
     for sp in ax.spines.values():
         sp.set_visible(False)
-    for i in range(len(ARMS) + 1):
+    for i in range(n_rows + 1):
         ax.axhline(i - 0.5, color="white", lw=2)
     for j in range(len(cols) + 1):
         ax.axvline(j - 0.5, color="white", lw=2)
-    for i, a in enumerate(ARMS):
+    if extra:
+        ax.add_patch(plt.Rectangle((-0.5, len(ARMS) - 0.5), len(cols), 1, color="white", zorder=5))   # blank the spacer row
+    for i in range(n_rows):
+        a = ARMS[i] if i < len(ARMS) else None
         for j, k in enumerate(cols):
             v = M[i, j]
             if np.isnan(v):
                 continue
-            ax.text(j, i, f"{v:+.2f}", ha="center", va="center", fontsize=10.5, color="white" if abs(v) > 0.6 * vlim else INK)
-            if k in OWN[a]:
+            ax.text(j, i, f"{v:+.2f}", ha="center", va="center", fontsize=10.5, color="white" if abs(v) > 0.6 * vlim else INK, zorder=7)
+            if a and k in OWN[a]:
                 ax.add_patch(plt.Rectangle((j - 0.45, i - 0.45), 0.9, 0.9, fill=False, ec=INK, lw=2.4, zorder=6))
-    cax = fig.add_axes([0.89, 0.16, 0.012, 0.60])
+    cax = fig.add_axes([0.89, 0.15, 0.012, 0.62])
     cb = fig.colorbar(im, cax=cax); cb.set_label("Δ vs init", fontsize=9); cb.ax.tick_params(labelsize=8)
     gen = budget["rl"]["generated_tokens_M"]; lo, hi = min(gen.values()), max(gen.values())
-    fig.text(0.02, 0.93, "Midtrain + 100 RL steps: structured direction families lift SAE and MLP fidelity, real acts improve in every mixed arm, J-lens never moves",
+    fig.text(0.02, 0.93 if not extra else 0.94, "Midtrain + 100 RL steps: structured direction families lift SAE and MLP fidelity, real acts improve in every mixed arm, J-lens never moves",
              fontsize=12.5, color=INK, va="center")
-    fig.text(0.02, 0.855, "\n".join(textwrap.wrap(f"Δ held-out score vs the shared init (23M real-act SFT). Each row: midtrain on 200k examples (100k real acts + 100k of the named family; "
-                                                    f"target tokens in the label) → 100 GRPO steps × 2048 rollouts ({lo:.0f}–{hi:.0f}M generated tokens). Black box = the arm's own family.", 165)),
-             fontsize=9, color="#52514e", va="top")
+    sub = (f"Δ held-out score vs the shared init (23M real-act SFT). Each row: midtrain on 200k examples (100k real acts + 100k of the named family; "
+           f"target tokens in the label) → 100 GRPO steps × 2048 rollouts ({lo:.0f}–{hi:.0f}M generated tokens). Black box = the arm's own family.")
+    if extra:
+        r = extra["source"]
+        sub += (f"  *Reference, not part of the matrix: midtrain on the full 1.1M all-families mix (≈{r['midtrain']['target_tokens_est'] / 1e6:.0f}M target tokens) → 100 GRPO steps at 2x the batch "
+                f"(4096 rollouts/step, ≈{r['rl']['generated_tokens_M']:.0f}M generated tokens) on the 7-family bank incl. MLP neurons; same init lineage.")
+    fig.text(0.02, 0.855 if not extra else 0.875, "\n".join(textwrap.wrap(sub, 165)), fontsize=9, color="#52514e", va="top")
     for ext in ("png", "pdf"):
         fig.savefig(f"{OUT}/{fname}.{ext}", dpi=170)
     plt.close(fig)
