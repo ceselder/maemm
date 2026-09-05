@@ -175,7 +175,8 @@ for lr, c in zip(LRS, COLORS):
     fin = [x for x in ls if math.isfinite(x)]
     loss_summary[RUN(lr)] = {"first10_mean": statistics.mean(fin[:10]) if fin else None, "last10_mean": statistics.mean(fin[-10:]) if fin else None,
                              "min": min(fin) if fin else None, "n_nonfinite": len(ls) - len(fin), "last_step": st[-1]}
-    ax.plot([s * EFF_BATCH / 1e6 for s in st], sm, color=c if lr not in DIVERGED else "#9a3b8f", lw=1.6, ls="-" if lr not in DIVERGED else "--",
+    ax.plot([s * EFF_BATCH / 1e6 for s in st], sm, color=c if lr not in DIVERGED else "#9a3b8f", lw=1.6,
+            ls="-" if lr not in DIVERGED else ["--", ":", "-."][sorted(DIVERGED).index(lr) % 3],   # distinct dashes per diverged arm
             label=f"lr {lr:g}" + (" (diverged, cancelled)" if lr in DIVERGED else ""))
 ax.set_xlabel("examples seen (millions)"); ax.set_ylabel(f"next-token CE on target tokens ({win}-point running mean)")
 if loss_summary:
