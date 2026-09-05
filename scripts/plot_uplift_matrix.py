@@ -42,11 +42,12 @@ COLS = [("eval/mean_all", "mean_all\n(11 fams)", True),
         ("eval/realact_long/cos", "acts long", True), ("eval/indist_realact/cos", "acts in-dist", True), ("eval/indist_long/cos", "long in-dist", True),
         ("eval/bsf/cos", "BSF", True), ("eval/sae/norm_act", "SAE\nnorm act", True), ("eval/sae/rank1_frac", "SAE\nrank-1", True),
         ("eval/cluster/cos", "probes", True), ("eval/indist_probe/cos", "probes\nin-dist", True), ("eval/jlens/cos", "J-lens", True),
-        ("eval/mlp/cos", "MLP\nneurons", True), ("eval/mlp_pair/cos", "MLP\npairs", True), ("eval/random/cos", "random\n(control, low)", False)]
+        ("eval/mlp/cos", "MLP\nneurons cos", True), ("eval/mlp/norm_act", "MLP\nfire-back", True), ("eval/mlp_pair/cos", "MLP\npairs cos", True),
+        ("eval/random/cos", "random\n(control, low)", False)]
 # which columns are the arm's OWN training family (in-distribution for that arm; every arm also trains on real acts)
 OWN = {"acts_sae": {"eval/sae/norm_act", "eval/sae/rank1_frac"}, "acts_bsf": {"eval/bsf/cos"},
        "acts_cluster": {"eval/cluster/cos", "eval/indist_probe/cos"}, "acts_realact_long": {"eval/realact_long/cos", "eval/indist_long/cos"},
-       "acts_mlp": {"eval/mlp/cos", "eval/mlp_pair/cos"}, "acts100": set()}
+       "acts_mlp": {"eval/mlp/cos", "eval/mlp/norm_act", "eval/mlp_pair/cos"}, "acts100": set()}
 REALACT_COLS = {"eval/realact/cos", "eval/realact_early/cos", "eval/realact_mid/cos", "eval/indist_realact/cos"}
 RL_STEPS = [25, 50, 100]
 
@@ -220,7 +221,7 @@ def heatmap(M, title, subtitle, fname, vlim=0.10, ref_row=None):
             strong = abs(v) > 0.6 * vlim
             ax.text(j, i, f"{v:+.3f}", ha="center", va="center", fontsize=8.6, color="white" if strong else INK)
             if k in OWN[a]:
-                ax.add_patch(plt.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False, ec=INK, lw=2.2))
+                ax.add_patch(plt.Rectangle((j - 0.45, i - 0.45), 0.9, 0.9, fill=False, ec=INK, lw=2.6, zorder=6))
     if ref_row is not None:
         ax.add_patch(plt.Rectangle((-0.5, ref_row - 0.5), len(COLS), 1, fill=False, ec=MUTED, lw=1.2, ls=(0, (2, 2))))
     cb = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.01)
@@ -267,11 +268,12 @@ def family_bars(table, stage, title, fname):
             ax.set_ylim(max(0, lo - pad) if k != "eval/random/cos" else 0, hi + pad)
     for ax in list(axes.flat)[n:]:
         ax.axis("off")
-    fig.suptitle(title, fontsize=12, x=0.01, ha="left", color=INK)
-    fig.text(0.01, 0.955, "orange = 100%-real-activations control arm; blue = 50/50 arms; dashed line = the common init before any midtraining. "
-             "Bars: 512 held-out directions per family, best-of-4 samples, cosine of the clean model's layer-42 activation (SAE: normalized feature activation; random: lower is better).",
-             fontsize=8.3, color="#52514e")
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    import textwrap
+    fig.suptitle("\n".join(textwrap.wrap(title, 160)), fontsize=12, x=0.01, ha="left", color=INK)
+    fig.text(0.01, 0.945, "\n".join(textwrap.wrap("orange = 100%-real-activations control arm; blue = 50/50 arms; dashed line = the common init before any midtraining. "
+             "Bars: 512 held-out directions per family, best-of-4 samples, cosine of the clean model's layer-42 activation (SAE: normalized feature activation; "
+             "MLP fire-back: normalized neuron activation; random: lower is better).", 200)), fontsize=8.3, color="#52514e", va="top")
+    fig.tight_layout(rect=(0, 0, 1, 0.925))
     for ext in ("png", "pdf"):
         fig.savefig(f"{OUT}/{fname}.{ext}", dpi=170)
     plt.close(fig)
@@ -293,10 +295,11 @@ def rl_train_plot(runs, fname):
         ax.grid(color=GRID, lw=0.8); ax.set_axisbelow(True); ax.tick_params(labelsize=8)
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
-    axes[0].legend(frameon=False, fontsize=8, ncol=2)
-    fig.suptitle("RL on each arm's own 200k bank raises the training reward within 100 steps; arms differ in the reward level their bank permits",
-                 fontsize=11.5, x=0.01, ha="left")
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, fontsize=8.5, ncol=6, loc="lower center", bbox_to_anchor=(0.5, 0.0))
+    fig.suptitle("RL raises every arm's training reward within 100 steps; the SAE / probe / MLP banks are the hardest (lowest reward) yet transfer the most, "
+                 "so the reward level of a bank does not predict its cross-uplift", fontsize=11.5, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.93))
     for ext in ("png", "pdf"):
         fig.savefig(f"{OUT}/{fname}.{ext}", dpi=170)
     plt.close(fig)
@@ -339,15 +342,22 @@ def main():
               open(f"{OUT}/data/references.json", "w"), indent=1)
     json.dump(runs, open(f"{OUT}/data/runs.json", "w"), indent=1)
 
-    heatmap(M_sft, "After the 200k midtrain, each 50/50 arm gains on its OWN family (outlined) but the other families barely move",
+    heatmap(M_sft, "The 200k midtrain (lr 1e-4, one epoch) LOWERS every held-out family in every arm — even the 100%-real-activations control — "
+                   "except the arm whose second half is long-context activation windows; SAE and probe rows keep only their own family",
             "delta vs the common init (23M realact-only SFT final) after 1 epoch of SFT on 100k real acts + 100k of family X (control: 200k real acts). "
-            "Rows = training arm, columns = held-out eval family; outlined cells = the arm's own X family.",
+            "Rows = training arm, columns = held-out eval family; outlined cells = the arm's own X family. The shared real-acts half is a short-context "
+            "prefix harvest (exact re-encodable pairs), a different target style from the init's activation windows.",
             "uplift_sft_delta_heatmap")
-    heatmap(M_rl, "After midtrain + 100 RL steps on the same bank, every arm lifts real-activation fidelity; cross-family gains stay concentrated on the trained family",
-            "delta vs the common init after SFT + RL@100 (CISPO/ScaleRL cosine reward, 128 groups x 16, lr 1e-5, 10 warmup steps). Outlined = the arm's own X family.",
+    heatmap(M_rl, "100 RL steps on the same bank undo the midtrain damage in every arm and lift real-activation fidelity above the init; "
+                  "every structured-direction arm (SAE, BSF, probes, MLP) also lifts SAE-feature fidelity and MLP fire-back far above the init",
+            "delta vs the common init after SFT + RL@100 (CISPO/ScaleRL cosine reward over the last 5 tokens, 128 directions x 16 samples per step, lr 1e-5, "
+            "10 warmup steps). Outlined = the arm's own X family.",
             "uplift_rl_delta_heatmap")
-    heatmap(M_x, "Cross-uplift at RL@100: relative to the 100%-real-acts control, adding family X mostly buys X itself (outlined); off-family columns are the cross-uplift",
-            "delta vs the acts100 control arm at RL@100 (same init, same step count, same recipe; only the bank differs). Outlined = the arm's own X family.",
+    heatmap(M_x, "Cross-uplift at RL@100 vs the 100%-real-activations control: every structured-direction family (SAE, BSF, probes, MLP) transfers to SAE-feature "
+                 "fidelity (+0.12 to +0.38) and MLP fire-back (+0.21 to +0.40) and lifts real activations (+0.02 to +0.04); long-context windows lift only activations; "
+                 "nothing moves J-lens",
+            "delta vs the acts100 control arm at RL@100 (same init, same step count, same recipe; only the 100k X half of the bank differs). "
+            "Outlined = the arm's own X family; real-activation columns are in-distribution for every arm.",
             "uplift_rl_vs_control_heatmap", ref_row=0)
     family_bars(table, "sft", "Absolute held-out scores after the 200k midtrain, per eval family: the control (orange) vs each 50/50 arm (blue) vs the init (dashed)",
                 "uplift_family_bars_sft")
