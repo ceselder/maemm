@@ -96,4 +96,40 @@ fig.tight_layout(rect=(0, 0.105, 1, 0.965))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/rl_pretrain_effect.{ext}", dpi=160)
 plt.close(fig)
+# ---- figure 2: the "all evals on one axis" view — one panel per arm, every named held-out eval as a line ----
+ONE_AXIS = [  # (key, legend label, colour, linestyle, marker)
+    ("eval/sae/norm_act", "SAE norm_act: held-out SAE feature activation on the generated text ÷ that feature's corpus max", "#b5542b", "-", "o"),
+    ("eval/sae/rank1_frac", "SAE rank-1 fraction: at the reward token the target feature is the top-1 active feature", "#c99a2e", "-", "D"),
+    ("eval/sae/unverbalized_frac", "SAE unverbalized fraction: held-out features the inverter cannot make fire at all (lower = better)", "#8c2d2d", "--", "x"),
+    ("eval/sae/cos", "SAE held-out: cosine of L42 activation to the held-out SAE feature direction", "#e08a5b", ":", "o"),
+    ("eval/realact/cos", "real acts held-out (short ctx): cosine to a held-out real L42 activation", "#6b4c9a", "-", "s"),
+    ("eval/realact_long/cos", "real acts held-out (long ctx 256–511): cosine", "#9a7fc4", "--", "s"),
+    ("eval/bsf/cos", "BSF held-out: cosine to held-out BSF subspace directions", "#4a6fa5", "-", "v"),
+    ("eval/cluster/cos", "cluster probes held-out: cosine to held-out cluster-probe directions", "#2a7f62", "-", "^"),
+    ("eval/jlens/cos", "J-lens: cosine to unit(W_U[t] · J_42), an unembed row pulled back to layer 42", "#9a3b8f", "-", "P"),
+    ("eval/random/cos", "random directions (control floor): cosine", "#888888", "--", "x"),
+]
+fig, axes = plt.subplots(2, 2, figsize=(17, 11), sharex=True, sharey=True)
+for ax, (label, cfg) in zip(axes.flat, RUNS.items()):
+    rows = data["runs"][label]["evals"]
+    for k, lab, col, ls, mk in ONE_AXIS:
+        pts = [(r["rollouts"] / 1e6, r[k]) for r in rows if isinstance(r.get(k), (int, float))]
+        if pts:
+            ax.plot([x for x, _ in pts], [y for _, y in pts], marker=mk, ls=ls, color=col, ms=4, lw=1.6, label=lab)
+    ax.set_xscale("log"); ax.grid(alpha=0.25); ax.tick_params(labelsize=9)
+    ax.set_xticks([0.05, 0.1, 0.2, 0.4, 0.8]); ax.set_xticklabels(["0.05", "0.1", "0.2", "0.4", "0.8"]); ax.minorticks_off()
+    ax.set_title(label.replace("  |  ", "\n"), fontsize=9.5, loc="left")
+for ax in axes[-1]:
+    ax.set_xlabel("rollouts seen (millions, log)", fontsize=10)
+for ax in axes[:, 0]:
+    ax.set_ylabel("held-out eval metric (cosine / norm_act / fraction)", fontsize=10)
+h, l = axes.flat[0].get_legend_handles_labels()
+fig.legend(h, l, loc="lower center", ncol=2, frameon=False, fontsize=8.8, bbox_to_anchor=(0.5, 0.0))
+fig.suptitle("Every held-out eval on one axis, per RL arm (same ScaleRL recipe, lr 7e-6; arms differ in SFT init, RL bank and rollouts/step — see panel titles):\n"
+             "the all-families arms lift SAE norm_act/rank-1 and cut unverbalized features while the realact-only-bank arm moves only the real-activation lines; random stays at the floor",
+             fontsize=11.5, y=0.995)
+fig.tight_layout(rect=(0, 0.13, 1, 0.955))
+for ext in ("png", "pdf"):
+    fig.savefig(f"{OUT}/rl_all_evals_one_axis.{ext}", dpi=160)
+plt.close(fig)
 print("wrote rl_pretrain_effect:", {k: len(v["evals"]) for k, v in data["runs"].items()})
