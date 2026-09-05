@@ -415,8 +415,9 @@ def main():
         # suffix forward through `ddp` (primes DDP's reducer once per step), prefix forward through the bare model
         prefix_cache = PrefixCache(ddp, prompt_ids, mpos[0], tok.pad_token_id, submodule, STEER_COEFF, device,
                                    prefix_model=model, persistent_injector=persistent_injector,
-                                   # FSDP2 registers backward hooks on the layer output: inject on a clone, never in place
-                                   inject_mode="add_clone" if a.full_ft else "add")
+                                   # FSDP2 registers backward hooks on the layer output: inject on a clone, never in place;
+                                   # and its pre-backward unshard hangs on module outputs -> the prefix output needs a grad path
+                                   inject_mode="add_clone" if a.full_ft else "add", keep_prefix_grad_path=a.full_ft)
         assert a.prefix_accum >= 1 and a.batch_size % a.prefix_accum == 0, "--prefix-accum must divide --batch-size"
         if is_main:
             print(f"[pretrain] prefix-cache ON: shared prefix {prefix_cache.prefix_len} tokens, suffix = "

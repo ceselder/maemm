@@ -79,18 +79,19 @@ def injection_probe(model, inject_layer, log=print, tag="fullft"):
     (suffix index 0 in the prefix-cache path) of the injection layer's output BEFORE the injection hook (a forward
     hook registered before it) with the next layer's INPUT (after every hook). Norm-matched addition of a unit
     vector gives ratio ~ sqrt(2 + 2 cos) ~ 1.41; ratio 1.00 means the hook did NOT fire."""
-    cap = {}
+    pairs, pending = [], {}   # one (seq_len, batch, pre-norm, post-norm) per forward: the prefix forward (no injection) and the suffix forward
     L = model.model.layers
 
     def pre_inj(_m, _i, out):
         h = out[0] if isinstance(out, tuple) else out
         if h.shape[1] > 1:
-            cap["pre"] = h[:, 0].detach().float().norm(dim=-1)
+            pending["pre"] = (h.shape[1], h.shape[0], h[:, 0].detach().float().norm(dim=-1))
 
     def next_in(_m, args, kwargs):
         h = args[0] if args else kwargs.get("hidden_states")
-        if h is not None and h.shape[1] > 1 and "pre" in cap and "post" not in cap:
-            cap["post"] = h[:, 0].detach().float().norm(dim=-1)
+        if h is not None and h.shape[1] > 1 and "pre" in pending:
+            Lq, B, pre = pending.pop("pre")
+            pairs.append((Lq, B, pre, h[:, 0].detach().float().norm(dim=-1)))
 
     h1 = L[inject_layer].register_forward_hook(pre_inj)
     h2 = L[inject_layer + 1].register_forward_pre_hook(next_in, with_kwargs=True)
@@ -98,13 +99,14 @@ def injection_probe(model, inject_layer, log=print, tag="fullft"):
         yield
     finally:
         h1.remove(); h2.remove()
-        if "pre" in cap and "post" in cap:
-            r = (cap["post"] / cap["pre"].clamp_min(1e-6))
-            log(f"[{tag}] injection check @layer {inject_layer}: marker-row norm ratio post/pre = {r.mean():.3f} "
-                f"(min {r.min():.3f} max {r.max():.3f}; ~1.41 expected, 1.00 = hook NOT firing) -> "
-                f"{'OK' if r.mean() > 1.2 else 'FAIL'}")
-        else:
-            log(f"[{tag}] injection check: probe captured nothing ({sorted(cap)})")
+        if not pairs:
+            log(f"[{tag}] injection check: probe captured nothing")
+        for Lq, B, pre, post in pairs:
+            r = post / pre.clamp_min(1e-6)
+            kind = "prefix forward, no injection expected" if B == 1 and Lq > 32 else "suffix forward, marker = index 0"
+            log(f"[{tag}] injection check @layer {inject_layer} [{kind}; B={B} L={Lq}]: marker-row norm ratio post/pre = "
+                f"{r.mean():.3f} (min {r.min():.3f} max {r.max():.3f}; ~1.41 expected on the suffix, 1.00 = no injection) -> "
+                f"{'OK' if (r.mean() > 1.2) == (kind.startswith('suffix')) else 'FAIL'}")
 
 
 # ---------------------------------------------------------------------------------------------------------------

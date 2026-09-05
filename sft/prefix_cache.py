@@ -106,7 +106,7 @@ class PrefixCache:
 
     def __init__(self, model, prompt_ids, marker, pad_id, inject_module, coeff, device,
                  inject_dtype=torch.bfloat16, inject_mode="add", pad_multiple=8, prefix_model=None,
-                 persistent_injector=None, compile_prefix=None):
+                 persistent_injector=None, compile_prefix=None, keep_prefix_grad_path=False):
         """
         model: the model to run (PEFT-wrapped, possibly DDP-wrapped) -- used for the SUFFIX forward.
         prefix_model: module used for the PREFIX forward. Under DDP pass the unwrapped ``ddp.module`` so DDP's reducer
@@ -119,6 +119,11 @@ class PrefixCache:
         compile_prefix: None | "default" | "reduce-overhead" -- torch.compile ONLY the prefix call (fully static
             shape [1, prefix_len]; the eager 64-layer PEFT forward+backward at batch 1 is launch/Python-bound).
             The suffix forward stays eager (its cache inputs make Dynamo recompile endlessly).
+        keep_prefix_grad_path: add ``0 * prefix_logits.sum()`` to the loss. The loss depends on the prefix forward ONLY
+            through the caches, so the LAST layer's prefix output never receives a gradient. FSDP2 (fully_shard) hangs its
+            pre-backward "all-gather the params" hook on module OUTPUTS, so without this term the last layer's params are
+            still sharded when the cache path's gradient reaches them (setStorage ... storage of size 0). Zero-weight,
+            so the optimization is unchanged; needed for --full-ft, a no-op for DDP/LoRA.
         """
         check_transformers()
         if not (0 < marker < len(prompt_ids)):
@@ -138,6 +143,8 @@ class PrefixCache:
         self.pad_multiple = pad_multiple
         self.persistent_injector = persistent_injector
         self._prefix_tensor = torch.tensor(self.prefix_ids, dtype=torch.long, device=device)[None]
+        self.keep_prefix_grad_path = keep_prefix_grad_path
+        self._prefix_logits = None
         self.compile_prefix = compile_prefix
         if compile_prefix:
             fwd = self.prefix_model.forward if hasattr(self.prefix_model, "forward") else self.prefix_model
@@ -182,6 +189,7 @@ class PrefixCache:
         cache = out.past_key_values
         if cache is None:
             raise RuntimeError("prefix forward returned no cache (use_cache ignored?)")
+        self._prefix_logits = out.logits if self.keep_prefix_grad_path else None   # [1, 1, V] (logits_to_keep=1)
         return cache
 
     def forward(self, vecs, targets, autocast=contextlib.nullcontext, max_len=None, prefix_cache=None, timings=None):
@@ -231,8 +239,12 @@ class PrefixCache:
         # states are 150 MB per example for the 27B).
         del cache
         out.past_key_values = None
+        loss = out.loss
+        if self.keep_prefix_grad_path and self._prefix_logits is not None:   # see __init__: FSDP2 needs a grad path through the prefix output
+            loss = loss + 0.0 * self._prefix_logits.float().sum()
+            self._prefix_logits = None                                        # once per prefix forward (prefix_accum > 1 shares it)
         t3 = _tick()
         if timings is not None:
             timings.update(prefix_fwd_s=t1 - t0, expand_s=t2 - t1, suffix_fwd_s=t3 - t2)
-        return SimpleNamespace(loss=out.loss, logits=out.logits, labels=labels, suffix_mask=smask,
+        return SimpleNamespace(loss=loss, logits=out.logits, labels=labels, suffix_mask=smask,
                                n_target_tokens=int((labels != -100).sum()), suffix_len=L, prefix_len=P)
