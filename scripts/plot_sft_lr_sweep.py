@@ -8,6 +8,7 @@ import json
 import math
 import os
 import statistics
+import textwrap
 
 import matplotlib
 matplotlib.use("Agg")
@@ -100,20 +101,30 @@ if have:
         claim += f"; lr >= {min(DIVERGED):g} diverges (train loss 7-10 from the first 100 steps)"
     data["claim"] = claim
     json.dump(data, open(f"{OUT}/data/lr_sweep.json", "w"), indent=1)
-    fig, axes = plt.subplots(2, 4, figsize=(15, 6.8))
+    fig, axes = plt.subplots(2, 4, figsize=(15, 7.2))
     for ax, (m, title) in zip(axes.flat, FINAL_PANELS):
         xs = [lr for lr in have if finals[lr].get(m) is not None]
         ys = [finals[lr][m] for lr in xs]
         ax.plot(xs, ys, "-", color="#b5542b", lw=1.5, zorder=2)
-        for lr, y, c, mk in zip(LRS, [finals[lr].get(m) if finals[lr] else None for lr in LRS], COLORS, MARKERS):
+        # y-range from the stable arms + references only: the diverged arms sit at ~0 and would flatten every difference
+        span = ys + [v for vals in REF.values() for v in ([vals[m]] if m in vals and not isinstance(vals[m], tuple) else list(vals[m]) if m in vals else [])]
+        if span:
+            lo, hi = min(span), max(span); pad = max(0.02, 0.18 * (hi - lo))
+            lo, hi = lo - pad, hi + pad
+            ax.set_ylim(lo, hi)
+        else:
+            lo, hi = ax.get_ylim()
+        for i, (lr, y, c, mk) in enumerate(zip(LRS, [finals[lr].get(m) if finals[lr] else None for lr in LRS], COLORS, MARKERS)):
             if y is None:
                 continue
             if lr in DIVERGED:
-                ax.plot([lr], [y], "x", color="#9a3b8f", ms=8, mew=1.6, zorder=3, label="diverged arm (train loss 7-10); its 0.5M-example checkpoint")
-                ax.annotate(f"{y:.3f}\ndiverged", (lr, y), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=7, color="#9a3b8f")
+                y_draw = lo + 0.06 * (hi - lo)
+                ax.plot([lr], [y_draw], "x", color="#9a3b8f", ms=8, mew=1.6, zorder=3, clip_on=False,
+                        label="diverged arm (train loss 7-10): its 0.5M-example checkpoint, drawn OFF SCALE at the axis bottom")
+                ax.annotate(f"{y:.3f}\n(off scale)", (lr, y_draw), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=6.5, color="#9a3b8f")
             else:
                 ax.plot([lr], [y], mk, color=c, ms=7, mec="#333", mew=0.5, zorder=3)
-                ax.annotate(f"{y:.3f}", (lr, y), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=7.5, color="#333")
+                ax.annotate(f"{y:.3f}", (lr, y), textcoords="offset points", xytext=(0, 7 if i % 2 == 0 else -13), ha="center", fontsize=7.5, color="#333")
         for i, (rname, vals) in enumerate(REF.items()):
             if m in vals:
                 v = vals[m]
@@ -131,9 +142,9 @@ if have:
         for h, l in zip(*ax.get_legend_handles_labels()):
             seen.setdefault(l, h)
     fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=2, frameon=False, fontsize=8.5, bbox_to_anchor=(0.5, -0.01))
-    fig.suptitle(claim + "\n(Qwen3.6-27B inverter, LoRA r64 rsLoRA, one epoch over the same 2M real-activation examples per arm; final annealed checkpoint; 512 dirs/family, best-of-4)",
-                 fontsize=10, y=0.995)
-    fig.tight_layout(rect=(0, 0.06, 1, 0.94))
+    fig.suptitle(textwrap.fill(claim, 150) + "\n(Qwen3.6-27B inverter, LoRA r64 rsLoRA, one epoch over the same 2M real-activation examples per arm; final annealed checkpoint; 512 dirs/family, best-of-4)",
+                 fontsize=9.5, y=0.995)
+    fig.tight_layout(rect=(0, 0.06, 1, 0.92))
     for ext in ("png", "pdf"):
         fig.savefig(f"{OUT}/lr_sweep_final_vs_lr.{ext}", dpi=160)
     plt.close(fig)
@@ -142,10 +153,11 @@ if have:
 fig, axes = plt.subplots(2, 5, figsize=(17, 6.8), sharex=True)
 for ax, (m, title) in zip(axes.flat, EVAL):
     for lr, c, mk in zip(LRS, COLORS, MARKERS):
+        if lr in DIVERGED:      # one ~0 point each; shown off-scale in the headline figure instead
+            continue
         rows = [r for r in data["arms"][RUN(lr)]["evals"] if r.get(m) is not None]
         if rows:
-            ax.plot([r["examples"] / 1e6 for r in rows], [r[m] for r in rows], "-", marker=mk if lr not in DIVERGED else "x", color=c if lr not in DIVERGED else "#9a3b8f",
-                    ms=4 if lr not in DIVERGED else 7, lw=1.4, mec="#333", mew=0.4 if lr not in DIVERGED else 1.4, label=f"lr {lr:g}" + (" (diverged, cancelled)" if lr in DIVERGED else ""))
+            ax.plot([r["examples"] / 1e6 for r in rows], [r[m] for r in rows], "-", marker=mk, color=c, ms=4, lw=1.4, mec="#333", mew=0.4, label=f"lr {lr:g}")
     for i, (rname, vals) in enumerate(REF.items()):
         if m in vals:
             v = vals[m]
@@ -161,8 +173,8 @@ for ax in axes.flat:
     for h, l in zip(*ax.get_legend_handles_labels()):
         seen.setdefault(l, h)
 fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=4, frameon=False, fontsize=8.5, bbox_to_anchor=(0.5, -0.01))
-fig.suptitle("Held-out fidelity along training for each SFT learning rate (same 2M real-activation examples, OneCycle schedule; intermediate checkpoints are not annealed)",
-             fontsize=10.5, y=0.995)
+fig.suptitle("Held-out fidelity along training for each stable SFT learning rate (same 2M real-activation examples, OneCycle schedule; intermediate checkpoints are not annealed; "
+             + ", ".join(f"{lr:g}" for lr in sorted(DIVERGED)) + " diverged and are omitted)", fontsize=10, y=0.995)
 fig.tight_layout(rect=(0, 0.07, 1, 0.95))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/lr_sweep_curves.{ext}", dpi=160)
