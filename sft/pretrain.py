@@ -267,6 +267,10 @@ def main():
                     help="synchronize and report MFU every N optimizer steps (1 for trustworthy microbenchmarks)")
     ap.add_argument("--save-examples", default="",
                     help="comma-separated global example counts for scaling-curve checkpoints")
+    ap.add_argument("--max-examples", type=int, default=0,
+                    help="0 = the whole bank; N = train on a seeded random subset of N records (equal per-rank shards). "
+                         "Fixed data budget for lr / scaling sweeps; the OneCycle schedule spans the subset.")
+    ap.add_argument("--max-examples-seed", type=int, default=0, help="seed of the --max-examples subset")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--n-ckpts", type=int, default=0,
                     help=">0: save this many evenly-spaced checkpoints (every 100/N %% of training); else every 2000 steps")
@@ -289,11 +293,19 @@ def main():
         tok.pad_token = tok.eos_token
     # stream + shard while reading: 20M-record banks would otherwise put 8 full copies of the record list in host RAM
     n_lines = sum(1 for _ in open(f"{a.data_dir}/records.jsonl", "rb"))
-    keep = n_lines // world                                   # equal shards (see below)
+    n_use = min(n_lines, a.max_examples) if a.max_examples else n_lines
+    keep = n_use // world                                     # equal shards (see below)
+    if n_use < n_lines:   # --max-examples: seeded random subset of the bank, dealt round-robin into equal per-rank shards
+        chosen = np.sort(np.random.default_rng(a.max_examples_seed).permutation(n_lines)[:n_use])
+        mine = set(chosen[rank::world][:keep].tolist())
+        take = mine.__contains__
+        del chosen
+    else:
+        take = lambda i: i % world == rank
     records = []
     with open(f"{a.data_dir}/records.jsonl") as f:
         for i, l in enumerate(f):
-            if i % world == rank and len(records) < keep:
+            if take(i) and len(records) < keep:
                 records.append(json.loads(l))
     vec_path, vec_bytes = next((os.path.join(a.data_dir, fn), np.dtype(dt).itemsize) for fn, dt in VEC_BANK_FILES
                                if os.path.exists(os.path.join(a.data_dir, fn)))
