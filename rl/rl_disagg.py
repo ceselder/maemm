@@ -172,7 +172,7 @@ def parse_args(argv=None):
     ap.add_argument("--kl-cap", type=float, default=10.0)
     # inline eval flags accepted for launcher compatibility; see inline_eval_stub()
     ap.add_argument("--inline-eval-every", type=int, default=0)
-    ap.add_argument("--eval-cache", default="/data/eval_universal_ho/eval_sets_heldout.pt")
+    ap.add_argument("--eval-cache", default=os.environ.get("MAEMM_EVAL_CACHE", "/data/eval_universal_ho/eval_sets_heldout.pt"))
     ap.add_argument("--eval-sae", default="/data/sae/ae.pt")
     ap.add_argument("--eval-bo", type=int, default=4)
     ap.add_argument("--eval-temp", type=float, default=1.0)

@@ -484,18 +484,26 @@ def load_eval_assets(a, device, is_main):
         assert es["meta"]["d_sae"] == sae.d_sae, f"cache d_sae {es['meta']['d_sae']} != SAE {sae.d_sae}"
         sae.W_dec = None   # decoder unused by encode_features / sae_rank_at_peaks -> free 2.7 GB next to the actor + vLLM
         fams = list(es["meta"].get("cos_families", EU.COS_FAMILIES))
+        xfams = EU.extra_families(es)   # cache v2 extras (mlp / mlp_pair): cosine + fire-back, NEVER in mean_all
         for fam in fams:
             assert f"{fam}_dirs" in es, f"eval cache lacks {fam}_dirs"
+        for fam in xfams:
+            for suf in ("_dirs", "_neuron", "_polarity", "_corpus_max"):
+                assert f"{fam}{suf}" in es, f"eval cache lacks {fam}{suf}"
         if a.eval_n_per_family > 0:   # cost control: first n rows of every family (frozen order -> same subset every ckpt)
             n = a.eval_n_per_family
             for fam in fams:
                 es[f"{fam}_dirs"] = es[f"{fam}_dirs"][:n]
+            for fam in xfams:
+                for suf in ("_dirs", "_neuron", "_polarity", "_corpus_max"):
+                    es[f"{fam}{suf}"] = es[f"{fam}{suf}"][:n]
             es["sae_dirs"], es["sae_feats"] = es["sae_dirs"][:n], list(es["sae_feats"])[:n]
             es["corpus_peak"] = es["corpus_peak"][:n]
-        ev = {"EU": EU, "es": es, "sae": sae, "fams": fams, "feats": list(es["sae_feats"]),
+        ev = {"EU": EU, "es": es, "sae": sae, "fams": fams, "xfams": xfams, "feats": list(es["sae_feats"]),
               "cp": es["corpus_peak"].numpy().astype(np.float64)}
         if is_main:
             print(f"[inline-eval] ready: families {fams} n={len(es[fams[0] + '_dirs'])} (cache n={es['meta'].get('n')}) | sae feats {len(ev['feats'])} "
+                  f"| extra families {xfams} n={[len(es[f + '_dirs']) for f in xfams]} (cache {a.eval_cache}) "
                   f"| bo={a.eval_bo} temp={a.eval_temp} tokens {a.eval_min_new}-{a.eval_max_new} | every {a.inline_eval_every} steps",
                   flush=True)
         return ev
@@ -569,6 +577,21 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
             local["sae_peak"] = {int(i): pk[j].half().numpy().tobytes() for j, i in enumerate(rows)}   # fp16 bytes (≈10 KB/row)
         else:
             local["sae"], local["sae_peak"] = {}, {}
+        # extra families (cache v2: layer-42 MLP neurons / co-firing pairs): cosine + clean-base fire-back
+        for fam in EV.get("xfams", []):
+            du = es[f"{fam}_dirs"]
+            rows, texts = gen(du)
+            local[fam], local[f"{fam}_na"], local[f"{fam}_na_any"] = {}, {}, {}
+            if rows:
+                rr = [i for i in rows for _ in range(bo)]
+                rd = F.normalize(torch.stack([du[i] for i in rr]).float(), dim=-1)
+                cos = EU.score_probe_cos(texts, rd, actor, tok, device).view(len(rows), bo).max(1).values
+                na_min, na_max = EU.score_mlp_fireback(texts, es[f"{fam}_neuron"][rr], es[f"{fam}_polarity"][rr],
+                                                       es[f"{fam}_corpus_max"][rr], actor, tok, device)
+                na_min = na_min.view(len(rows), bo).max(1).values; na_max = na_max.view(len(rows), bo).max(1).values
+                local[fam] = {int(i): float(c) for i, c in zip(rows, cos.tolist())}
+                local[f"{fam}_na"] = {int(i): float(v) for i, v in zip(rows, na_min.tolist())}
+                local[f"{fam}_na_any"] = {int(i): float(v) for i, v in zip(rows, na_max.tolist())}
     except Exception as e:  # noqa
         local = {"error": f"rank{rank}: {type(e).__name__}: {str(e)[:300]}"}
     gathered = [None] * world
@@ -607,8 +630,18 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
     out["eval/sae/beat_corpus"] = float(np.mean(best > cp))
     out["eval/sae/unverbalized_frac"] = float(np.mean(best <= EU.SAE_FIRE))
     out["eval/sae/unverbalized_p10"] = float(np.mean(na < 0.10))
+    # mean_all over the cos families only (no control, no sae/cos diagnostic, no cache-v2 extra families)
     cos_keys = [k for k in out if k.startswith("eval/") and k.endswith("/cos") and k.split("/")[1] not in EU.CONTROL_FAMS and k.split("/")[1] != "sae"]   # sae/cos is a diagnostic, not a mean_all family
     out["eval/mean_all"] = float(np.mean([out[k] for k in cos_keys]))
+    for fam in EV.get("xfams", []):
+        idx = sorted(merged[fam])
+        out[f"eval/{fam}/cos"] = float(np.mean([merged[fam][i] for i in idx]))
+        k = int(es[f"{fam}_neuron"].shape[1])
+        out.update(EU.mlp_metrics(fam, [merged[f"{fam}_na"][i] for i in idx],
+                                  [merged[f"{fam}_na_any"][i] for i in idx] if k > 1 else None))
+        out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
+        out[f"eval/all/{fam}_norm_act"] = out[f"eval/{fam}/norm_act"]
+        out[f"eval/all/{fam}_fired10"] = out[f"eval/{fam}/fired10"]
     for fam in EV["fams"]:
         out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
     out["eval/all/sae_norm_act"] = out["eval/sae/norm_act"]
@@ -821,7 +854,8 @@ def parse_args():
     ap.add_argument("--inline-eval-every", type=int, default=0,
                     help="run the held-out eval suite INSIDE the trainer on all ranks every N steps (vLLM gen + clean-base "
                          "scoring, logged into this run with x-axis ckpt_step). 0 = off. vllm engine only.")
-    ap.add_argument("--eval-cache", default="/data/eval_universal_ho/eval_sets_heldout.pt")
+    ap.add_argument("--eval-cache", default=os.environ.get("MAEMM_EVAL_CACHE", "/data/eval_universal_ho/eval_sets_heldout.pt"),
+                    help="frozen eval-set cache (env MAEMM_EVAL_CACHE); eval_sets_heldout_v2.pt adds the mlp / mlp_pair extra families")
     ap.add_argument("--eval-sae", default="/data/sae/ae.pt")
     ap.add_argument("--eval-bo", type=int, default=4)
     ap.add_argument("--eval-temp", type=float, default=1.0)

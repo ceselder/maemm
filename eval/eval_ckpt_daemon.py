@@ -51,7 +51,9 @@ def parse_args(argv=None):
                     help="an adapter of the run's LoRA geometry to build the PEFT actor with before the engine (the SFT init)")
     ap.add_argument("--no-extra-evals", action="store_true")
     # held-out eval protocol (rl.py inline_eval flags; FULL 512/family by default)
-    ap.add_argument("--eval-cache", default="/data/eval_universal_ho/eval_sets_heldout.pt")
+    ap.add_argument("--eval-cache", default=os.environ.get("MAEMM_EVAL_CACHE", "/data/eval_universal_ho/eval_sets_heldout.pt"),
+                    help="frozen eval-set cache (env MAEMM_EVAL_CACHE). eval_sets_heldout_v2.pt = the same 11 cos families + sae PLUS the "
+                         "extra mlp / mlp_pair families (layer-42 MLP neuron cosine + fire-back; not in mean_all)")
     ap.add_argument("--eval-sae", default="/data/sae/ae.pt")
     ap.add_argument("--eval-n-per-family", type=int, default=0, help="0 = the whole cache (512/family)")
     ap.add_argument("--eval-bo", type=int, default=4)
@@ -290,6 +292,8 @@ def main():
             f"adapter {t_load:.0f}s) | mean_all {ev['eval/mean_all']:.4f} | sae norm_act {ev['eval/sae/norm_act']:.4f} "
             f"rank1 {ev.get('eval/sae/rank1_frac', float('nan')):.3f} unverb {ev['eval/sae/unverbalized_frac']:.3f} "
             f"| realact {ev.get('eval/realact/cos', float('nan')):.4f} random {ev.get('eval/random/cos', float('nan')):.4f}"
+            + "".join(f" | {f} cos {ev[f'eval/{f}/cos']:.4f} fireback {ev[f'eval/{f}/norm_act']:.3f} fired10 {ev[f'eval/{f}/fired10']:.3f}"
+                      for f in EV.get("xfams", []) if f"eval/{f}/cos" in ev)
             + (f" | locality win5 {ex.get('extra/locality/win5_share', float('nan')):.3f} fire {ex.get('extra/locality/fire_frac', float('nan')):.3f}" if ex else ""))
         flush_judge()
     if not a.no_wandb:

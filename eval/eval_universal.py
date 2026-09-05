@@ -76,6 +76,19 @@ COS_FAMILIES = ["probe", "jlens", "cluster", "random", "realact"]   # legacy fre
 COS_FAMILIES_HELDOUT = ["bsf", "realact", "jlens", "cluster", "random"]   # held-out-pool mode
 HELDOUT_POOL_FAMILIES = ["bsf", "realact", "sae", "jlens", "cluster"]     # record families in pool_heldout
 CONTROL_FAMS = {"random"}   # lower-is-better control(s): logged per-family, EXCLUDED from mean_all
+# EXTRA families (eval cache v2, data/mlp42_bank_worker.py): meta["extra_families"] lists cosine families scored IN
+# ADDITION to meta["cos_families"] and NEVER folded into eval/mean_all, so old and new runs stay comparable. Each
+# extra family <fam> ships <fam>_dirs [n, d] plus <fam>_neuron / <fam>_polarity / <fam>_corpus_max [n, k] (k members
+# per direction: 1 for "mlp" single neurons, 2 for "mlp_pair" composites) for the layer-42 MLP fire-back metric.
+EXTRA_FAMS_KEY = "extra_families"
+MLP_LAST_K = 5                       # fire-back: max over the LAST 5 kept tokens of polarity * a_i / corpus_max_i
+MLP_FIRE_LEVELS = (0.10, 0.25, 0.50)  # -> eval/<fam>/fired10 / fired25 / fired50
+ENV_EVAL_CACHE = "MAEMM_EVAL_CACHE"  # env override of the eval-cache path (rl.py / rl_disagg.py / eval_ckpt_daemon.py --eval-cache default)
+
+
+def extra_families(eval_sets):
+    """Extra (non-mean_all) cosine families present in an eval-set cache — [] for v1 caches."""
+    return list(eval_sets["meta"].get(EXTRA_FAMS_KEY, []))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -115,6 +128,97 @@ def score_probe_cos(gen_texts, dirs, actor, tok, device):
         hn = F.normalize(h.float(), dim=-1)                                 # [b,T,d]
         cos = torch.einsum("btd,bd->bt", hn, d)                             # [b,T]
         out[s:s + h.shape[0]] = cos.masked_fill(~keep, -1.0).max(1).values.float().cpu()
+    return out
+
+
+class _Stop(Exception):
+    pass
+
+
+@torch.no_grad()
+def _reencode_mlp(gen_texts, neuron_ids, actor, tok, device, sbatch=32):
+    """_reencode that ALSO returns the layer-42 MLP neuron values (down_proj input) of each row's k paired neurons.
+    neuron_ids: LongTensor / list [N, k]. Yields (s, h [b,T,d] fp32, keep [b,T], a_sel [b,k,T] fp32, lastk [b,T]) with
+    lastk = keep restricted to the last MLP_LAST_K positions of the row (sink counted in the length, as in the
+    verbalization scorer of data/mlp42_neurons_worker.py). Same tokenization / sink / 10x-median norm filter as _reencode."""
+    layer = get_layer(actor, READ_LAYER)
+    down = layer.mlp.down_proj
+    nid_all = torch.as_tensor(neuron_ids, dtype=torch.long)
+    if nid_all.dim() == 1:
+        nid_all = nid_all[:, None]
+    prev = tok.padding_side; tok.padding_side = "right"
+    sink = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
+    try:
+        for s in range(0, len(gen_texts), sbatch):
+            batch = [t if t.strip() else " " for t in gen_texts[s:s + sbatch]]
+            enc = tok(batch, return_tensors="pt", padding=True, truncation=True,
+                      max_length=95, add_special_tokens=False).to(device)
+            B = enc["input_ids"].shape[0]
+            ids = torch.cat([torch.full((B, 1), sink, device=device, dtype=enc["input_ids"].dtype), enc["input_ids"]], 1)
+            am = torch.cat([torch.ones((B, 1), device=device, dtype=enc["attention_mask"].dtype), enc["attention_mask"]], 1)
+            cap = {}
+
+            def pre(_m, inp):
+                cap["a"] = inp[0]
+
+            def post(_m, _i, out):
+                cap["h"] = (out[0] if isinstance(out, tuple) else out).float()
+                raise _Stop
+
+            h1 = down.register_forward_pre_hook(pre); h2 = layer.register_forward_hook(post)
+            try:
+                with actor.disable_adapter():
+                    actor(input_ids=ids, attention_mask=am)
+            except _Stop:
+                pass
+            finally:
+                h1.remove(); h2.remove()
+            h = cap["h"]
+            nid = nid_all[s:s + B].to(device)                                       # [b, k]
+            a_sel = cap["a"].float()[torch.arange(B, device=device)[:, None], :, nid]  # [b, k, T]
+            keep = am.bool().clone(); keep[:, 0] = False
+            nrm = h.norm(dim=-1)
+            med = nrm.masked_fill(~keep, float("nan")).nanmedian(dim=1, keepdim=True).values
+            keep = keep & (nrm <= NORM_FILTER_MULT * med)
+            L = am.sum(1)                                                            # incl. sink
+            pos = torch.arange(h.shape[1], device=device)[None, :]
+            lastk = keep & (pos >= (L - MLP_LAST_K)[:, None])
+            yield s, h, keep, a_sel, lastk
+    finally:
+        tok.padding_side = prev
+
+
+@torch.no_grad()
+def score_mlp_fireback(gen_texts, neuron_ids, polarity, corpus_max, actor, tok, device):
+    """Layer-42 MLP fire-back of the generated texts on the CLEAN base: per text and paired neuron, max over the last
+    MLP_LAST_K kept tokens of polarity * a_i / corpus_max_i. Returns (na_min [N], na_max [N]) cpu fp32 = the WEAKEST and
+    the STRONGEST member's normalized fire-back (k=1 singles: identical). neuron_ids / polarity / corpus_max: [N, k]."""
+    pol_all = torch.as_tensor(polarity, dtype=torch.float32); cm_all = torch.as_tensor(corpus_max, dtype=torch.float32)
+    if pol_all.dim() == 1:
+        pol_all = pol_all[:, None]; cm_all = cm_all[:, None]
+    na_min = torch.zeros(len(gen_texts)); na_max = torch.zeros(len(gen_texts))
+    for s, h, keep, a_sel, lastk in _reencode_mlp(gen_texts, neuron_ids, actor, tok, device):
+        b = h.shape[0]
+        pol = pol_all[s:s + b].to(device); cm = cm_all[s:s + b].to(device).clamp_min(1e-6)
+        av = (a_sel * pol[:, :, None]).masked_fill(~lastk[:, None, :], -float("inf")).max(2).values   # [b, k]
+        av = torch.where(torch.isfinite(av), av, torch.zeros_like(av))                                  # no kept token -> 0
+        na = av / cm
+        na_min[s:s + b] = na.min(1).values.float().cpu(); na_max[s:s + b] = na.max(1).values.float().cpu()
+    return na_min, na_max
+
+
+def mlp_metrics(fam, best_na, best_na_any=None):
+    """eval/<fam>/{norm_act, fired10, fired25, fired50} from best-of-bo normalized fire-back per direction (np [n]);
+    for k>1 families also any_* from the strongest member."""
+    best_na = np.asarray(best_na, np.float64)
+    out = {f"eval/{fam}/norm_act": float(best_na.mean())}
+    for lv in MLP_FIRE_LEVELS:
+        out[f"eval/{fam}/fired{int(round(lv * 100))}"] = float(np.mean(best_na >= lv))
+    if best_na_any is not None:
+        best_na_any = np.asarray(best_na_any, np.float64)
+        out[f"eval/{fam}/any_norm_act"] = float(best_na_any.mean())
+        for lv in MLP_FIRE_LEVELS:
+            out[f"eval/{fam}/any_fired{int(round(lv * 100))}"] = float(np.mean(best_na_any >= lv))
     return out
 
 
@@ -207,6 +311,24 @@ def eval_sae_family(dirs_unit, feats, sae, actor, tok, prompt_ids, marker, sub, 
                 peak_h[i] = peaks[j]
     ranks = sae_rank_at_peaks(sae, peak_h, feats)
     return best, ranks
+
+
+@torch.no_grad()
+def eval_mlp_family(tag, dirs_unit, neuron, polarity, corpus_max, actor, tok, prompt_ids, marker, sub, dev,
+                    bo, temp, max_new, min_new, gen_chunk):
+    """Extra (MLP neuron) family: best-of-bo max-token cosine (the standard metric) AND best-of-bo normalized fire-back
+    (weakest member / strongest member). Returns (best_cos [N], best_na [N], best_na_any [N]) np arrays."""
+    n = len(dirs_unit)
+    best_cos = np.full(n, -1e9); best_na = np.full(n, -1e9); best_any = np.full(n, -1e9)
+    for rows, texts in _gen_batches(tag, dirs_unit, actor, tok, prompt_ids, marker, sub, dev,
+                                    bo, temp, max_new, min_new, gen_chunk):
+        rdirs = F.normalize(torch.stack([dirs_unit[i] for i in rows]), dim=-1)
+        cos = score_probe_cos(texts, rdirs, actor, tok, dev)
+        na_min, na_max = score_mlp_fireback(texts, neuron[rows], polarity[rows], corpus_max[rows], actor, tok, dev)
+        np.maximum.at(best_cos, rows, cos.numpy().astype(np.float64))
+        np.maximum.at(best_na, rows, na_min.numpy().astype(np.float64))
+        np.maximum.at(best_any, rows, na_max.numpy().astype(np.float64))
+    return best_cos, best_na, best_any
 
 
 # ---------------------------------------------------------------------------------------------
@@ -409,7 +531,8 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
     actor.eval()
     fork_devs = [dev] if str(dev).startswith("cuda") else []
     # legacy fresh-sample caches predate meta["cos_families"] -> default to the legacy list
-    fams = eval_sets["meta"].get("cos_families", COS_FAMILIES)
+    fams = list(eval_sets["meta"].get("cos_families", COS_FAMILIES))
+    xfams = extra_families(eval_sets)
     out = {}
     try:
         with torch.random.fork_rng(devices=fork_devs):
@@ -430,21 +553,32 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
             na = best_act / np.maximum(cp, 1e-6)
             out["eval/sae/unverbalized_frac"] = float(np.mean(best_act <= sae_fire))  # cannot be made to fire at all
             out["eval/sae/unverbalized_p10"] = float(np.mean(na < 0.10))  # inversion reached <10pct of corpus peak
+            # extra families (cache v2: layer-42 MLP neurons / co-firing pairs): cosine + fire-back, NOT in mean_all
+            for fam in xfams:
+                k = eval_sets[f"{fam}_neuron"].shape[1]
+                bc, bn, ba = eval_mlp_family(fam, eval_sets[f"{fam}_dirs"], eval_sets[f"{fam}_neuron"],
+                                             eval_sets[f"{fam}_polarity"], eval_sets[f"{fam}_corpus_max"], *gen_args)
+                out[f"eval/{fam}/cos"] = float(bc.mean())
+                out.update(mlp_metrics(fam, bn, ba if k > 1 else None))
     finally:
         if was_training:
             actor.train()
     # mean_all = mean over the HIGHER-IS-BETTER cos families only. `random` is the control
     # (should stay ~0.03, LOWER is better) — folding it in would drag the mean down and move
-    # mean_all the WRONG way if the control ever degraded. It stays logged separately.
+    # mean_all the WRONG way if the control ever degraded. It stays logged separately. Extra
+    # families (xfams) are NOT included either, so mean_all is comparable across cache versions.
     out["eval/mean_all"] = float(np.mean([out[f"eval/{f}/cos"] for f in fams
                                           if f not in CONTROL_FAMS]))
     # headline mirror group — one wandb panel with every family side by side
     # legacy mode: probe/jlens/cluster/random/realact _cos; held-out mode: bsf replaces probe
-    for fam in fams:
+    for fam in fams + xfams:
         out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
     out["eval/all/sae_norm_act"] = out["eval/sae/norm_act"]
     out["eval/all/sae_unverbalized"] = out["eval/sae/unverbalized_frac"]
     out["eval/all/sae_mean_rank"] = out["eval/sae/mean_rank"]
+    for fam in xfams:
+        out[f"eval/all/{fam}_norm_act"] = out[f"eval/{fam}/norm_act"]
+        out[f"eval/all/{fam}_fired10"] = out[f"eval/{fam}/fired10"]
     return out
 
 
@@ -464,6 +598,9 @@ def main():
     ap.add_argument("--cache", default="/root/pmx/data/eval_universal",
                     help="cache DIR; frozen eval sets live at <cache>/eval_sets.pt "
                          "(<cache>/eval_sets_heldout.pt with --heldout-pool)")
+    ap.add_argument("--cache-file", default=os.environ.get(ENV_EVAL_CACHE),
+                    help=f"FULL path of an existing eval-set cache (overrides --cache's file name; env {ENV_EVAL_CACHE}), "
+                         "e.g. .../eval_sets_heldout_v2.pt with the extra mlp / mlp_pair families")
     ap.add_argument("--n", type=int, default=1024, help="directions per family")
     ap.add_argument("--bo", type=int, default=4)
     ap.add_argument("--temp", type=float, default=1.0)
@@ -493,10 +630,14 @@ def main():
           + (f"heldout pool {a.heldout_pool}" if a.heldout_pool
              else f"J{READ_LAYER} {tuple(j42.shape)}"), flush=True)
 
-    cache_path = os.path.join(a.cache,
-                              "eval_sets_heldout.pt" if a.heldout_pool else "eval_sets.pt")
+    cache_path = a.cache_file or os.path.join(a.cache,
+                                             "eval_sets_heldout.pt" if a.heldout_pool else "eval_sets.pt")
+    if a.cache_file:
+        assert os.path.exists(a.cache_file), f"--cache-file {a.cache_file} does not exist"
     es = build_eval_sets(cache_path, sae, wu, j42, a.probe_bank, a.acts_dir, a.n, dev,
                          seed=0, maxacts_path=a.maxacts_path, heldout_pool=a.heldout_pool)
+    if extra_families(es):
+        print(f"[eval-universal] extra families {extra_families(es)} (cosine + MLP fire-back; not in mean_all)", flush=True)
     m = run_eval(actor, tok, prompt_ids, marker, sub, es, sae, a.bo, a.temp,
                  a.max_new_tokens, a.min_new_tokens, dev, gen_chunk=a.gen_chunk, sae_fire=a.sae_fire)
     print("=== EVAL-UNIVERSAL ===\n" + json.dumps(m, indent=1), flush=True)
