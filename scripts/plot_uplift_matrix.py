@@ -40,19 +40,19 @@ ARM_SHORT = {"acts100": "acts100", "acts_sae": "+SAE", "acts_bsf": "+BSF", "acts
 COLS = [("eval/mean_all", "mean_all\n(11 fams)", True),
         ("eval/realact/cos", "real acts", True), ("eval/realact_early/cos", "acts early", True), ("eval/realact_mid/cos", "acts mid", True),
         ("eval/realact_long/cos", "acts long", True), ("eval/indist_realact/cos", "acts in-dist", True), ("eval/indist_long/cos", "long in-dist", True),
-        ("eval/bsf/cos", "BSF", True), ("eval/sae/norm_act", "SAE\nnorm act", True), ("eval/sae/rank1_frac", "SAE\nrank-1", True),
+        ("eval/bsf/cos", "BSF", True), ("eval/sae/norm_act", "SAE\nnorm act", True), ("eval/sae/rank1_frac", "SAE\nrank-1", True), ("eval/sae/verbalized_frac", "SAE\nverbalized", True),
         ("eval/cluster/cos", "probes", True), ("eval/indist_probe/cos", "probes\nin-dist", True), ("eval/jlens/cos", "J-lens", True),
         ("eval/mlp/cos", "MLP\nneurons cos", True), ("eval/mlp/norm_act", "MLP\nfire-back", True), ("eval/mlp_pair/cos", "MLP\npairs cos", True),
         ("eval/random/cos", "random\n(control, low)", False)]
 # which columns are the arm's OWN training family (in-distribution for that arm; every arm also trains on real acts)
-OWN = {"acts_sae": {"eval/sae/norm_act", "eval/sae/rank1_frac"}, "acts_bsf": {"eval/bsf/cos"},
+OWN = {"acts_sae": {"eval/sae/norm_act", "eval/sae/rank1_frac", "eval/sae/verbalized_frac"}, "acts_bsf": {"eval/bsf/cos"},
        "acts_cluster": {"eval/cluster/cos", "eval/indist_probe/cos"}, "acts_realact_long": {"eval/realact_long/cos", "eval/indist_long/cos"},
        "acts_mlp": {"eval/mlp/cos", "eval/mlp/norm_act", "eval/mlp_pair/cos"}, "acts100": set()}
 REALACT_COLS = {"eval/realact/cos", "eval/realact_early/cos", "eval/realact_mid/cos", "eval/indist_realact/cos"}
 RL_STEPS = [25, 50, 100]
 # headline figure: the non-duplicate columns only, plain-language rows, one-line title
 CORE_COLS = [("eval/mean_all", "mean of\n11 families"), ("eval/realact/cos", "real acts"), ("eval/realact_long/cos", "real acts\nlong ctx"),
-             ("eval/sae/norm_act", "SAE\nnorm act"), ("eval/sae/rank1_frac", "SAE\nrank-1"), ("eval/bsf/cos", "BSF"), ("eval/cluster/cos", "cluster\nprobes"),
+             ("eval/sae/norm_act", "SAE\nnorm act"), ("eval/sae/rank1_frac", "SAE\nrank-1"), ("eval/sae/verbalized_frac", "SAE\nverbalized"), ("eval/bsf/cos", "BSF"), ("eval/cluster/cos", "cluster\nprobes"),
              ("eval/jlens/cos", "J-lens"), ("eval/mlp/cos", "MLP\nneurons"), ("eval/mlp/norm_act", "MLP\nfire-back"), ("eval/random/cos", "random\n(control)")]
 ARM_ROW = {"acts100": "real acts only (control)", "acts_sae": "+ SAE features", "acts_bsf": "+ BSF blocks", "acts_cluster": "+ cluster probes",
            "acts_realact_long": "+ long-context acts", "acts_mlp": "+ MLP neurons"}
@@ -106,6 +106,13 @@ REF_LABEL = {"rl_A_from_init_no_midtrain_ckpt100": "RL-A @100: same init, NO mid
              "rl_B_rp500k_init_ckpt100": "RL-B @100: 500k realact+probes init, real-acts + probes bank (16x256, lr 7e-6)",
              "rl_C_mix1m_midtrain_ckpt100": "RL-C @100: same init + 1.1M all-families midtrain (lr 1e-4), all-families bank (16x256, lr 7e-6)",
              "sft_mix1m_midtrain_final": "1.1M all-families midtrain final (lr 1e-4, 4279 steps) = RL-C's init"}
+
+
+def _derive(m):
+    """add eval/sae/verbalized_frac = 1 - unverbalized_frac (share of held-out SAE features the inverter CAN make fire)."""
+    if m and m.get("eval/sae/unverbalized_frac") is not None and m.get("eval/sae/verbalized_frac") is None:
+        m["eval/sae/verbalized_frac"] = 1.0 - m["eval/sae/unverbalized_frac"]
+    return m
 
 
 def load_metrics(path):
@@ -165,6 +172,8 @@ def wandb_runs(no_wandb):
 
 def assemble():
     init = load_metrics(f"{RAW}/init/ckpt_0.json")
+    if init:
+        _derive(init.get("metrics"))
     table = {"init": init, "arms": {}}
     for a in ARMS:
         rl = {str(k): load_metrics(f"{RAW}/rl/{a}_{k}.json") for k in RL_STEPS}
@@ -199,8 +208,8 @@ def matrix(table, stage, ref):
 def stage_metrics(table, arm, stage):
     s = table["arms"][arm]
     if stage == "sft":
-        return (s["sft"] or {}).get("metrics")
-    return (s["rl"].get(str(stage)) or {}).get("metrics")
+        return _derive((s["sft"] or {}).get("metrics"))
+    return _derive((s["rl"].get(str(stage)) or {}).get("metrics"))
 
 
 def heatmap(M, title, subtitle, fname, vlim=0.10, ref_row=None):
@@ -251,17 +260,18 @@ def all_families_row(table, budget):
     try:
         import wandb
         rs = list(wandb.Api().runs(PROJ, filters={"display_name": ref["rl"]["eval_run"]}, order="-created_at"))
-        row = next(r for r in rs[0].history(pandas=False) if r.get("ckpt_step") == ref["rl"]["ckpt"] and r.get("eval/mean_all") is not None)
+        row = _derive(dict(next(r for r in rs[0].history(pandas=False) if r.get("ckpt_step") == ref["rl"]["ckpt"] and r.get("eval/mean_all") is not None)))
     except Exception as e:
         print("[plot] all-families reference row unavailable:", e); return None
     init = (table["init"] or {}).get("metrics", {})
-    return {"label": f"all 7 families mixed*  ·  {ref['midtrain']['target_tokens_est'] / 1e6:.0f}M tok",
+    return {"label": f"all 7 families mixed*  ·  {ref['midtrain']['n_examples'] / 1e6:.1f}M acts",
             "delta": {k: (row[k] - init[k]) if (row.get(k) is not None and init.get(k) is not None) else np.nan for k, _ in CORE_COLS},
             "abs": {k: row.get(k) for k, _ in CORE_COLS}, "source": ref}
 
 
 TRAJ_COLS = [("eval/mean_all", "mean of 11 families"), ("eval/realact/cos", "real acts"), ("eval/realact_long/cos", "real acts, long ctx"), ("eval/sae/norm_act", "SAE norm act"),
-             ("eval/sae/rank1_frac", "SAE rank-1"), ("eval/bsf/cos", "BSF"), ("eval/cluster/cos", "cluster probes"), ("eval/mlp/norm_act", "MLP fire-back")]
+             ("eval/sae/rank1_frac", "SAE rank-1"), ("eval/sae/verbalized_frac", "SAE verbalized (share that fires)"), ("eval/bsf/cos", "BSF"), ("eval/cluster/cos", "cluster probes"),
+             ("eval/mlp/norm_act", "MLP fire-back")]
 ARM_COLOR = {"acts100": "#7a7a7a", "acts_sae": "#b5542b", "acts_bsf": "#4a6fa5", "acts_cluster": "#2a7f62", "acts_realact_long": "#9a7fc4", "acts_mlp": "#c99a2e"}
 
 
@@ -286,13 +296,14 @@ def trajectories(table, fname, budget):
             rs = list(wandb.Api().runs(PROJ, filters={"display_name": ref["rl"]["eval_run"]}, order="-created_at"))
             for r in sorted([r for r in rs[0].history(pandas=False) if r.get("ckpt_step") is not None and r.get("eval/mean_all") is not None], key=lambda r: r["ckpt_step"]):
                 if r["ckpt_step"] <= 100:
+                    r = _derive(dict(r))
                     ref_pts.append({"rl_step": int(r["ckpt_step"]), "rollouts": int(r["ckpt_step"]) * ref["rl"]["rollouts_per_step"],
                                     **{k: (r[k] - init[k]) if (r.get(k) is not None and init.get(k) is not None) else None for k, _ in TRAJ_COLS}})
             out["reference"] = {"label": "all 7 families mixed (RL-E; 1.1M midtrain, 4096 rollouts/step)", "points": ref_pts}
         except Exception as e:
             print("[plot] trajectory reference unavailable:", e)
     json.dump(out, open(f"{OUT}/data/trajectories.json", "w"), indent=1)
-    fig, axes = plt.subplots(2, 4, figsize=(17, 7.4), sharex=True)
+    fig, axes = plt.subplots(3, 3, figsize=(15, 10.5), sharex=True)
     for ax, (k, title) in zip(axes.flat, TRAJ_COLS):
         for a in ARMS:
             pts = [p for p in out["arms"][a]["points"] if p.get(k) is not None]
@@ -310,7 +321,7 @@ def trajectories(table, fname, budget):
     fig.legend(h, l, loc="lower center", ncol=4, frameon=False, fontsize=8.8, bbox_to_anchor=(0.5, 0.0))
     fig.suptitle("Every checkpoint: the 200k midtrain alone lowers every family (x = 0), RL recovers and then lifts them within 50k–100k rollouts;\n"
                  "at matched rollouts the everything-mixed run (dashed, 5x more midtrain tokens) tracks the best single-family arm rather than beating it", fontsize=11, y=0.995)
-    fig.tight_layout(rect=(0, 0.13, 1, 0.94))
+    fig.tight_layout(rect=(0, 0.1, 1, 0.95))
     for ext in ("png", "pdf"):
         fig.savefig(f"{OUT}/{fname}.{ext}", dpi=170)
     plt.close(fig)
@@ -324,7 +335,10 @@ def heatmap_clean(table, fname, budget):
     M_full = matrix(table, 100, "init"); M = M_full[:, [full.index(k) for k in cols]]
     extra = all_families_row(table, budget)
     mt = budget["midtrain"]
-    rows = [f"{ARM_ROW[a]}  ·  {mt[a]['target_tokens'] / 1e6:.1f}M tok" for a in ARMS]
+    def acts_label(a):
+        fams = mt[a]["per_family"]; n_real = fams.get("realact", {}).get("n", 0); n_x = sum(v["n"] for f, v in fams.items() if f != "realact")
+        return f"{ARM_ROW[a]}  ·  {n_real / 1e3:.0f}k real + {n_x / 1e3:.0f}k acts" if n_x else f"{ARM_ROW[a]}  ·  {n_real / 1e3:.0f}k acts"
+    rows = [acts_label(a) for a in ARMS]
     if extra:
         M = np.vstack([M, np.full((1, len(cols)), np.nan), np.array([[extra["delta"][k] for k in cols]])])   # blank spacer row, then the reference
         rows += ["", extra["label"]]
@@ -360,11 +374,12 @@ def heatmap_clean(table, fname, budget):
     gen = budget["rl"]["generated_tokens_M"]; lo, hi = min(gen.values()), max(gen.values())
     fig.text(0.02, 0.93 if not extra else 0.94, "Midtrain + 100 RL steps: structured direction families lift SAE and MLP fidelity, real acts improve in every mixed arm, J-lens never moves",
              fontsize=12.5, color=INK, va="center")
-    sub = (f"Δ held-out score vs the shared init (23M real-act SFT). Each row: midtrain on 200k examples (100k real acts + 100k of the named family; "
-           f"target tokens in the label) → 100 GRPO steps × 2048 rollouts ({lo:.0f}–{hi:.0f}M generated tokens). Black box = the arm's own family.")
+    mt_lo, mt_hi = min(v["target_tokens"] for v in mt.values()) / 1e6, max(v["target_tokens"] for v in mt.values()) / 1e6
+    sub = (f"Δ held-out score vs the shared init (23M real-act SFT). Each row: midtrain on 200k (direction, text) pairs — 100k real activations + 100k of the named family "
+           f"({mt_lo:.0f}–{mt_hi:.0f}M target tokens) → 100 RL steps (CISPO loss, group-relative advantages, 16 samples/direction) × 2048 rollouts ({lo:.0f}–{hi:.0f}M generated tokens). Black box = the arm's own family.")
     if extra:
         r = extra["source"]
-        sub += (f"  *Reference, not part of the matrix: midtrain on the full 1.1M all-families mix (≈{r['midtrain']['target_tokens_est'] / 1e6:.0f}M target tokens) → 100 GRPO steps at 2x the batch "
+        sub += (f"  *Reference, not part of the matrix: midtrain on the full 1.1M all-families mix (≈{r['midtrain']['target_tokens_est'] / 1e6:.0f}M target tokens) → 100 RL steps at 2x the batch "
                 f"(4096 rollouts/step, ≈{r['rl']['generated_tokens_M']:.0f}M generated tokens) on the 7-family bank incl. MLP neurons; same init lineage.")
     fig.text(0.02, 0.855 if not extra else 0.875, "\n".join(textwrap.wrap(sub, 165)), fontsize=9, color="#52514e", va="top")
     for ext in ("png", "pdf"):
@@ -474,6 +489,24 @@ def main():
                "delta_sft_vs_acts100": {a: {k: (None if np.isnan(M_sft_x[i, j]) else float(M_sft_x[i, j])) for j, (k, _, _) in enumerate(COLS)} for i, a in enumerate(ARMS)}},
               open(f"{OUT}/data/deltas.json", "w"), indent=1)
     json.dump({"arms": {a: table["arms"][a]["bank"] for a in ARMS}}, open(f"{OUT}/data/banks.json", "w"), indent=1)
+    # CSVs: long (arm, stage, metric, absolute, delta_vs_init, delta_vs_control) + wide heatmap (RL@100 delta vs init, core columns)
+    import csv
+    init_m = _derive((table["init"] or {}).get("metrics", {})) or {}
+    with open(f"{OUT}/data/uplift_matrix_long.csv", "w", newline="") as fh:
+        w = csv.writer(fh); w.writerow(["arm", "arm_label", "stage", "rl_step", "metric", "value", "init_value", "delta_vs_init", "control_value_same_stage", "delta_vs_control"])
+        for a in ARMS:
+            for stage in ["sft"] + RL_STEPS:
+                m = stage_metrics(table, a, stage); c = stage_metrics(table, "acts100", stage)
+                if not m:
+                    continue
+                for k, _, _ in COLS:
+                    v = m.get(k); iv = init_m.get(k); cv = (c or {}).get(k)
+                    w.writerow([a, ARM_LABEL[a], "after_midtrain" if stage == "sft" else "rl", 0 if stage == "sft" else stage, k,
+                                v, iv, None if (v is None or iv is None) else v - iv, cv, None if (v is None or cv is None) else v - cv])
+    with open(f"{OUT}/data/uplift_heatmap_wide.csv", "w", newline="") as fh:
+        w = csv.writer(fh); w.writerow(["arm", "arm_label"] + [k for k, _ in CORE_COLS])
+        for i, a in enumerate(ARMS):
+            w.writerow([a, ARM_LABEL[a]] + [(None if np.isnan(M_rl[i, [k for k, _, _ in COLS].index(k2)]) else round(float(M_rl[i, [k for k, _, _ in COLS].index(k2)]), 4)) for k2, _ in CORE_COLS])
     json.dump({n: {"label": REF_LABEL[n], "source": p, **(load_metrics(f"{RAW}/refs/{n}.json") or {})} for n, p in REFS.items()},
               open(f"{OUT}/data/references.json", "w"), indent=1)
     json.dump(runs, open(f"{OUT}/data/runs.json", "w"), indent=1)
