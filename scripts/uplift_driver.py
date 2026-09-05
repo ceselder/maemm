@@ -33,7 +33,8 @@ import modal
 ARMS = ["acts100", "acts_sae", "acts_bsf", "acts_cluster", "acts_realact_long", "acts_mlp"]
 INIT_ADAPTER = "/data/sft_mix/realact20m_prefix_lr1e-4/final"
 EVAL_CACHE_V2 = "/data/eval_universal_ho/eval_sets_heldout_v2.pt"
-EVAL_APP = "maemm-eval-ckpt-mlp"          # eval/modal_eval_ckpt.py deployed from the mlp42-bank worktree (v2-cache-aware daemon)
+EVAL_APP = "maemm-eval-ckpt-uplift"       # eval/modal_eval_ckpt_uplift.py (mlp42-bank evaluator code + vol.reload + killpg-on-cancel);
+                                          # the first daemons ran on the MLP agent's `maemm-eval-ckpt-mlp` (same evaluator code)
 SFT_APP = "maemm-sft-8xb200"
 RL_APP = "maemm-rl-disagg-x4"
 BANK_APP = "maemm-uplift-banks"
@@ -207,11 +208,10 @@ def tick(st, ctl):
     # 3. SFT eval (once, `final` as ckpt_step 0)
     for a, s in arms.items():
         if s.get("sft_done") and not s.get("sft_eval_call") and retry_ok(s, "sft_eval"):
-            # daemon mode (NOT --once): a reused warm container's stale /data mount does not see the fresh `final`; --once then
-            # exits with "nothing pending" (happened twice for acts_realact_long). In daemon mode the launcher reloads the mount
-            # every 30 s and the daemon finds `final` on a later poll; the driver cancels the call once ckpt_0.json exists.
+            # --once on `final` (ckpt_step 0). The uplift launcher reloads the volume before the daemon starts, so a reused warm
+            # container sees the fresh `final` (on the shared mlp app --once exited "nothing pending" twice for acts_realact_long).
             s["sft_eval_call"] = spawn(EVAL_APP, "daemon", ckpt_dir=f"/data/sft_mix/uplift_sft_{a}", tag=f"uplift_sft_{a}", rl_run_id="",
-                                       wandb_name=f"uplift_sft_{a}_eval", final_step=0, poll_s=60, extra_args=eval_extra_args())
+                                       wandb_name=f"uplift_sft_{a}_eval", final_step=0, once=True, only_step=0, extra_args=eval_extra_args())
         if s.get("sft_eval_call") and not s.get("sft_eval_done"):
             if vexists(f"eval_ckpt/uplift_sft_{a}/ckpt_0.json"):
                 s["sft_eval_done"] = True; events.append(f"SFT-EVAL {a} DONE")
