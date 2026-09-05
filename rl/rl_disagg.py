@@ -117,6 +117,8 @@ def parse_args(argv=None):
                     help="LR decay from --lr (after warmup) to --lr-min-frac*lr at --total-steps. Default none = constant LR, which "
                          "blew up RL-C at step ~300 (entropy collapse -> grad-norm explosion, see memory 2026-09-05)")
     ap.add_argument("--lr-min-frac", type=float, default=0.0, help="final LR as a fraction of --lr for --lr-decay")
+    ap.add_argument("--fresh-optim", action="store_true", help="do NOT load <init-adapter>/optim.pt on resume (fresh AdamW moments). Needed when the advantage "
+                    "scale changes between the saved run and this one (e.g. batch-normalized -> raw), otherwise the stale second moment rescales the effective lr")
     ap.add_argument("--lr-decay-total-steps", type=int, default=None, help="decay horizon (global step at which lr reaches lr-min-frac*lr); default = --total-steps. "
                     "Lets a short resumed ablation follow the schedule a full 400-step run would have.")
     ap.add_argument("--run-name", default="mxf-rl-disagg")
@@ -1587,7 +1589,7 @@ def run_trainer(a):
     opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0,
                             eps=a.adam_eps, betas=tuple(a.adam_betas))
     optim_p = os.path.join(a.init_adapter or "", "optim.pt")
-    if a.init_adapter and os.path.exists(optim_p):
+    if a.init_adapter and os.path.exists(optim_p) and not a.fresh_optim:
         opt.load_state_dict(torch.load(optim_p, map_location="cpu"))
         for _g in opt.param_groups:   # a loaded optimizer state carries the OLD run's lr/betas/eps — re-apply this run's flags (ablation arms rely on it)
             _g["lr"], _g["betas"], _g["eps"] = a.lr, tuple(a.adam_betas), a.adam_eps
