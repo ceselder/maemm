@@ -278,7 +278,8 @@ def main():
             wandb.log(row, commit=True)
         json.dump({"ckpt_step": s, "ckpt": ck, "metrics": row, "n_lora_tensors": n_t, "protocol": {
             "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]), "bo": a.eval_bo, "temp": a.eval_temp,
-            "min_new": a.eval_min_new, "max_new": a.eval_max_new}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
+            "min_new": a.eval_min_new, "max_new": a.eval_max_new, "eval_cache": a.eval_cache,
+            "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
         if EX is not None and "extra/locality/fire_frac" in ex:
             try:
                 IX.launch_judge_stage(None, s, EX, a)
