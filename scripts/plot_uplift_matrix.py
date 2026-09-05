@@ -337,7 +337,7 @@ def heatmap_clean(table, fname, budget):
     mt = budget["midtrain"]
     def acts_label(a):
         fams = mt[a]["per_family"]; n_real = fams.get("realact", {}).get("n", 0); n_x = sum(v["n"] for f, v in fams.items() if f != "realact")
-        return f"{ARM_ROW[a]}  ·  {n_real / 1e3:.0f}k real + {n_x / 1e3:.0f}k acts" if n_x else f"{ARM_ROW[a]}  ·  {n_real / 1e3:.0f}k acts"
+        return f"{ARM_ROW[a]}  ·  {n_real / 1e3:.0f}k+{n_x / 1e3:.0f}k acts" if n_x else f"{ARM_ROW[a]}  ·  {n_real / 1e3:.0f}k acts"
     rows = [acts_label(a) for a in ARMS]
     if extra:
         M = np.vstack([M, np.full((1, len(cols)), np.nan), np.array([[extra["delta"][k] for k in cols]])])   # blank spacer row, then the reference
@@ -346,7 +346,7 @@ def heatmap_clean(table, fname, budget):
                    "source": extra["source"]}, open(f"{OUT}/data/all_families_reference_row.json", "w"), indent=1)
     n_rows = M.shape[0]
     fig = plt.figure(figsize=(14.5, 6.0 + (0.9 if extra else 0)))
-    ax = fig.add_axes([0.215, 0.15, 0.66, 0.62])   # [left, bottom, width, height] — fixed so the cells stay wide
+    ax = fig.add_axes([0.245, 0.15, 0.63, 0.62])   # [left, bottom, width, height] — fixed so the cells stay wide
     vlim = 0.10
     im = ax.imshow(np.ma.masked_invalid(M), cmap=DIVERGING, norm=TwoSlopeNorm(vmin=-vlim, vcenter=0.0, vmax=vlim), aspect="auto")
     ax.set_xticks(range(len(cols))); ax.set_xticklabels([l for _, l in CORE_COLS], fontsize=9.5)
