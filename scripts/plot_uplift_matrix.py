@@ -31,11 +31,11 @@ RAW = f"{OUT}/raw"
 MODAL = os.path.expanduser("~/modal_venv/bin/modal")
 PROJ = "octahedral-systems/maxact-fast"
 
-ARMS = ["acts100", "acts_sae", "acts_bsf", "acts_cluster", "acts_realact_long", "acts_mlp"]
+ARMS = ["acts100", "acts_sae", "acts_bsf", "acts_cluster", "acts_realact_long", "acts_mlp", "acts_all"]
 ARM_LABEL = {"acts100": "100% real acts (control)", "acts_sae": "50% acts + 50% SAE features", "acts_bsf": "50% acts + 50% BSF blocks",
              "acts_cluster": "50% acts + 50% cluster probes", "acts_realact_long": "50% acts + 50% long-ctx acts",
-             "acts_mlp": "50% acts + 50% MLP neurons"}
-ARM_SHORT = {"acts100": "acts100", "acts_sae": "+SAE", "acts_bsf": "+BSF", "acts_cluster": "+probes", "acts_realact_long": "+long acts", "acts_mlp": "+MLP"}
+             "acts_mlp": "50% acts + 50% MLP neurons", "acts_all": "50% acts + 50% mix of the 5 other families (act-matched)"}
+ARM_SHORT = {"acts100": "acts100", "acts_sae": "+SAE", "acts_bsf": "+BSF", "acts_cluster": "+probes", "acts_realact_long": "+long acts", "acts_mlp": "+MLP", "acts_all": "+all mix"}
 # eval column: (metric key, short label, higher-is-better)
 COLS = [("eval/mean_all", "mean_all\n(11 fams)", True),
         ("eval/realact/cos", "real acts", True), ("eval/realact_early/cos", "acts early", True), ("eval/realact_mid/cos", "acts mid", True),
@@ -47,7 +47,9 @@ COLS = [("eval/mean_all", "mean_all\n(11 fams)", True),
 # which columns are the arm's OWN training family (in-distribution for that arm; every arm also trains on real acts)
 OWN = {"acts_sae": {"eval/sae/norm_act", "eval/sae/rank1_frac", "eval/sae/verbalized_frac"}, "acts_bsf": {"eval/bsf/cos"},
        "acts_cluster": {"eval/cluster/cos", "eval/indist_probe/cos"}, "acts_realact_long": {"eval/realact_long/cos", "eval/indist_long/cos"},
-       "acts_mlp": {"eval/mlp/cos", "eval/mlp/norm_act", "eval/mlp_pair/cos"}, "acts100": set()}
+       "acts_mlp": {"eval/mlp/cos", "eval/mlp/norm_act", "eval/mlp_pair/cos"}, "acts100": set(),
+       "acts_all": {"eval/sae/norm_act", "eval/sae/rank1_frac", "eval/sae/verbalized_frac", "eval/bsf/cos", "eval/cluster/cos", "eval/indist_probe/cos",
+                    "eval/realact_long/cos", "eval/indist_long/cos", "eval/mlp/cos", "eval/mlp/norm_act", "eval/mlp_pair/cos"}}
 REALACT_COLS = {"eval/realact/cos", "eval/realact_early/cos", "eval/realact_mid/cos", "eval/indist_realact/cos"}
 RL_STEPS = [25, 50, 100]
 # headline figure: the non-duplicate columns only, plain-language rows, one-line title
@@ -55,7 +57,7 @@ CORE_COLS = [("eval/mean_all", "mean of\n11 families"), ("eval/realact/cos", "re
              ("eval/sae/norm_act", "SAE\nnorm act"), ("eval/sae/rank1_frac", "SAE\nrank-1"), ("eval/sae/verbalized_frac", "SAE\nverbalized"), ("eval/bsf/cos", "BSF"), ("eval/cluster/cos", "cluster\nprobes"),
              ("eval/jlens/cos", "J-lens"), ("eval/mlp/cos", "MLP\nneurons"), ("eval/mlp/norm_act", "MLP\nfire-back"), ("eval/random/cos", "random\n(control)")]
 ARM_ROW = {"acts100": "real acts only (control)", "acts_sae": "+ SAE features", "acts_bsf": "+ BSF blocks", "acts_cluster": "+ cluster probes",
-           "acts_realact_long": "+ long-context acts", "acts_mlp": "+ MLP neurons"}
+           "acts_realact_long": "+ long-context acts", "acts_mlp": "+ MLP neurons", "acts_all": "+ all 5 families mixed"}
 
 # palette (dataviz reference instance): diverging blue <-> red with a neutral gray midpoint; categorical slot 1 blue, slot 2 orange
 BLUE, ORANGE, GRAY_MID, INK, MUTED, GRID = "#2a78d6", "#eb6834", "#f0efec", "#0b0b0b", "#898781", "#e1e0d9"
@@ -272,7 +274,7 @@ def all_families_row(table, budget):
 TRAJ_COLS = [("eval/mean_all", "mean of 11 families"), ("eval/realact/cos", "real acts"), ("eval/realact_long/cos", "real acts, long ctx"), ("eval/sae/norm_act", "SAE norm act"),
              ("eval/sae/rank1_frac", "SAE rank-1"), ("eval/sae/verbalized_frac", "SAE verbalized (share that fires)"), ("eval/bsf/cos", "BSF"), ("eval/cluster/cos", "cluster probes"),
              ("eval/mlp/norm_act", "MLP fire-back")]
-ARM_COLOR = {"acts100": "#7a7a7a", "acts_sae": "#b5542b", "acts_bsf": "#4a6fa5", "acts_cluster": "#2a7f62", "acts_realact_long": "#9a7fc4", "acts_mlp": "#c99a2e"}
+ARM_COLOR = {"acts100": "#7a7a7a", "acts_sae": "#b5542b", "acts_bsf": "#4a6fa5", "acts_cluster": "#2a7f62", "acts_realact_long": "#9a7fc4", "acts_mlp": "#c99a2e", "acts_all": "#111111"}
 
 
 def trajectories(table, fname, budget):
