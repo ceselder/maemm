@@ -33,8 +33,9 @@ EVAL_KEYS = [("eval/mean_all", "mean over held-out families"), ("eval/sae/norm_a
 api = wandb.Api()
 
 
-def train_rows(run):
-    return [{"step": int(h["_step"]), **{k: h.get(k) for k in TRAIN_KEYS}} for h in run.history(keys=TRAIN_KEYS, pandas=False, samples=1000) if h.get("grad_norm") is not None]
+def train_rows(run, keys=TRAIN_KEYS):
+    # wandb's keys= filter drops rows missing ANY key: the RL-D reference predates the "lr" metric, so fetch it without "lr"
+    return [{"step": int(h["_step"]), **{k: h.get(k) for k in keys}} for h in run.history(keys=keys, pandas=False, samples=1000) if h.get("grad_norm") is not None]
 
 
 def eval_rows(name):
@@ -45,7 +46,7 @@ def eval_rows(name):
     return sorted([{"ckpt_step": int(r["ckpt_step"]), **{k: r.get(k) for k, _ in EVAL_KEYS}} for r in rows], key=lambda r: r["ckpt_step"])
 
 
-data = {"reference": {"train_id": REF_TRAIN, "eval_run": REF_EVAL, "train": [r for r in train_rows(api.run(f"{PROJ}/{REF_TRAIN}")) if 225 <= r["step"] <= 310],
+data = {"reference": {"train_id": REF_TRAIN, "eval_run": REF_EVAL, "train": [r for r in train_rows(api.run(f"{PROJ}/{REF_TRAIN}"), [k for k in TRAIN_KEYS if k != "lr"]) if 225 <= r["step"] <= 310],
                       "evals": [r for r in eval_rows(REF_EVAL) if r["ckpt_step"] in (250, 300)]},
         "arms": {}, "note": "all arms resume RL-D step_250 (adapter + optimizer state) for steps 251..310; 16 samples x 256 directions per step; bank mix_1m_v2; "
         "1 vLLM rollout + 3 HF trainer B200. Onsets: first step with grad_norm > 1.0 and first step with sampler |dlogp| > 0.05."}
