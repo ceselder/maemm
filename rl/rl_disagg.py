@@ -113,6 +113,10 @@ def parse_args(argv=None):
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--save-steps", default="", help="comma-separated extra checkpoint steps, e.g. 25,40,60,90,130,200,300,450,675,1000 (log-spaced)")
     ap.add_argument("--warmup-steps", type=int, default=0, help="linear LR warmup over the first N global steps (stability)")
+    ap.add_argument("--lr-decay", choices=("none", "linear", "cosine"), default="none",
+                    help="LR decay from --lr (after warmup) to --lr-min-frac*lr at --total-steps. Default none = constant LR, which "
+                         "blew up RL-C at step ~300 (entropy collapse -> grad-norm explosion, see memory 2026-09-05)")
+    ap.add_argument("--lr-min-frac", type=float, default=0.0, help="final LR as a fraction of --lr for --lr-decay")
     ap.add_argument("--run-name", default="mxf-rl-disagg")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
@@ -1798,9 +1802,14 @@ def run_trainer(a):
                 if v is not None:
                     old_lp[i, j] = float(v); known[i, j] = True
         t_up = time.time()
-        if a.warmup_steps > 0:   # linear LR warmup over the first N global steps (stability)
+        lr_now = a.lr * (min(1.0, (step + 1) / a.warmup_steps) if a.warmup_steps > 0 else 1.0)   # linear warmup
+        if a.lr_decay != "none":   # decay over [warmup_steps, total_steps) to lr_min_frac * lr; step is the GLOBAL step (resume-safe)
+            frac = min(1.0, max(0.0, (step - a.warmup_steps) / max(1, a.total_steps - a.warmup_steps)))
+            shape = (1.0 - frac) if a.lr_decay == "linear" else 0.5 * (1.0 + math.cos(math.pi * frac))
+            lr_now = lr_now * (a.lr_min_frac + (1.0 - a.lr_min_frac) * shape)
+        if a.warmup_steps > 0 or a.lr_decay != "none":
             for _g in opt.param_groups:
-                _g["lr"] = a.lr * min(1.0, (step + 1) / a.warmup_steps)
+                _g["lr"] = lr_now
 
         stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=keep)
         if a.entropy_target > 0:   # SAC-style temperature adaptation on the measured per-token entropy of this step
@@ -1847,7 +1856,7 @@ def run_trainer(a):
                "ratio/clipfrac": stats["clipfrac"], "ratio/mean": stats["ratio_mean"],
                "policy/entropy": stats["entropy"], "policy/kl_to_init": stats["kl"], "policy/entropy_coef": a.entropy_coef,
                "policy/sampler_abs_dlogp": stats["sampler_abs_dlogp"], "policy/offpolicy_lag_steps": lag,
-               "loss": stats["loss"], "grad_norm": stats["grad_norm"], "grad_norm_did_clip": float(stats["grad_norm"] > a.max_grad_norm),
+               "loss": stats["loss"], "grad_norm": stats["grad_norm"], "grad_norm_did_clip": float(stats["grad_norm"] > a.max_grad_norm), "lr": float(opt.param_groups[0]["lr"]),
                "rollout/mean_logp": float(old_lp[known].mean()) if bool(known.any()) else float("nan"),
                "rollout/len_mean": n_gen_all / (B * G), "tokens_per_sec": n_gen_all / secs,
                "rollout/gen_s": gen_s, "rollout/tok_per_s_per_replica": blk_tok / max(gen_s * len(blocks), 1e-6),
