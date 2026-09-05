@@ -207,11 +207,16 @@ def tick(st, ctl):
     # 3. SFT eval (once, `final` as ckpt_step 0)
     for a, s in arms.items():
         if s.get("sft_done") and not s.get("sft_eval_call") and retry_ok(s, "sft_eval"):
+            # daemon mode (NOT --once): a reused warm container's stale /data mount does not see the fresh `final`; --once then
+            # exits with "nothing pending" (happened twice for acts_realact_long). In daemon mode the launcher reloads the mount
+            # every 30 s and the daemon finds `final` on a later poll; the driver cancels the call once ckpt_0.json exists.
             s["sft_eval_call"] = spawn(EVAL_APP, "daemon", ckpt_dir=f"/data/sft_mix/uplift_sft_{a}", tag=f"uplift_sft_{a}", rl_run_id="",
-                                       wandb_name=f"uplift_sft_{a}_eval", final_step=0, once=True, only_step=0, extra_args=eval_extra_args())
+                                       wandb_name=f"uplift_sft_{a}_eval", final_step=0, poll_s=60, extra_args=eval_extra_args())
         if s.get("sft_eval_call") and not s.get("sft_eval_done"):
             if vexists(f"eval_ckpt/uplift_sft_{a}/ckpt_0.json"):
                 s["sft_eval_done"] = True; events.append(f"SFT-EVAL {a} DONE")
+                if call_state(s["sft_eval_call"]) == "pending":     # daemon-mode evaluator: stop it now that `final` is scored
+                    cancel(s["sft_eval_call"]); events.append(f"SFT-EVAL {a} daemon cancelled")
             else:
                 cs = call_state(s["sft_eval_call"])
                 if cs == "done" and not s.get("sft_eval_failed"):     # --once exited without scoring: stale mount saw no `final`

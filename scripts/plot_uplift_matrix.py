@@ -84,7 +84,21 @@ def fetch_all(refresh_latest=True):
                 got.append(f"rl:{a}:{k}")
         if fetch(f"/sft_mix/uplift_sft_{a}/run_meta.json", f"{RAW}/sft_meta/{a}.json"):
             got.append(f"sftmeta:{a}")
+    for name, path in REFS.items():
+        if fetch(path, f"{RAW}/refs/{name}.json"):
+            got.append(f"ref:{name}")
     return got
+
+
+# reference checkpoints from earlier runs (v1 eval cache -> no mlp columns), for the "was the midtrain worth it" comparison
+REFS = {"rl_A_from_init_no_midtrain_ckpt100": "/eval_ckpt/rl_A_randctx/ckpt_100.json",           # pristine init, realact random-ctx bank, 16x256, lr 7e-6, warmup 25
+        "rl_B_rp500k_init_ckpt100": "/eval_ckpt/rl_B_randctx_probes/ckpt_100.json",                # 500k realact+probes init, acts+probes bank
+        "rl_C_mix1m_midtrain_ckpt100": "/eval_ckpt/rl_C_mix1m/ckpt_100.json",                      # init + 1.1M all-families midtrain, all-families bank, lr 7e-6
+        "sft_mix1m_midtrain_final": "/eval_ckpt/sft_mix1m_from_realact23m/ckpt_5000.json"}         # the 1.1M all-families midtrain final (before RL-C)
+REF_LABEL = {"rl_A_from_init_no_midtrain_ckpt100": "RL-A @100: same init, NO midtrain, random-ctx real-acts bank (16x256, lr 7e-6, warmup 25)",
+             "rl_B_rp500k_init_ckpt100": "RL-B @100: 500k realact+probes init, real-acts + probes bank (16x256, lr 7e-6)",
+             "rl_C_mix1m_midtrain_ckpt100": "RL-C @100: same init + 1.1M all-families midtrain (lr 1e-4), all-families bank (16x256, lr 7e-6)",
+             "sft_mix1m_midtrain_final": "1.1M all-families midtrain final (lr 1e-4, 4279 steps) = RL-C's init"}
 
 
 def load_metrics(path):
@@ -321,6 +335,8 @@ def main():
                "delta_sft_vs_acts100": {a: {k: (None if np.isnan(M_sft_x[i, j]) else float(M_sft_x[i, j])) for j, (k, _, _) in enumerate(COLS)} for i, a in enumerate(ARMS)}},
               open(f"{OUT}/data/deltas.json", "w"), indent=1)
     json.dump({"arms": {a: table["arms"][a]["bank"] for a in ARMS}}, open(f"{OUT}/data/banks.json", "w"), indent=1)
+    json.dump({n: {"label": REF_LABEL[n], "source": p, **(load_metrics(f"{RAW}/refs/{n}.json") or {})} for n, p in REFS.items()},
+              open(f"{OUT}/data/references.json", "w"), indent=1)
     json.dump(runs, open(f"{OUT}/data/runs.json", "w"), indent=1)
 
     heatmap(M_sft, "After the 200k midtrain, each 50/50 arm gains on its OWN family (outlined) but the other families barely move",
