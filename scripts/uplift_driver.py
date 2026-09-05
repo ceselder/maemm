@@ -30,7 +30,7 @@ import time
 
 import modal
 
-ARMS = ["acts100", "acts_sae", "acts_bsf", "acts_cluster", "acts_realact_long", "acts_mlp"]
+ARMS = os.environ.get("UPLIFT_ARMS", "acts100,acts_sae,acts_bsf,acts_cluster,acts_realact_long,acts_mlp").split(",")   # UPLIFT_ARMS=acts_all -> single new arm
 INIT_ADAPTER = "/data/sft_mix/realact20m_prefix_lr1e-4/final"
 EVAL_CACHE_V2 = "/data/eval_universal_ho/eval_sets_heldout_v2.pt"
 EVAL_APP = "maemm-eval-ckpt-uplift"       # eval/modal_eval_ckpt_uplift.py (mlp42-bank evaluator code + vol.reload + killpg-on-cancel);
@@ -172,7 +172,7 @@ def tick(st, ctl):
 
     # 1. banks
     if not st.get("bank_call"):
-        st["bank_call"] = spawn(BANK_APP, "build")
+        st["bank_call"] = spawn(BANK_APP, "build", arms=",".join(ARMS))
     for a, s in arms.items():
         if not s.get("bank_ready") and vexists(f"banks/uplift_{a}/build_stats.json"):
             s["bank_ready"] = True; events.append(f"bank {a} READY")

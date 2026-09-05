@@ -57,8 +57,24 @@ ARMS = {
     "acts_cluster": (SRC_MIX, ("cluster",)),
     "acts_realact_long": (SRC_MIX, ("realact_long",)),
     "acts_mlp": (SRC_MLP, ("mlp", "mlp_pair")),
+    # act-matched "everything mixed": 100k real acts (subset A) + 100k spread evenly over the five other families (20k each)
+    "acts_all": [(SRC_MIX, ("sae",), 20_000), (SRC_MIX, ("bsf",), 20_000), (SRC_MIX, ("cluster",), 20_000),
+                 (SRC_MIX, ("realact_long",), 20_000), (SRC_MLP, ("mlp", "mlp_pair"), 20_000)],
 }
-ARM_ORDER = list(ARMS)   # the rng consumption order (fixed -> reproducible selections)
+ARM_ORDER = list(ARMS)   # the rng consumption order (fixed -> reproducible selections; new arms go at the END)
+
+
+def _parts(spec, n_half):
+    """normalize an arm spec to a list of (bank, families, n) parts (None = control)."""
+    if spec is None:
+        return []
+    if isinstance(spec, list):
+        return [(b, tuple(f), int(n)) for b, f, n in spec]
+    return [(spec[0], tuple(spec[1]), n_half)]
+
+
+def _x_desc(spec):
+    return "+".join("/".join(f) for _, f, _ in spec) if isinstance(spec, list) else "/".join(spec[1])
 
 
 def _log(msg):
@@ -127,12 +143,14 @@ def build(arms: str = "all", n_half: int = 100_000, seed: int = 2027, overwrite:
         spec = ARMS[a]
         if spec is None:
             continue
-        bank, fams = spec
-        rows = np.flatnonzero(np.isin(fam_of[bank], list(fams)))
-        take = min(n_half, len(rows))
-        x_sel[a] = (bank, np.sort(rng.permutation(rows)[:take]), len(rows))
+        parts = []
+        for bank, fams, n in _parts(spec, n_half):
+            rows = np.flatnonzero(np.isin(fam_of[bank], list(fams)))
+            take = min(n, len(rows))
+            parts.append((bank, np.sort(rng.permutation(rows)[:take]), len(rows), fams))
+        x_sel[a] = parts
     _log(f"realact subset A {len(sub_a)} rows (min {sub_a[0]} max {sub_a[-1]}), B {len(sub_b)} | "
-         + " ".join(f"{a}:{len(s[1])}/{s[2]}" for a, s in x_sel.items()))
+         + " ".join(f"{a}:{'+'.join(str(len(pp[1])) + '/' + str(pp[2]) for pp in ps)}" for a, ps in x_sel.items()))
 
     # ---- per-arm row lists: (bank, src_row) in a seeded shuffled order; dst i == records line i ----
     plans = {}
@@ -142,8 +160,7 @@ def build(arms: str = "all", n_half: int = 100_000, seed: int = 2027, overwrite:
         if ARMS[a] is None:
             src = [(SRC_MIX, int(r)) for r in np.concatenate([sub_a, sub_b])]
         else:
-            bank, sel, _ = x_sel[a]
-            src = [(SRC_MIX, int(r)) for r in sub_a] + [(bank, int(r)) for r in sel]
+            src = [(SRC_MIX, int(r)) for r in sub_a] + [(bank, int(r)) for bank, sel, _, _ in x_sel[a] for r in sel]
         N = len(src)
         perm = np.random.default_rng(seed * 100 + ai).permutation(N)      # staged g -> dst perm[g]
         dst_of_src = {}
@@ -270,14 +287,15 @@ def build(arms: str = "all", n_half: int = 100_000, seed: int = 2027, overwrite:
                              "realact_rows_A": [int(sub_a[0]), int(sub_a[-1]), len(sub_a)],
                              "realact_rows_B": [int(sub_b[0]), int(sub_b[-1]), len(sub_b)] if spec is None else None}}
         if spec is not None:
-            bank, sel, avail = x_sel[a]
-            sources.setdefault(bank, {"path": bank, "n_rows_taken": 0})
-            sources[bank].update({"x_families": list(spec[1]), "x_rows_taken": int(len(sel)), "x_rows_available": int(avail),
-                                  "x_rule": f"seeded permutation of every {'/'.join(spec[1])} row of the source, first {n_half}"})
-            sources[bank]["n_rows_taken"] = int(sum(1 for b, _ in P["src"] if b == bank))
+            for bank, sel, avail, fams in x_sel[a]:
+                sources.setdefault(bank, {"path": bank, "n_rows_taken": 0})
+                parts_here = sources[bank].setdefault("x_parts", [])
+                parts_here.append({"x_families": list(fams), "x_rows_taken": int(len(sel)), "x_rows_available": int(avail),
+                                   "x_rule": f"seeded permutation of every {'/'.join(fams)} row of the source, first {len(sel)}"})
+                sources[bank]["n_rows_taken"] = int(sum(1 for b, _ in P["src"] if b == bank))
         stats = {"kind": f"cross-uplift arm {a}: " + ("200k real activations (control)" if spec is None else
-                         f"100k real activations (subset A) + 100k {'/'.join(spec[1])} rows"),
-                 "arm": a, "x_family": None if spec is None else list(spec[1]),
+                         f"100k real activations (subset A) + 100k {_x_desc(spec)} rows"),
+                 "arm": a, "x_family": None if spec is None else sorted({f for _, fams, _, _ in x_sel[a] for f in fams}),
                  "n_examples": N, "n_vecs": N, "families": counts,
                  "layout": "seeded shuffle of all rows (records.jsonl line i == vec_idx i; src_bank/src_vec_idx = provenance)",
                  "seed": seed, "arm_shuffle_seed": seed * 100 + ARM_ORDER.index(a), "n_half": n_half,
