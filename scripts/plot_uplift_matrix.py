@@ -50,6 +50,12 @@ OWN = {"acts_sae": {"eval/sae/norm_act", "eval/sae/rank1_frac"}, "acts_bsf": {"e
        "acts_mlp": {"eval/mlp/cos", "eval/mlp/norm_act", "eval/mlp_pair/cos"}, "acts100": set()}
 REALACT_COLS = {"eval/realact/cos", "eval/realact_early/cos", "eval/realact_mid/cos", "eval/indist_realact/cos"}
 RL_STEPS = [25, 50, 100]
+# headline figure: the non-duplicate columns only, plain-language rows, one-line title
+CORE_COLS = [("eval/mean_all", "mean of\n11 families"), ("eval/realact/cos", "real acts"), ("eval/realact_long/cos", "real acts\nlong ctx"),
+             ("eval/sae/norm_act", "SAE\nnorm act"), ("eval/sae/rank1_frac", "SAE\nrank-1"), ("eval/bsf/cos", "BSF"), ("eval/cluster/cos", "cluster\nprobes"),
+             ("eval/jlens/cos", "J-lens"), ("eval/mlp/cos", "MLP\nneurons"), ("eval/mlp/norm_act", "MLP\nfire-back"), ("eval/random/cos", "random\n(control)")]
+ARM_ROW = {"acts100": "real acts only (control)", "acts_sae": "+ SAE features", "acts_bsf": "+ BSF blocks", "acts_cluster": "+ cluster probes",
+           "acts_realact_long": "+ long-context acts", "acts_mlp": "+ MLP neurons"}
 
 # palette (dataviz reference instance): diverging blue <-> red with a neutral gray midpoint; categorical slot 1 blue, slot 2 orange
 BLUE, ORANGE, GRAY_MID, INK, MUTED, GRID = "#2a78d6", "#eb6834", "#f0efec", "#0b0b0b", "#898781", "#e1e0d9"
@@ -236,6 +242,46 @@ def heatmap(M, title, subtitle, fname, vlim=0.10, ref_row=None):
     plt.close(fig)
 
 
+def heatmap_clean(table, fname, budget):
+    """Headline: delta vs the shared init after midtrain + RL@100, core columns only, per-row training budget in the label."""
+    import textwrap
+    cols = [k for k, _ in CORE_COLS]; full = [k for k, _, _ in COLS]
+    M_full = matrix(table, 100, "init"); M = M_full[:, [full.index(k) for k in cols]]
+    fig = plt.figure(figsize=(14.5, 6.0))
+    ax = fig.add_axes([0.215, 0.16, 0.66, 0.60])   # [left, bottom, width, height] — fixed so the cells stay wide
+    vlim = 0.10
+    im = ax.imshow(np.ma.masked_invalid(M), cmap=DIVERGING, norm=TwoSlopeNorm(vmin=-vlim, vcenter=0.0, vmax=vlim), aspect="auto")
+    ax.set_xticks(range(len(cols))); ax.set_xticklabels([l for _, l in CORE_COLS], fontsize=9.5)
+    mt = budget["midtrain"]
+    ax.set_yticks(range(len(ARMS))); ax.set_yticklabels([f"{ARM_ROW[a]}  ·  {mt[a]['target_tokens'] / 1e6:.1f}M tok" for a in ARMS], fontsize=10.5)
+    ax.tick_params(length=0)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    for i in range(len(ARMS) + 1):
+        ax.axhline(i - 0.5, color="white", lw=2)
+    for j in range(len(cols) + 1):
+        ax.axvline(j - 0.5, color="white", lw=2)
+    for i, a in enumerate(ARMS):
+        for j, k in enumerate(cols):
+            v = M[i, j]
+            if np.isnan(v):
+                continue
+            ax.text(j, i, f"{v:+.2f}", ha="center", va="center", fontsize=10.5, color="white" if abs(v) > 0.6 * vlim else INK)
+            if k in OWN[a]:
+                ax.add_patch(plt.Rectangle((j - 0.45, i - 0.45), 0.9, 0.9, fill=False, ec=INK, lw=2.4, zorder=6))
+    cax = fig.add_axes([0.89, 0.16, 0.012, 0.60])
+    cb = fig.colorbar(im, cax=cax); cb.set_label("Δ vs init", fontsize=9); cb.ax.tick_params(labelsize=8)
+    gen = budget["rl"]["generated_tokens_M"]; lo, hi = min(gen.values()), max(gen.values())
+    fig.text(0.02, 0.93, "Midtrain + 100 RL steps: structured direction families lift SAE and MLP fidelity, real acts improve in every mixed arm, J-lens never moves",
+             fontsize=12.5, color=INK, va="center")
+    fig.text(0.02, 0.855, "\n".join(textwrap.wrap(f"Δ held-out score vs the shared init (23M real-act SFT). Each row: midtrain on 200k examples (100k real acts + 100k of the named family; "
+                                                    f"target tokens in the label) → 100 GRPO steps × 2048 rollouts ({lo:.0f}–{hi:.0f}M generated tokens). Black box = the arm's own family.", 165)),
+             fontsize=9, color="#52514e", va="top")
+    for ext in ("png", "pdf"):
+        fig.savefig(f"{OUT}/{fname}.{ext}", dpi=170)
+    plt.close(fig)
+
+
 def family_bars(table, stage, title, fname):
     init = (table["init"] or {}).get("metrics", {})
     cols = [c for c in COLS if c[0] not in ("eval/sae/rank1_frac",)]
@@ -359,6 +405,8 @@ def main():
             "delta vs the acts100 control arm at RL@100 (same init, same step count, same recipe; only the 100k X half of the bank differs). "
             "Outlined = the arm's own X family; real-activation columns are in-distribution for every arm.",
             "uplift_rl_vs_control_heatmap", ref_row=0)
+    if os.path.exists(f"{OUT}/data/budget.json"):
+        heatmap_clean(table, "uplift_rl_delta_clean", json.load(open(f"{OUT}/data/budget.json")))
     family_bars(table, "sft", "Absolute held-out scores after the 200k midtrain, per eval family: the control (orange) vs each 50/50 arm (blue) vs the init (dashed)",
                 "uplift_family_bars_sft")
     family_bars(table, 100, "Absolute held-out scores after midtrain + RL@100, per eval family: the control (orange) vs each 50/50 arm (blue) vs the init (dashed)",
