@@ -117,6 +117,8 @@ def parse_args(argv=None):
                     help="LR decay from --lr (after warmup) to --lr-min-frac*lr at --total-steps. Default none = constant LR, which "
                          "blew up RL-C at step ~300 (entropy collapse -> grad-norm explosion, see memory 2026-09-05)")
     ap.add_argument("--lr-min-frac", type=float, default=0.0, help="final LR as a fraction of --lr for --lr-decay")
+    ap.add_argument("--lr-decay-total-steps", type=int, default=None, help="decay horizon (global step at which lr reaches lr-min-frac*lr); default = --total-steps. "
+                    "Lets a short resumed ablation follow the schedule a full 400-step run would have.")
     ap.add_argument("--run-name", default="mxf-rl-disagg")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
@@ -1587,6 +1589,9 @@ def run_trainer(a):
     optim_p = os.path.join(a.init_adapter or "", "optim.pt")
     if a.init_adapter and os.path.exists(optim_p):
         opt.load_state_dict(torch.load(optim_p, map_location="cpu"))
+        for _g in opt.param_groups:   # a loaded optimizer state carries the OLD run's lr/betas/eps — re-apply this run's flags (ablation arms rely on it)
+            _g["lr"], _g["betas"], _g["eps"] = a.lr, tuple(a.adam_betas), a.adam_eps
+        _log(tag, f"optimizer state loaded from {optim_p}; hyperparams re-applied: lr {a.lr} betas {tuple(a.adam_betas)} eps {a.adam_eps}")
         _log(tag, f"AdamW state restored from {optim_p}")
     submodule = get_layer(actor, INJECT_LAYER)
     if a.kl_coef > 0:
@@ -1810,7 +1815,8 @@ def run_trainer(a):
         t_up = time.time()
         lr_now = a.lr * (min(1.0, (step + 1) / a.warmup_steps) if a.warmup_steps > 0 else 1.0)   # linear warmup
         if a.lr_decay != "none":   # decay over [warmup_steps, total_steps) to lr_min_frac * lr; step is the GLOBAL step (resume-safe)
-            frac = min(1.0, max(0.0, (step - a.warmup_steps) / max(1, a.total_steps - a.warmup_steps)))
+            _T = a.lr_decay_total_steps or a.total_steps
+            frac = min(1.0, max(0.0, (step - a.warmup_steps) / max(1, _T - a.warmup_steps)))
             shape = (1.0 - frac) if a.lr_decay == "linear" else 0.5 * (1.0 + math.cos(math.pi * frac))
             lr_now = lr_now * (a.lr_min_frac + (1.0 - a.lr_min_frac) * shape)
         if a.warmup_steps > 0 or a.lr_decay != "none":
