@@ -86,13 +86,13 @@ seen = {}
 for ax in axes.flat:
     for h, l in zip(*ax.get_legend_handles_labels()):
         seen.setdefault(l, h)
-fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=1, frameon=False, fontsize=9.5, bbox_to_anchor=(0.5, 0.0))
-fig.text(0.5, 0.0855, "Shared by every arm: Qwen3.6-27B inverter LoRA r64, ScaleRL (CISPO eps 5, batch adv norm, NPR 0.9@0.7), lr 7e-6, reward = max cos over last 5 tokens, held-out eval 512 dirs/family best-of-4 at T=1.   "
+fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=1, frameon=False, fontsize=9.5, bbox_to_anchor=(0.5, 0.012))
+fig.text(0.5, 0.004, "Shared by every arm: Qwen3.6-27B inverter LoRA r64, ScaleRL (CISPO eps 5, batch adv norm, NPR 0.9@0.7), lr 7e-6, reward = max cos over last 5 tokens, held-out eval 512 dirs/family best-of-4 at T=1.   "
          "Only RL-C vs RL-D (lr) and the uplift matrix (bank) are single-factor comparisons; a same-bank init head-to-head has not been run.",
-         ha="center", va="top", fontsize=9, color="#555555")
+         ha="center", va="bottom", fontsize=9, color="#555555")
 fig.suptitle("RL runs that differ in SFT init AND RL bank AND rollouts/step (same ScaleRL recipe, lr 7e-6), every logged eval metric — not a controlled test of the init:\n"
              "the realact-only arm also has a realact-only RL bank (so flat SAE/probes are the bank), and the 500k-init arms use a different bank and half the batch of RL-C", fontsize=12, y=0.995)
-fig.tight_layout(rect=(0, 0.095, 1, 0.965))
+fig.tight_layout(rect=(0, 0.105, 1, 0.965))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/rl_pretrain_effect.{ext}", dpi=160)
 plt.close(fig)
