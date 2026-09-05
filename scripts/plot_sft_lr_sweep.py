@@ -123,13 +123,19 @@ if have:
         claim = f"lr {best_lr:g} is the best SFT learning rate at a fixed 2M-example budget (mean_all {means[best_lr]:.3f}); higher lrs do not help"
     if DIVERGED:
         claim += f"; lr >= {min(DIVERGED):g} diverges (train loss 7-10 from the first 100 steps)"
-    if ft_have:
-        ft_means = {lr: ft_finals[lr]["eval/mean_all"] for lr in ft_have}
+    ft_done = [lr for lr in ft_have if ft_finals[lr]["ckpt_step"] >= FINAL_STEP]    # only ANNEALED finals earn a verdict
+    if ft_done:
+        ft_means = {lr: ft_finals[lr]["eval/mean_all"] for lr in ft_done}
         ft_best = max(ft_means, key=ft_means.get)
         d = ft_means[ft_best] - means[best_lr]
         verdict = ("beats" if d > 0.005 else "ties" if abs(d) <= 0.005 else "trails")
         claim += f". Full fine-tuning (lr {ft_best:g}) {verdict} the best LoRA arm: mean_all {ft_means[ft_best]:.3f} vs {means[best_lr]:.3f}"
-        data["claim_fullft"] = {"best_ft_lr": ft_best, "ft_mean_all": ft_means[ft_best], "lora_best_lr": best_lr, "lora_mean_all": means[best_lr], "verdict": verdict}
+        data["claim_fullft"] = {"best_ft_lr": ft_best, "ft_mean_all": ft_means[ft_best], "lora_best_lr": best_lr, "lora_mean_all": means[best_lr], "verdict": verdict,
+                                "n_final": len(ft_done), "n_arms": len(FT_LRS)}
+    elif ft_have:
+        claim += ". Full fine-tuning arms still running (latest evaluated checkpoint: " + ", ".join(
+            f"lr {lr:g} step {ft_finals[lr]['ckpt_step']} mean_all {ft_finals[lr]['eval/mean_all']:.3f}" for lr in ft_have) + ")"
+    data["fullft_in_progress"] = [RUN_FT(lr) for lr in ft_have if lr not in ft_done]
     data["claim"] = claim
     json.dump(data, open(f"{OUT}/data/lr_sweep.json", "w"), indent=1)
     fig, axes = plt.subplots(2, 4, figsize=(15, 7.2))
