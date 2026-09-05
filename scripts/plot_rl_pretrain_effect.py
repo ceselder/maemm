@@ -13,11 +13,16 @@ import wandb
 OUT = os.path.expanduser("~/shared/reports/maemm-rl-ab")
 os.makedirs(f"{OUT}/data", exist_ok=True)
 PROJ = "octahedral-systems/maxact-fast"
+# Every factor that differs between the arms is spelled out in the label: this is NOT a controlled comparison of the SFT init alone.
 RUNS = {
-    "SFT on realact only (23M) → RL-A [bank: real activations only, 4096 rollouts/step]": {"eval": "rl_A_randctx_from_realact23m_eval", "rps": 4096, "color": "#c99a2e", "ls": "-"},
-    "SFT on datamix (500k) → RL 16x128 [all-families bank, 2048/step]": {"eval": "rl_everything_16x128_disagg_scalerl_lr7e-6_4gpu_eval", "rps": 2048, "color": "#7a7a7a", "ls": "-"},
-    "SFT on datamix (500k) → RL 8x256 [all-families bank, 2048/step]": {"eval": "rl_everything_8x256_disagg_scalerl_lr7e-6_eval", "rps": 2048, "color": "#4a6fa5", "ls": "--"},
-    "SFT on realact (23M) + datamix midtrain (1.1M) → RL-C [all-families bank, 4096/step]": {"eval": "rl_C_mix1m_from_realact23m_mixsft_eval", "rps": 4096, "color": "#b5542b", "ls": "-"},
+    "init: SFT realact only (23M)  |  RL bank: real activations only (200k)  |  16x256 = 4096 rollouts/step  |  RL-A":
+        {"eval": "rl_A_randctx_from_realact23m_eval", "rps": 4096, "color": "#c99a2e", "ls": "-"},
+    "init: SFT datamix (500k realact+probes)  |  RL bank: all 5 families, 500k (100k each)  |  16x128 = 2048 rollouts/step":
+        {"eval": "rl_everything_16x128_disagg_scalerl_lr7e-6_4gpu_eval", "rps": 2048, "color": "#7a7a7a", "ls": "-"},
+    "init: SFT datamix (500k realact+probes)  |  RL bank: all 5 families, 500k (100k each)  |  8x256 = 2048 rollouts/step":
+        {"eval": "rl_everything_8x256_disagg_scalerl_lr7e-6_eval", "rps": 2048, "color": "#4a6fa5", "ls": "--"},
+    "init: SFT realact (23M) + datamix midtrain (1.1M)  |  RL bank: all 5 families, 1.1M (250k/250k/236k/118k/242k)  |  16x256 = 4096 rollouts/step  |  RL-C":
+        {"eval": "rl_C_mix1m_from_realact23m_mixsft_eval", "rps": 4096, "color": "#b5542b", "ls": "-"},
 }
 INIT = {"SFT datamix 500k (before RL)": {"eval/mean_all": 0.359, "eval/sae/norm_act": 0.61, "color": "#4a6fa5"},
         "SFT realact 23M (before RL)": {"eval/mean_all": 0.369, "eval/sae/norm_act": 0.418, "eval/realact/cos": 0.477, "color": "#c99a2e"},
@@ -53,7 +58,7 @@ raw = {}
 for label, cfg in RUNS.items():
     rs = list(api.runs(PROJ, filters={"display_name": cfg["eval"]}, order="-created_at"))
     raw[label] = sorted([r for r in rs[0].history(pandas=False) if "ckpt_step" in r and r.get("eval/mean_all") is not None], key=lambda r: r["ckpt_step"]) if rs else []
-METRICS = _metric_list(raw["SFT on realact (23M) + datamix midtrain (1.1M) → RL-C [all-families bank, 4096/step]"])
+METRICS = _metric_list(next(v for k, v in raw.items() if k.endswith("RL-C")))
 for label, cfg in RUNS.items():
     rows = [{"ckpt_step": int(r["ckpt_step"]), "rollouts": int(r["ckpt_step"]) * cfg["rps"], **{m: r.get(m) for m, _ in METRICS}} for r in raw[label]]
     data["runs"][label] = {"eval_run": cfg["eval"], "rollouts_per_step": cfg["rps"], "evals": rows}
@@ -81,10 +86,13 @@ seen = {}
 for ax in axes.flat:
     for h, l in zip(*ax.get_legend_handles_labels()):
         seen.setdefault(l, h)
-fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=2, frameon=False, fontsize=9, bbox_to_anchor=(0.5, 0.0))
-fig.suptitle("RL from three SFT inits (same ScaleRL recipe, lr 7e-6), every logged eval metric: the 23M realact pretrain + datamix midtrain overtakes the 500k-datamix start\n"
-             "on the mean, SAE and real activations by ~0.4M rollouts; the realact-only pretrain wins real activations but never learns SAE/probes (its RL bank has none)", fontsize=12, y=0.995)
-fig.tight_layout(rect=(0, 0.075, 1, 0.965))
+fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=1, frameon=False, fontsize=9.5, bbox_to_anchor=(0.5, 0.0))
+fig.text(0.5, 0.0855, "Shared by every arm: Qwen3.6-27B inverter LoRA r64, ScaleRL (CISPO eps 5, batch adv norm, NPR 0.9@0.7), lr 7e-6, reward = max cos over last 5 tokens, held-out eval 512 dirs/family best-of-4 at T=1.   "
+         "Only RL-C vs RL-D (lr) and the uplift matrix (bank) are single-factor comparisons; a same-bank init head-to-head has not been run.",
+         ha="center", va="top", fontsize=9, color="#555555")
+fig.suptitle("RL runs that differ in SFT init AND RL bank AND rollouts/step (same ScaleRL recipe, lr 7e-6), every logged eval metric — not a controlled test of the init:\n"
+             "the realact-only arm also has a realact-only RL bank (so flat SAE/probes are the bank), and the 500k-init arms use a different bank and half the batch of RL-C", fontsize=12, y=0.995)
+fig.tight_layout(rect=(0, 0.095, 1, 0.965))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/rl_pretrain_effect.{ext}", dpi=160)
 plt.close(fig)
