@@ -105,8 +105,8 @@ def render(arms, run_prefix, prefix, title_dyn, extra_refs):
         ax.set_xlabel("global RL step (all arms resume RL-D at 250)", fontsize=9.5)
     h, l = axes.flat[0].get_legend_handles_labels()
     fig.legend(h, l, loc="lower center", ncol=2, frameon=False, fontsize=8.6, bbox_to_anchor=(0.5, 0.0))
-    fig.suptitle(title_dyn(data), fontsize=11, y=0.995)
-    fig.tight_layout(rect=(0, 0.19, 1, 0.95))
+    fig.suptitle(title_dyn(data), fontsize=10.5, y=0.998)
+    fig.tight_layout(rect=(0, 0.19, 1, 0.94))
     for ext in ("png", "pdf"):
         fig.savefig(f"{OUT}/{prefix}_dynamics.{ext}", dpi=160)
     plt.close(fig)
@@ -145,9 +145,10 @@ def title1(d):
 def title2(d):
     on = {a: d["arms"][a]["onset_dlogp_gt05"] for a in ROUND2}
     fmt = lambda a: str(on[a]) if on[a] else "none"
-    return ("Round 2, mechanism-level changes at the SAME lr 1e-5: none prevents the runaway. Sampler-drift onset — fresh Adam moments "
-            f"{fmt('control_fresh')} (control 277), raw advantages {fmt('rawadv_fresh')}, 2x batch {fmt('groups512')}, PPO clip {fmt('ppoclip')}, KL 0.02 {fmt('kl002')}, entropy floor {fmt('enttarget')};\n"
-            "the raw-advantage arms with loaded Adam moments look stable only because the stale second moment cuts their effective lr ~25x")
+    return ("Round 2 — mechanism-level changes at the same lr 1e-5: none prevents the runaway (control's drift onset = step 277)\n"
+            f"onset with fresh Adam moments {fmt('control_fresh')} · raw advantages {fmt('rawadv_fresh')} · 2x batch {fmt('groups512')} · PPO clip {fmt('ppoclip')} · "
+            f"KL 0.02 {fmt('kl002')} · entropy floor {fmt('enttarget')}\n"
+            "the two raw-advantage arms with LOADED Adam moments look stable only because the stale second moment cuts their effective lr ~25x")
 
 
 d1 = render(ROUND1, "rl_ablate_", "ablation", title1, [])
