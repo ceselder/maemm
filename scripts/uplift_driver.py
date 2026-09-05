@@ -136,7 +136,8 @@ def spawn(app, fn, **kw):
     return fc.object_id
 
 
-RETRYABLE = ("bank not found on volume", "missing /data/", "No such file", "LocalEntryNotFound", "nothing pending", "does not exist")
+RETRYABLE = ("bank not found on volume", "missing /data/", "No such file", "LocalEntryNotFound", "nothing pending", "does not exist",
+             "exited rc=")   # rl_disagg / torchrun non-zero exit: the launcher hides the cause; a stale-mount init adapter is the common one
 MAX_RETRIES = 3
 
 

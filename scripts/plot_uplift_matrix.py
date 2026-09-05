@@ -212,8 +212,9 @@ def heatmap(M, title, subtitle, fname, vlim=0.10, ref_row=None):
     cb = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.01)
     cb.set_label("delta (clipped at ±%.2f for color; numbers exact)" % vlim, fontsize=8.5)
     cb.ax.tick_params(labelsize=8)
-    ax.set_title(title, fontsize=12, loc="left", color=INK, pad=14)
-    ax.text(0, 1.015, subtitle, transform=ax.transAxes, fontsize=8.8, color="#52514e", va="bottom")
+    import textwrap
+    ax.set_title("\n".join(textwrap.wrap(title, 150)), fontsize=12, loc="left", color=INK, pad=30)
+    ax.text(0, 1.012, "\n".join(textwrap.wrap(subtitle, 190)), transform=ax.transAxes, fontsize=8.6, color="#52514e", va="bottom")
     fig.tight_layout()
     for ext in ("png", "pdf"):
         fig.savefig(f"{OUT}/{fname}.{ext}", dpi=170)
