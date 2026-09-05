@@ -297,9 +297,9 @@ def rl_train_plot(runs, fname):
             ax.spines[sp].set_visible(False)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, frameon=False, fontsize=8.5, ncol=6, loc="lower center", bbox_to_anchor=(0.5, 0.0))
-    fig.suptitle("RL raises every arm's training reward within 100 steps; the SAE / probe / MLP banks are the hardest (lowest reward) yet transfer the most, "
-                 "so the reward level of a bank does not predict its cross-uplift", fontsize=11.5, x=0.01, ha="left")
-    fig.tight_layout(rect=(0, 0.06, 1, 0.93))
+    fig.suptitle("RL raises every arm's training reward within 100 steps; the SAE / probe / MLP banks are the hardest (lowest reward)\n"
+                 "yet transfer the most, so a bank's reward level does not predict its cross-uplift", fontsize=11.5, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.90))
     for ext in ("png", "pdf"):
         fig.savefig(f"{OUT}/{fname}.{ext}", dpi=170)
     plt.close(fig)
