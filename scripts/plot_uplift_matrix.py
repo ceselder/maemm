@@ -260,6 +260,62 @@ def all_families_row(table, budget):
             "abs": {k: row.get(k) for k, _ in CORE_COLS}, "source": ref}
 
 
+TRAJ_COLS = [("eval/mean_all", "mean of 11 families"), ("eval/realact/cos", "real acts"), ("eval/realact_long/cos", "real acts, long ctx"), ("eval/sae/norm_act", "SAE norm act"),
+             ("eval/sae/rank1_frac", "SAE rank-1"), ("eval/bsf/cos", "BSF"), ("eval/cluster/cos", "cluster probes"), ("eval/mlp/norm_act", "MLP fire-back")]
+ARM_COLOR = {"acts100": "#7a7a7a", "acts_sae": "#b5542b", "acts_bsf": "#4a6fa5", "acts_cluster": "#2a7f62", "acts_realact_long": "#9a7fc4", "acts_mlp": "#c99a2e"}
+
+
+def trajectories(table, fname, budget):
+    """Every evaluated checkpoint of every arm as delta vs the shared init, against RL rollouts consumed (0 = right after the midtrain),
+    with the everything-mixed run (RL-E) at ITS checkpoints as a reference — so arms can be compared at matched RL compute."""
+    init = (table["init"] or {}).get("metrics", {})
+    rps = budget["rl"]["directions_per_step"] * budget["rl"]["samples_per_direction"]      # 2048 rollouts / step for the arms
+    out = {"x_is": "RL rollouts consumed (0 = after the 200k midtrain, before RL)", "arms": {}, "reference": None}
+    for a in ARMS:
+        pts = []
+        m = stage_metrics(table, a, "sft")
+        if m: pts.append({"rl_step": 0, "rollouts": 0, **{k: (m[k] - init[k]) if (m.get(k) is not None and init.get(k) is not None) else None for k, _ in TRAJ_COLS}})
+        for st in RL_STEPS:
+            m = stage_metrics(table, a, st)
+            if m: pts.append({"rl_step": st, "rollouts": st * rps, **{k: (m[k] - init[k]) if (m.get(k) is not None and init.get(k) is not None) else None for k, _ in TRAJ_COLS}})
+        out["arms"][a] = {"label": ARM_ROW[a], "points": pts}
+    ref = budget.get("reference_all_families"); ref_pts = []
+    if ref:
+        try:
+            import wandb
+            rs = list(wandb.Api().runs(PROJ, filters={"display_name": ref["rl"]["eval_run"]}, order="-created_at"))
+            for r in sorted([r for r in rs[0].history(pandas=False) if r.get("ckpt_step") is not None and r.get("eval/mean_all") is not None], key=lambda r: r["ckpt_step"]):
+                if r["ckpt_step"] <= 100:
+                    ref_pts.append({"rl_step": int(r["ckpt_step"]), "rollouts": int(r["ckpt_step"]) * ref["rl"]["rollouts_per_step"],
+                                    **{k: (r[k] - init[k]) if (r.get(k) is not None and init.get(k) is not None) else None for k, _ in TRAJ_COLS}})
+            out["reference"] = {"label": "all 7 families mixed (RL-E; 1.1M midtrain, 4096 rollouts/step)", "points": ref_pts}
+        except Exception as e:
+            print("[plot] trajectory reference unavailable:", e)
+    json.dump(out, open(f"{OUT}/data/trajectories.json", "w"), indent=1)
+    fig, axes = plt.subplots(2, 4, figsize=(17, 7.4), sharex=True)
+    for ax, (k, title) in zip(axes.flat, TRAJ_COLS):
+        for a in ARMS:
+            pts = [p for p in out["arms"][a]["points"] if p.get(k) is not None]
+            ax.plot([p["rollouts"] / 1e3 for p in pts], [p[k] for p in pts], "o-", color=ARM_COLOR[a], ms=4, lw=1.6, label=ARM_ROW[a])
+        pts = [p for p in ref_pts if p.get(k) is not None]
+        if pts:
+            ax.plot([p["rollouts"] / 1e3 for p in pts], [p[k] for p in pts], "s--", color="#111111", ms=4, lw=1.4, label=out["reference"]["label"])
+        ax.axhline(0, color="#999999", lw=0.8); ax.set_title(title, fontsize=10); ax.grid(alpha=0.25); ax.tick_params(labelsize=8.5)
+        ax.set_xticks([0, 51, 102, 205, 410]); ax.set_xticklabels(["0\n(after\nmidtrain)", "51k", "102k", "205k", "410k"], fontsize=8)
+    for ax in axes[1]:
+        ax.set_xlabel("RL rollouts consumed", fontsize=9.5)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Δ vs shared init", fontsize=9.5)
+    h, l = axes.flat[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="lower center", ncol=4, frameon=False, fontsize=8.8, bbox_to_anchor=(0.5, 0.0))
+    fig.suptitle("Every checkpoint: the 200k midtrain alone lowers every family (x = 0), RL recovers and then lifts them within 50k–100k rollouts;\n"
+                 "at matched rollouts the everything-mixed run (dashed, 5x more midtrain tokens) tracks the best single-family arm rather than beating it", fontsize=11, y=0.995)
+    fig.tight_layout(rect=(0, 0.13, 1, 0.94))
+    for ext in ("png", "pdf"):
+        fig.savefig(f"{OUT}/{fname}.{ext}", dpi=170)
+    plt.close(fig)
+
+
 def heatmap_clean(table, fname, budget):
     """Headline: delta vs the shared init after midtrain + RL@100, core columns only, per-row training budget in the label,
     plus (below a gap) the everything-mixed reference run at the same RL step."""
@@ -441,6 +497,7 @@ def main():
             "uplift_rl_vs_control_heatmap", ref_row=0)
     if os.path.exists(f"{OUT}/data/budget.json"):
         heatmap_clean(table, "uplift_rl_delta_clean", json.load(open(f"{OUT}/data/budget.json")))
+        trajectories(table, "uplift_trajectories", json.load(open(f"{OUT}/data/budget.json")))
     family_bars(table, "sft", "Absolute held-out scores after the 200k midtrain, per eval family: the control (orange) vs each 50/50 arm (blue) vs the init (dashed)",
                 "uplift_family_bars_sft")
     family_bars(table, 100, "Absolute held-out scores after midtrain + RL@100, per eval family: the control (orange) vs each 50/50 arm (blue) vs the init (dashed)",
