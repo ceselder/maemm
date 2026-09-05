@@ -136,6 +136,31 @@ def spawn(app, fn, **kw):
     return fc.object_id
 
 
+RETRYABLE = ("bank not found on volume", "missing /data/", "No such file", "LocalEntryNotFound", "nothing pending", "does not exist")
+MAX_RETRIES = 3
+
+
+def retry(s, stage, msg, events, arm, delay=180):
+    """Modal reuses WARM containers whose /data mount predates files written by other containers (the bank, the SFT final,
+    the RL ckpt dir): the preflight asserts fail ("bank not found on volume", "missing /data/...") or a --once evaluator finds
+    nothing. Clear the stage so it is re-spawned after `delay` s (idle containers scale down by then) on a fresh container.
+    Returns True when a retry was scheduled (bounded by MAX_RETRIES and the RETRYABLE signatures)."""
+    n = s.get(f"{stage}_retries", 0)
+    if n >= MAX_RETRIES or not any(k in (msg or "") for k in RETRYABLE):
+        return False
+    s[f"{stage}_retries"] = n + 1
+    s[f"{stage}_retry_after"] = time.time() + delay
+    s[f"{stage}_failed_calls"] = s.get(f"{stage}_failed_calls", []) + [{"call": s.get(f"{stage}_call"), "error": msg, "ts": time.time()}]
+    for k in (f"{stage}_call", f"{stage}_failed", f"{stage}_spawn_ts"):
+        s.pop(k, None)
+    events.append(f"{stage.upper()} {arm}: retry {n + 1}/{MAX_RETRIES} scheduled in {delay}s (stale-mount signature)")
+    return True
+
+
+def retry_ok(s, stage):
+    return time.time() >= s.get(f"{stage}_retry_after", 0)
+
+
 # ---------------------------------------------------------------------------------------------
 # one driver tick
 # ---------------------------------------------------------------------------------------------
@@ -168,17 +193,19 @@ def tick(st, ctl):
             else:
                 cs = call_state(s["sft_call"])
                 if isinstance(cs, tuple) and not s.get("sft_failed"):
-                    s["sft_failed"] = cs[1]; events.append(f"SFT {a} FAILED: {cs[1]} (modal_sft supervisor may resume it)")
-                running_sft += 1
+                    s["sft_failed"] = cs[1]; events.append(f"SFT {a} FAILED: {cs[1]}")
+                    retry(s, "sft", cs[1], events, a, delay=int(ctl.get("retry_delay_s", 180)))
+                if s.get("sft_call") and not s.get("sft_failed"):
+                    running_sft += 1
     for a, s in arms.items():
-        if s.get("bank_ready") and not s.get("sft_call") and running_sft < int(ctl.get("max_sft_concurrent", 2)):
+        if s.get("bank_ready") and not s.get("sft_call") and running_sft < int(ctl.get("max_sft_concurrent", 2)) and retry_ok(s, "sft"):
             s["sft_call"] = spawn(SFT_APP, "train", run_name=f"uplift_sft_{a}", data_dir=f"/data/banks/uplift_{a}", n_ckpts=1, epochs=1,
                                   batch_size=32, lr=1e-4, max_seq=160, backend="nccl", extra_args=SFT_EXTRA)
             s["sft_spawn_ts"] = time.time(); running_sft += 1
 
     # 3. SFT eval (once, `final` as ckpt_step 0)
     for a, s in arms.items():
-        if s.get("sft_done") and not s.get("sft_eval_call"):
+        if s.get("sft_done") and not s.get("sft_eval_call") and retry_ok(s, "sft_eval"):
             s["sft_eval_call"] = spawn(EVAL_APP, "daemon", ckpt_dir=f"/data/sft_mix/uplift_sft_{a}", tag=f"uplift_sft_{a}", rl_run_id="",
                                        wandb_name=f"uplift_sft_{a}_eval", final_step=0, once=True, only_step=0, extra_args=eval_extra_args())
         if s.get("sft_eval_call") and not s.get("sft_eval_done"):
@@ -186,12 +213,17 @@ def tick(st, ctl):
                 s["sft_eval_done"] = True; events.append(f"SFT-EVAL {a} DONE")
             else:
                 cs = call_state(s["sft_eval_call"])
-                if isinstance(cs, tuple) and not s.get("sft_eval_failed"):
+                if cs == "done" and not s.get("sft_eval_failed"):     # --once exited without scoring: stale mount saw no `final`
+                    s["sft_eval_failed"] = "nothing pending (call returned without ckpt_0.json)"
+                    events.append(f"SFT-EVAL {a} returned without a result (stale mount?)")
+                    retry(s, "sft_eval", s["sft_eval_failed"], events, a, delay=int(ctl.get("retry_delay_s", 180)))
+                elif isinstance(cs, tuple) and not s.get("sft_eval_failed"):
                     s["sft_eval_failed"] = cs[1]; events.append(f"SFT-EVAL {a} FAILED: {cs[1]}")
+                    retry(s, "sft_eval", cs[1], events, a, delay=int(ctl.get("retry_delay_s", 180)))
 
     # 4. RL (each arm as soon as its own SFT final exists, unless held)
     for a, s in arms.items():
-        if s.get("sft_done") and not s.get("rl_call") and not ctl.get("rl_hold", False):
+        if s.get("sft_done") and not s.get("rl_call") and not ctl.get("rl_hold", False) and retry_ok(s, "rl"):
             lr = str(ctl.get("rl_lr", "1e-5"))
             s["rl_lr"] = lr
             s["rl_call"] = spawn(RL_APP, "train", n_rollout=1, n_trainer=3, total_steps=RL_STEPS, extra_args=rl_extra_args(a, lr),
@@ -206,6 +238,7 @@ def tick(st, ctl):
                     s["rl_done"] = True; s["rl_done_ts"] = time.time(); events.append(f"RL {a} call returned (final not seen yet?)")
                 elif isinstance(cs, tuple) and not s.get("rl_failed"):
                     s["rl_failed"] = cs[1]; events.append(f"RL {a} FAILED: {cs[1]}")
+                    retry(s, "rl", cs[1], events, a, delay=int(ctl.get("retry_delay_s", 180)))
             if not s.get("rl_wandb_id"):
                 wid = None
                 try:
@@ -221,7 +254,7 @@ def tick(st, ctl):
     # 5. RL eval daemon: start at the first checkpoint, stop after ckpt 100 is scored
     for a, s in arms.items():
         first = RL_SAVES.split(",")[0]
-        if s.get("rl_call") and not s.get("rl_eval_call") and (s.get(f"rl_step_{first}_ts") or s.get("rl_done")):
+        if s.get("rl_call") and not s.get("rl_eval_call") and (s.get(f"rl_step_{first}_ts") or s.get("rl_done")) and retry_ok(s, "rl_eval"):
             s["rl_eval_call"] = spawn(EVAL_APP, "daemon", ckpt_dir=f"/data/ckpts_uplift_{a}", tag=f"uplift_rl_{a}", rl_run_id=s.get("rl_wandb_id", ""),
                                       wandb_name=f"uplift_rl_{a}_eval", final_step=RL_STEPS, extra_args=eval_extra_args())
         if s.get("rl_eval_call") and not s.get("rl_eval_done"):
@@ -233,9 +266,15 @@ def tick(st, ctl):
                 if all_k or time.time() - s.get("rl_done_ts", time.time()) > 2 * 3600:
                     if cancel(s["rl_eval_call"]):
                         s["rl_eval_done"] = True; events.append(f"RL-EVAL {a} complete ({'all ckpts' if all_k else 'ckpt 100; gave up on the rest'}) -> daemon cancelled")
-            cs = call_state(s["rl_eval_call"])
-            if isinstance(cs, tuple) and not s.get("rl_eval_failed") and not s.get("rl_eval_done"):
-                s["rl_eval_failed"] = cs[1]; events.append(f"RL-EVAL {a} daemon FAILED: {cs[1]}")
+            if not s.get("rl_eval_done"):
+                cs = call_state(s["rl_eval_call"])
+                if cs == "done" and not s.get("rl_eval_failed"):       # the daemon never exits by itself -> it died / was killed
+                    s["rl_eval_failed"] = "daemon call returned early (missing /data/ ckpts?)"
+                    events.append(f"RL-EVAL {a} daemon returned early")
+                    retry(s, "rl_eval", s["rl_eval_failed"], events, a, delay=int(ctl.get("retry_delay_s", 180)))
+                elif isinstance(cs, tuple) and not s.get("rl_eval_failed"):
+                    s["rl_eval_failed"] = cs[1]; events.append(f"RL-EVAL {a} daemon FAILED: {cs[1]}")
+                    retry(s, "rl_eval", cs[1], events, a, delay=int(ctl.get("retry_delay_s", 180)))
 
     # init eval (spawned by hand before the driver; tracked here for the report)
     if st.get("init_eval_call") and not st.get("init_eval_done") and vexists("eval_ckpt/uplift_init_realact23m/ckpt_0.json"):
