@@ -271,6 +271,10 @@ def main():
                     help="0 = the whole bank; N = train on a seeded random subset of N records (equal per-rank shards). "
                          "Fixed data budget for lr / scaling sweeps; the OneCycle schedule spans the subset.")
     ap.add_argument("--max-examples-seed", type=int, default=0, help="seed of the --max-examples subset")
+    ap.add_argument("--full-ft", action="store_true",
+                    help="FULL fine-tuning (no LoRA): every weight trainable, FSDP2-sharded across the ranks with fp32 sharded "
+                         "masters + AdamW states and bf16 compute (sft/fullft.py). --init-adapter then names a FULL model dir "
+                         "(the base by default); checkpoints are full HF models in the base repo layout (bf16, ~54 GB each).")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--n-ckpts", type=int, default=0,
                     help=">0: save this many evenly-spaced checkpoints (every 100/N %% of training); else every 2000 steps")
@@ -315,16 +319,38 @@ def main():
     if is_main:
         print(f"{len(records)*world} records, {n_vecs} vectors ({vec_file}), world={world}", flush=True)
 
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16,
-                                                 attn_implementation="sdpa",  # flash-attn has no sm_103 build
-                                                 device_map={"": device})
-    model.enable_input_require_grads()
-    if a.init_adapter:
-        model = PeftModel.from_pretrained(model, a.init_adapter, is_trainable=True)
+    FT = None
+    if a.full_ft:
+        try:
+            from sft import fullft as FT
+        except ImportError:  # mounted next to this file (modal_sft.py puts both under /pmx/SL/)
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import fullft as FT
+        assert world > 1, "--full-ft needs >= 2 ranks (fp32 masters + AdamW of a 27B do not fit one GPU)"
+        assert not a.pack_len and not a.head_on_labels and not a.compile and not a.fp8_base, \
+            "--full-ft supports the per-example path (optionally --prefix-cache) without --compile/--head-on-labels/--fp8-base"
+        if a.autocast_bf16 and is_main:
+            print("[fullft] --autocast-bf16 ignored: FSDP2 MixedPrecisionPolicy(param_dtype=bf16) already runs the compute in bf16", flush=True)
+        a.autocast_bf16 = False
+        src = a.init_adapter or MODEL   # a full model dir (our own checkpoints load like the base repo) or the base
+        model = AutoModelForCausalLM.from_pretrained(src, dtype=torch.bfloat16, attn_implementation="sdpa",
+                                                     device_map={"": device})
+        model = FT.shard_full_model(model, world, device, log=print if is_main else (lambda *x, **k: None))
+        nontext_shard = "/tmp/base_nontext.safetensors"
+        if is_main:
+            FT.prepare_nontext_shard(MODEL, nontext_shard)
     else:
-        model = get_peft_model(model, LoraConfig(
-            r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=0.0, use_rslora=True,
-            target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
+        model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16,
+                                                     attn_implementation="sdpa",  # flash-attn has no sm_103 build
+                                                     device_map={"": device})
+        model.enable_input_require_grads()
+        if a.init_adapter:
+            model = PeftModel.from_pretrained(model, a.init_adapter, is_trainable=True)
+        else:
+            model = get_peft_model(model, LoraConfig(
+                r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=0.0, use_rslora=True,
+                target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
     if a.fp8_base:  # after PEFT (only frozen base_layers convert), before grad-ckpt / compile / DDP
         from fp8 import convert_frozen_base_to_fp8
         convert_frozen_base_to_fp8(model, verbose=is_main)
@@ -369,7 +395,10 @@ def main():
         # --prefix-cache: cache inputs vary per step, so the graph must be dynamic (measured: recompile-prone, not recommended)
         target.forward = torch.compile(target.forward, mode=a.compile_mode, dynamic=True if a.prefix_cache else None)
     train_mod = label_head if a.head_on_labels else model   # what DDP wraps / the loop calls
-    ddp = DDP(train_mod, device_ids=[local]) if world > 1 else train_mod
+    if a.full_ft:
+        ddp = model                                          # FSDP2 IS the parallelism (fully_shard in place; no wrapper)
+    else:
+        ddp = DDP(train_mod, device_ids=[local]) if world > 1 else train_mod
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
     prefix_cache = None
     if a.prefix_cache:
@@ -385,7 +414,9 @@ def main():
         prompt_ids, mpos = build_prompt_ids(tok)
         # suffix forward through `ddp` (primes DDP's reducer once per step), prefix forward through the bare model
         prefix_cache = PrefixCache(ddp, prompt_ids, mpos[0], tok.pad_token_id, submodule, STEER_COEFF, device,
-                                   prefix_model=model, persistent_injector=persistent_injector)
+                                   prefix_model=model, persistent_injector=persistent_injector,
+                                   # FSDP2 registers backward hooks on the layer output: inject on a clone, never in place
+                                   inject_mode="add_clone" if a.full_ft else "add")
         assert a.prefix_accum >= 1 and a.batch_size % a.prefix_accum == 0, "--prefix-accum must divide --batch-size"
         if is_main:
             print(f"[pretrain] prefix-cache ON: shared prefix {prefix_cache.prefix_len} tokens, suffix = "
@@ -432,6 +463,14 @@ def main():
     save_examples = sorted({int(x) for x in a.save_examples.split(",") if x.strip()})
     saved_examples = set()
 
+    def save_ckpt(path, at_step):
+        """LoRA: rank 0 writes the adapter. --full-ft: COLLECTIVE full-model save (every rank all-gathers), rank 0 writes."""
+        if a.full_ft:
+            FT.save_full_ckpt(model, path, tok, MODEL, is_main, world, nontext_shard=nontext_shard, log=print,
+                              extra_meta={"step": at_step, "run_name": a.run_name, "lr": a.lr, "full_ft": True})
+        elif is_main:
+            model.save_pretrained(path)
+
     step = 0
     parity_done = not a.parity_check
     t_train0 = time.time()
@@ -454,6 +493,9 @@ def main():
             t0 = time.time()
             n_real_step = n_ex_step = 0
             loss_step = torch.zeros((), device=device)
+            probe_ctx = (FT.injection_probe(model, INJECT_LAYER, log=print) if (a.full_ft and step == a.skip_steps and is_main)
+                         else contextlib.nullcontext())
+            probe_ctx.__enter__()
             for mi, batch in enumerate(group):
                 last_in_group = mi == len(group) - 1
                 if prefix_cache is not None:
@@ -526,7 +568,8 @@ def main():
                     else:
                         vlist = [gather_rows(vecs, t[3]).unsqueeze(0) for t in batch]
                         hook_ctx = hooked(submodule, make_inject_hook(
-                            vlist, [pos] * len(batch), STEER_COEFF, device, torch.bfloat16))
+                            vlist, [pos] * len(batch), STEER_COEFF, device, torch.bfloat16,
+                            mode="add_clone" if a.full_ft else "add"))
                     # use_cache=False explicitly: HF's default (None -> config True) builds a DynamicCache every
                     # training forward and routes the GDN conv through the cache pad+slice path.
                     kw = dict(input_ids=input_ids.to(device), attention_mask=attn.to(device),
@@ -542,7 +585,11 @@ def main():
                     loss = out if a.head_on_labels else out.loss
                     (loss / len(group)).backward()
                 loss_step += loss.detach() / len(group)
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+            probe_ctx.__exit__(None, None, None)
+            if a.full_ft:
+                FT.clip_grad_norm([p for p in model.parameters() if p.requires_grad], 1.0)
+            else:
+                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step(); sched.step(); opt.zero_grad()
             if log_now:
                 torch.cuda.synchronize()
@@ -559,14 +606,14 @@ def main():
                     wandb.log({"loss": loss_step.item(), "lr": sched.get_last_lr()[0], "mfu": m, "tflops": tfl,
                                "ex_per_s": n_ex_step / dt, "tok_per_s": n_real_step / dt,
                                "peak_mem_gb": peak_gb}, step=step)
-            if is_main and step % save_every == 0 and step:
-                model.save_pretrained(f"{a.save_dir}/step_{step}")
+            if step % save_every == 0 and step:
+                save_ckpt(f"{a.save_dir}/step_{step}", step)
             global_seen = min((step + 1) * a.batch_size * a.grad_accum * world, len(records) * world)
             for requested in save_examples:
                 if requested <= global_seen and requested not in saved_examples:
                     path = f"{a.save_dir}/examples_{requested}"
+                    save_ckpt(path, step + 1)
                     if is_main:
-                        model.save_pretrained(path)
                         json.dump({"requested_examples": requested, "actual_examples": global_seen,
                                    "step": step + 1, "world_size": world,
                                    "batch_size_per_rank": a.batch_size, "grad_accum": a.grad_accum},
@@ -575,8 +622,8 @@ def main():
                               f"step={step + 1}", flush=True)
                     saved_examples.add(requested)
             step += 1
+    save_ckpt(f"{a.save_dir}/final", step)
     if is_main:
-        model.save_pretrained(f"{a.save_dir}/final")
         print(f"[pretrain] {step} optimizer steps in {time.time() - t_train0:.0f} s | peak GPU memory: "
               f"allocated {torch.cuda.max_memory_allocated() / 2**30:.1f} GB, "
               f"reserved {torch.cuda.max_memory_reserved() / 2**30:.1f} GB", flush=True)

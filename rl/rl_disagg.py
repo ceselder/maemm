@@ -689,9 +689,14 @@ def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
         EngineArgs.create_engine_config = _cfg
         from mxf.config import MODEL
         max_len = p_len + a.max_new_tokens + 8
-        kw = dict(model=MODEL, tensor_parallel_size=1, gpu_memory_utilization=a.vllm_gpu_mem, max_model_len=max_len,
+        # engine_model / engine_lora (eval_ckpt_daemon --full-model): serve a FULL fine-tuned checkpoint dir instead of
+        # base+LoRA. Defaults = the base with 2 LoRA slots (live policy + eval ckpt), byte-identical to before.
+        engine_model = getattr(a, "engine_model", None) or MODEL
+        engine_lora = bool(getattr(a, "engine_lora", True))
+        kw = dict(model=engine_model, tensor_parallel_size=1, gpu_memory_utilization=a.vllm_gpu_mem, max_model_len=max_len,
                   attention_backend="TRITON_ATTN", language_model_only=True, enable_prefix_caching=False,
-                  enable_lora=True, max_loras=2, max_lora_rank=64, max_num_seqs=int(max_seqs),   # 2 slots: live policy + eval ckpt
+                  enable_lora=engine_lora, max_num_seqs=int(max_seqs),
+                  **({"max_loras": 2, "max_lora_rank": 64} if engine_lora else {}),
                   # never chunk a prompt (the marker must be prefilled in a hooked, eager pass): budget = every seq's full prompt+gen
                   # unless overridden (the eval daemon uses a smaller budget so the profiling run leaves KV memory for concurrency)
                   max_num_batched_tokens=int(getattr(a, "max_num_batched_tokens", 0) or 0) or max(8192, int(max_seqs) * max_len),
@@ -709,7 +714,8 @@ def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
         llm = LLM(**kw)
         llm.collective_rpc("install_hooks")
         _log(tag, f"engine up in {time.time() - t0:.0f}s | graphs={use_graphs} max_num_seqs={max_seqs} "
-                  f"mem={a.vllm_gpu_mem} ext={'stock' if a.stock_lens_hook else 'fast'} gdn_prefill={gdn}")
+                  f"mem={a.vllm_gpu_mem} ext={'stock' if a.stock_lens_hook else 'fast'} gdn_prefill={gdn} "
+                  f"model={engine_model} lora={engine_lora}")
         return llm
     finally:
         os.environ.update(hidden)
