@@ -14,12 +14,14 @@ OUT = os.path.expanduser("~/shared/reports/maemm-rl-ab")
 os.makedirs(f"{OUT}/data", exist_ok=True)
 PROJ = "octahedral-systems/maxact-fast"
 RUNS = {
-    "500k SFT init → RL 16x128 (2048 rollouts/step)": {"eval": "rl_everything_16x128_disagg_scalerl_lr7e-6_4gpu_eval", "rps": 2048, "color": "#7a7a7a", "ls": "-"},
-    "500k SFT init → RL 8x256 (2048 rollouts/step)": {"eval": "rl_everything_8x256_disagg_scalerl_lr7e-6_eval", "rps": 2048, "color": "#4a6fa5", "ls": "--"},
-    "23M-act pretrain + mix midtrain → RL-C 16x256 (4096 rollouts/step)": {"eval": "rl_C_mix1m_from_realact23m_mixsft_eval", "rps": 4096, "color": "#b5542b", "ls": "-"},
+    "SFT on realact only (23M) → RL-A [bank: real activations only, 4096 rollouts/step]": {"eval": "rl_A_randctx_from_realact23m_eval", "rps": 4096, "color": "#c99a2e", "ls": "-"},
+    "SFT on datamix (500k) → RL 16x128 [all-families bank, 2048/step]": {"eval": "rl_everything_16x128_disagg_scalerl_lr7e-6_4gpu_eval", "rps": 2048, "color": "#7a7a7a", "ls": "-"},
+    "SFT on datamix (500k) → RL 8x256 [all-families bank, 2048/step]": {"eval": "rl_everything_8x256_disagg_scalerl_lr7e-6_eval", "rps": 2048, "color": "#4a6fa5", "ls": "--"},
+    "SFT on realact (23M) + datamix midtrain (1.1M) → RL-C [all-families bank, 4096/step]": {"eval": "rl_C_mix1m_from_realact23m_mixsft_eval", "rps": 4096, "color": "#b5542b", "ls": "-"},
 }
-INIT = {"500k SFT init": {"eval/mean_all": 0.359, "eval/sae/norm_act": 0.61, "color": "#4a6fa5"},
-        "23M pretrain + midtrain init": {"eval/mean_all": 0.340, "eval/sae/norm_act": 0.450, "eval/realact/cos": 0.444, "color": "#b5542b"}}
+INIT = {"SFT datamix 500k (before RL)": {"eval/mean_all": 0.359, "eval/sae/norm_act": 0.61, "color": "#4a6fa5"},
+        "SFT realact 23M (before RL)": {"eval/mean_all": 0.369, "eval/sae/norm_act": 0.418, "eval/realact/cos": 0.477, "color": "#c99a2e"},
+        "SFT realact 23M + datamix 1.1M (before RL)": {"eval/mean_all": 0.340, "eval/sae/norm_act": 0.450, "eval/realact/cos": 0.444, "color": "#b5542b"}}
 SKIP = {"extra/locality/n_features", "extra/locality/n_texts", "extra/adversarial/n_pending_scored"}
 LABELS = {"eval/mean_all": "mean over held-out families", "eval/realact/cos": "real activations (cos)", "eval/realact_early/cos": "real acts, early positions (cos)",
           "eval/realact_mid/cos": "real acts, mid positions (cos)", "eval/realact_long/cos": "real acts, long context (cos)",
@@ -51,7 +53,7 @@ raw = {}
 for label, cfg in RUNS.items():
     rs = list(api.runs(PROJ, filters={"display_name": cfg["eval"]}, order="-created_at"))
     raw[label] = sorted([r for r in rs[0].history(pandas=False) if "ckpt_step" in r and r.get("eval/mean_all") is not None], key=lambda r: r["ckpt_step"]) if rs else []
-METRICS = _metric_list(raw["23M-act pretrain + mix midtrain → RL-C 16x256 (4096 rollouts/step)"])
+METRICS = _metric_list(raw["SFT on realact (23M) + datamix midtrain (1.1M) → RL-C [all-families bank, 4096/step]"])
 for label, cfg in RUNS.items():
     rows = [{"ckpt_step": int(r["ckpt_step"]), "rollouts": int(r["ckpt_step"]) * cfg["rps"], **{m: r.get(m) for m, _ in METRICS}} for r in raw[label]]
     data["runs"][label] = {"eval_run": cfg["eval"], "rollouts_per_step": cfg["rps"], "evals": rows}
@@ -70,7 +72,7 @@ for ax, (m, title) in zip(axes.flat, METRICS):
             ax.plot([r["rollouts"] / 1e6 for r in rows], [r[m] for r in rows], "o", ls=cfg["ls"], color=cfg["color"], ms=3.5, lw=1.5, label=label)
     for name, vals in INIT.items():
         if m in vals:
-            ax.axhline(vals[m], color=vals["color"], ls=":", lw=1.1, label=f"{name} (before RL)")
+            ax.axhline(vals[m], color=vals["color"], ls=":", lw=1.1, label=name)
     ax.set_xscale("log"); ax.set_title(title, fontsize=8.5); ax.grid(alpha=0.25); ax.tick_params(labelsize=8)
     ax.set_xticks([0.05, 0.1, 0.2, 0.4, 0.8]); ax.set_xticklabels(["0.05", "0.1", "0.2", "0.4", "0.8"]); ax.minorticks_off()
 for ax in axes[-1]:
@@ -79,10 +81,10 @@ seen = {}
 for ax in axes.flat:
     for h, l in zip(*ax.get_legend_handles_labels()):
         seen.setdefault(l, h)
-fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.005))
-fig.suptitle("Same all-families RL recipe, different starting points: the 23M-activation pretrain (+ mix midtrain) starts lower but overtakes the 500k-SFT start "
-             "on the mean, SAE features, real activations and J-lens by ~0.4M rollouts; still behind on BSF and cluster probes (all logged eval metrics)", fontsize=11, y=0.995)
-fig.tight_layout(rect=(0, 0.04, 1, 0.975))
+fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=2, frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.01))
+fig.suptitle("RL from three SFT inits (same ScaleRL recipe, lr 7e-6): the 23M realact pretrain + datamix midtrain overtakes the 500k-datamix start on the mean, SAE and real "
+             "activations by ~0.4M rollouts; the realact-only pretrain wins real activations but never learns SAE/probes (banks differ, see legend) — all logged eval metrics", fontsize=11, y=0.995)
+fig.tight_layout(rect=(0, 0.06, 1, 0.975))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/rl_pretrain_effect.{ext}", dpi=160)
 plt.close(fig)
