@@ -295,7 +295,7 @@ def build(arms: str = "all", n_half: int = 100_000, seed: int = 2027, overwrite:
                 sources[bank]["n_rows_taken"] = int(sum(1 for b, _ in P["src"] if b == bank))
         stats = {"kind": f"cross-uplift arm {a}: " + ("200k real activations (control)" if spec is None else
                          f"100k real activations (subset A) + 100k {_x_desc(spec)} rows"),
-                 "arm": a, "x_family": None if spec is None else sorted({f for _, fams, _, _ in x_sel[a] for f in fams}),
+                 "arm": a, "x_family": None if spec is None else sorted({f for _, _, _, fams in x_sel[a] for f in fams}),   # (bank, sel, avail, fams)
                  "n_examples": N, "n_vecs": N, "families": counts,
                  "layout": "seeded shuffle of all rows (records.jsonl line i == vec_idx i; src_bank/src_vec_idx = provenance)",
                  "seed": seed, "arm_shuffle_seed": seed * 100 + ARM_ORDER.index(a), "n_half": n_half,
