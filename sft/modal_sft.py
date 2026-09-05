@@ -31,7 +31,7 @@ import modal
 
 REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
 
-APP_NAME = "maemm-sft-8xb200"
+APP_NAME = os.environ.get("SFT_APP_NAME", "maemm-sft-8xb200")   # SFT_APP_NAME=maemm-sft-fullft = a second, independent deployment
 app = modal.App(APP_NAME)
 
 # torch 2.10.0+cu128 == the box venv; cu128 wheels carry sm_100 (B200) kernels. Identical pins to
@@ -76,6 +76,7 @@ image = (
     image
     .add_local_file(REPO / "sft" / "pretrain.py", "/pmx/SL/pretrain.py")
     .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/SL/prefix_cache.py")   # --prefix-cache sibling import
+    .add_local_file(REPO / "sft" / "fullft.py", "/pmx/SL/fullft.py")               # --full-ft (FSDP2) sibling import
     .add_local_file(REPO / "sft" / "fp8.py", "/pmx/SL/fp8.py")            # --fp8-base (imported by pretrain.py)
     .add_local_file(REPO / "sft" / "fp8_eval.py", "/pmx/SL/fp8_eval.py")  # fp8 speed/fidelity harness (fp8_eval fn)
     .add_local_file(REPO / "sft" / "fp8_microbench.py", "/pmx/SL/fp8_microbench.py")  # fp8 GEMM/layer/profile bench
@@ -304,8 +305,10 @@ def train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
         modal.Secret.from_name("maemm-wandb"),
     ],
     timeout=7200,
+    memory=int(os.environ.get("SFT_SMOKE_MEM_GB", "64")) * 1024,
 )
-def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: str = ""):
+def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: str = "", nproc: int = 1,
+          save_dir: str = "/tmp/smoke_ckpt", reload_check: bool = False):
     """1xB200 pipeline validation: pre-warms /data/hf_cache, carves a tiny bank (first n_records
     of records.jsonl + the full vecs.f32 / vecs.f16) and runs world=1 SFT over it (no wandb, ckpts
     to /tmp, including the --n-ckpts intermediate-save path). extra_args reach pretrain.py verbatim,
@@ -329,10 +332,11 @@ def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: 
         shutil.copy(f"{local_bank}/{vec_file}", f"{tiny}/{vec_file}")
     print(f"[modal-smoke] tiny bank: first {n_records} records", flush=True)
 
-    cmd = [
-        "python", "SL/pretrain.py",
+    launcher = ["torchrun", "--standalone", f"--nproc_per_node={nproc}"] if nproc > 1 else ["python"]
+    cmd = launcher + [
+        "SL/pretrain.py",
         "--data-dir", tiny,
-        "--save-dir", "/tmp/smoke_ckpt",
+        "--save-dir", save_dir,
         "--run-name", "smoke",
         "--n-ckpts", "2",
         "--epochs", "1",
@@ -344,9 +348,39 @@ def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: 
     rc = _stream(cmd, _train_env("nccl"), "modal-smoke")
     if rc != 0:
         raise RuntimeError(f"smoke exited rc={rc}")
-    saved = sorted(os.listdir("/tmp/smoke_ckpt"))
+    saved = sorted(os.listdir(save_dir))
     assert "final" in saved and any(s.startswith("step_") for s in saved), f"ckpt cadence broken: {saved}"
     print(f"[modal-smoke] OK — saved {saved}", flush=True)
+    if save_dir.startswith("/data"):
+        vol.commit()
+    if reload_check:   # --full-ft: the checkpoint must load as a plain HF model and give a sane loss on the tiny bank
+        chk = ["python", "-c", f"""
+import json, os, sys, time, torch
+sys.path.insert(0, '/pmx/helpers'); os.environ['HF_HUB_OFFLINE'] = '1'
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from mxf.config import MODEL
+from mxf.prompts import build_sft_ids
+ck = '{save_dir}/final'
+assert os.path.exists(ck + '/SAVE_DONE'), 'SAVE_DONE missing'
+print('[reload] SAVE_DONE', json.load(open(ck + '/SAVE_DONE')), flush=True)
+t0 = time.time()
+tok = AutoTokenizer.from_pretrained(MODEL)
+m = AutoModelForCausalLM.from_pretrained(ck, dtype=torch.bfloat16, attn_implementation='sdpa', device_map={{'': 'cuda:0'}})
+print(f'[reload] loaded {{type(m).__name__}} from {{ck}} in {{time.time() - t0:.0f}}s', flush=True)
+recs = [json.loads(l) for _, l in zip(range(8), open('{tiny}/records.jsonl'))]
+losses = []
+for r in recs:
+    ids, labs, pos = build_sft_ids(tok, r['target_text'])
+    with torch.no_grad():
+        out = m(input_ids=torch.tensor([ids], device='cuda:0'), labels=torch.tensor([labs], device='cuda:0'))
+    losses.append(out.loss.item())
+print(f'[reload] CE on 8 tiny-bank examples (no injection): {{sum(losses) / len(losses):.3f}} (each {{[round(x, 2) for x in losses]}})', flush=True)
+assert all(torch.isfinite(torch.tensor(losses))), 'non-finite loss after reload'
+print('RELOAD_OK', flush=True)
+"""]
+        rc = _stream(chk, _train_env("nccl"), "modal-smoke-reload")
+        if rc != 0:
+            raise RuntimeError(f"reload check exited rc={rc}")
 
 
 @app.function(
@@ -456,7 +490,8 @@ def prewarm():
 # --skip-steps N+1 (step_N is saved after batch N of the deterministic order) + the same wandb id.
 # No step ckpts yet -> clean fresh respawn. Unlike the RL supervisor this is fully generic across
 # N parallel runs: per-run heartbeat/state files, nothing hardcoded. ----
-@app.function(schedule=modal.Period(minutes=20), volumes={"/data": vol}, timeout=600)
+@app.function(schedule=modal.Period(minutes=20) if os.environ.get("SFT_SUPERVISOR", "1") == "1" else None,
+              volumes={"/data": vol}, timeout=600)   # SFT_SUPERVISOR=0 at deploy: a second deployment must not double-resume runs
 def supervisor():
     import glob
     import json
@@ -529,8 +564,10 @@ def run_train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
 
 
 @app.local_entrypoint()
-def run_smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: str = ""):
-    smoke.remote(data_dir=data_dir, n_records=n_records, batch_size=batch_size, extra_args=extra_args)
+def run_smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: str = "", nproc: int = 1,
+              save_dir: str = "/tmp/smoke_ckpt", reload_check: bool = False):
+    smoke.remote(data_dir=data_dir, n_records=n_records, batch_size=batch_size, extra_args=extra_args, nproc=nproc,
+                 save_dir=save_dir, reload_check=reload_check)
 
 
 @app.local_entrypoint()

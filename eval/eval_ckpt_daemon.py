@@ -50,6 +50,11 @@ def parse_args(argv=None):
     ap.add_argument("--first-adapter", default="/data/sft_mix/last5_rp/final",
                     help="an adapter of the run's LoRA geometry to build the PEFT actor with before the engine (the SFT init)")
     ap.add_argument("--no-extra-evals", action="store_true")
+    ap.add_argument("--full-model", action="store_true",
+                    help="checkpoints are FULL HF models (dirs carrying SAVE_DONE, sft/fullft.py layout): the vLLM engine loads the "
+                         "checkpoint ITSELF (no LoRA) while scoring stays on the clean base; the adapter-on marker norm becomes the "
+                         "served model's own marker norm captured from the engine. One engine per process: requires --once --only-step k "
+                         "(eval/modal_eval_ckpt.py fullmodel_daemon loops over checkpoints).")
     # held-out eval protocol (rl.py inline_eval flags; FULL 512/family by default)
     ap.add_argument("--eval-cache", default=os.environ.get("MAEMM_EVAL_CACHE", "/data/eval_universal_ho/eval_sets_heldout.pt"),
                     help="frozen eval-set cache (env MAEMM_EVAL_CACHE). eval_sets_heldout_v2.pt = the same 11 cos families + sae PLUS the "
@@ -78,7 +83,63 @@ def parse_args(argv=None):
     a.save_dir = a.out_dir            # inline_extra_evals writes its artifacts under <save_dir>/extra_evals
     a.inline_eval_every = 1           # load_eval_assets prints it; every ckpt here is evaluated
     a.cuda_graphs = not a.no_cuda_graphs
+    if a.full_model:
+        assert a.once and a.only_step is not None, "--full-model needs --once --only-step k (one engine per checkpoint)"
     return a
+
+
+class _BaseActor:
+    """The plain HF base with the PEFT-actor surface the eval code touches: disable_adapter() (a no-op: it IS the clean
+    base), get_base_model(), forward/generate, generation_config, eval(). Used by --full-model, where generation runs
+    inside vLLM on the fine-tuned checkpoint and every HF-side score is the clean base by construction."""
+
+    def __init__(self, base):
+        self.base = base
+
+    def __call__(self, *args, **kw):
+        return self.base(*args, **kw)
+
+    def forward(self, *args, **kw):
+        return self.base(*args, **kw)
+
+    def generate(self, *args, **kw):
+        return self.base.generate(*args, **kw)
+
+    def get_base_model(self):
+        return self.base
+
+    def disable_adapter(self):
+        import contextlib
+        return contextlib.nullcontext()
+
+    def eval(self):
+        self.base.eval(); return self
+
+    def train(self, mode=True):
+        self.base.train(mode); return self
+
+    @property
+    def training(self):
+        return self.base.training
+
+    @property
+    def generation_config(self):
+        return self.base.generation_config
+
+    @property
+    def config(self):
+        return self.base.config
+
+
+def _vllm_marker_norm(llm, prompt_ids, marker, inject_layer):
+    """||h|| at the marker of the served model's INJECT_LAYER residual (vllm_lens capture, clean prompt, greedy 1 token)."""
+    from vllm import SamplingParams
+    out = llm.generate([{"prompt_token_ids": list(prompt_ids)}],
+                       [SamplingParams(temperature=0.0, max_tokens=1, extra_args={"output_residual_stream": [inject_layer]})],
+                       use_tqdm=False)[0]
+    act = getattr(out, "activations", None)
+    assert act is not None and "residual_stream" in act, "vllm_lens capture returned nothing -- plugin not active?"
+    return act["residual_stream"][0].float()[marker].norm().item()
 
 
 def _save_adapter_for_vllm(actor, adapter_name, lora_dir):
@@ -98,17 +159,23 @@ def _save_adapter_for_vllm(actor, adapter_name, lora_dir):
     return len(out)
 
 
-def _scan(ckpt_dir, final_step, min_mtime):
+def _scan(ckpt_dir, final_step, min_mtime, full_model=False):
+    """{ckpt_step: dir} of complete checkpoints. LoRA: adapter files present. Full model: SAVE_DONE present (written last)."""
     avail = {}
     for p in glob.glob(f"{ckpt_dir}/step_*"):
         try:
             s = int(p.rsplit("_", 1)[-1])
         except ValueError:
             continue
-        w = f"{p}/adapter_model.safetensors"
-        if os.path.exists(w) and os.path.exists(f"{p}/adapter_config.json") and os.path.getmtime(w) >= min_mtime:
+        if full_model:
+            w = f"{p}/SAVE_DONE"
+            ok = os.path.exists(w)
+        else:
+            w = f"{p}/adapter_model.safetensors"
+            ok = os.path.exists(w) and os.path.exists(f"{p}/adapter_config.json")
+        if ok and os.path.getmtime(w) >= min_mtime:
             avail[s] = p
-    fw = f"{ckpt_dir}/final/adapter_model.safetensors"
+    fw = f"{ckpt_dir}/final/{'SAVE_DONE' if full_model else 'adapter_model.safetensors'}"
     if os.path.exists(fw) and os.path.getmtime(fw) >= min_mtime:
         avail[final_step] = f"{ckpt_dir}/final"
     return avail
@@ -157,7 +224,10 @@ def main():
     t0 = time.time()
     # ---- HF actor FIRST (vllm's import clobbers transformers' AutoConfig for this model, see rl.py main) ----
     base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
-    actor = PeftModel.from_pretrained(base, a.first_adapter, adapter_name="init", is_trainable=False)
+    if a.full_model:
+        actor = _BaseActor(base)          # scoring side = the clean base; the checkpoint lives in the engine
+    else:
+        actor = PeftModel.from_pretrained(base, a.first_adapter, adapter_name="init", is_trainable=False)
     actor.eval()
     submodule = get_layer(actor, INJECT_LAYER)
     cur_name = "init"
@@ -173,9 +243,27 @@ def main():
     log(f"eval assets: {len(EV['fams'])} families x {len(EV['es'][EV['fams'][0] + '_dirs'])} dirs x Bo{a.eval_bo} + sae {len(EV['feats'])} "
         f"| extra evals {'ON' if EX is not None else 'OFF'} | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB")
     # ---- engine (rl_disagg: fast steering hook + CUDA graphs), then the one-time numeric injection proof ----
+    if a.full_model:
+        avail0 = _scan(a.ckpt_dir, a.final_step, a.min_ckpt_mtime, full_model=True)
+        assert a.only_step in avail0, f"--full-model: step {a.only_step} has no complete checkpoint (SAVE_DONE) under {a.ckpt_dir}: {sorted(avail0)}"
+        a.engine_model, a.engine_lora = avail0[a.only_step], False
+        log(f"full-model mode: engine serves {a.engine_model} (no LoRA); HF side = clean base for scoring")
     llm = DG._build_engine(a, 0, p_len, a.max_num_seqs, a.cuda_graphs, "eval-ckpt")
-    chk = R.verify_vllm_injection(llm, actor, submodule, prompt_ids, marker, device, seed=a.seed)
-    log(f"injection check: cos {chk['cos']:.4f} | magnitude ratio {chk['norm_ratio']:.3f} | ||h|| vllm/hf {chk['hnorm_agree']:.3f} -> {'OK' if chk['ok'] else 'FAIL'}")
+    if a.full_model:
+        # the 'adapter-on' marker norm of the LoRA protocol == the SERVED model's own marker norm here; take it from the engine
+        prompt_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        hnorm_ft = _vllm_marker_norm(llm, prompt_ids, marker, INJECT_LAYER)
+        hnorm_base = R._marker_norm(actor, submodule, prompt_t, marker, device, adapter=False)
+        chk = DG._verify_injection(llm, prompt_ids, marker, hnorm_ft, "eval-ckpt", seed=a.seed)
+        chk.update({"hnorm_served": hnorm_ft, "hnorm_hf_base": hnorm_base, "hnorm_agree": hnorm_ft / max(hnorm_base, 1e-6), "mode": "full_model"})
+        R._marker_norm = lambda *args, **kw: hnorm_ft            # inline_eval / extra evals ask the actor for it
+        _orig_generate = llm.generate
+        llm.generate = lambda *args, **kw: _orig_generate(*args, **{k: v for k, v in kw.items() if k != "lora_request"})
+        log(f"injection check (full model): cos {chk['cos']:.4f} | magnitude ratio {chk['norm_ratio']:.3f} | marker ||h|| served {hnorm_ft:.1f} "
+            f"vs clean base {hnorm_base:.1f} (x{chk['hnorm_agree']:.3f}) -> {'OK' if chk['ok'] else 'FAIL'}")
+    else:
+        chk = R.verify_vllm_injection(llm, actor, submodule, prompt_ids, marker, device, seed=a.seed)
+        log(f"injection check: cos {chk['cos']:.4f} | magnitude ratio {chk['norm_ratio']:.3f} | ||h|| vllm/hf {chk['hnorm_agree']:.3f} -> {'OK' if chk['ok'] else 'FAIL'}")
     if not chk["ok"]:
         raise RuntimeError(f"vLLM steering does NOT match the HF inject hook: {chk}")
     eos_ids = R._eos_ids(tok, actor)
@@ -225,7 +313,7 @@ def main():
     log(f"previously evaled: {sorted(done) or 'none'} | ckpt_dir {a.ckpt_dir} | state {a.state}")
     while True:
         vol_reload()
-        avail = _scan(a.ckpt_dir, a.final_step, a.min_ckpt_mtime)
+        avail = _scan(a.ckpt_dir, a.final_step, a.min_ckpt_mtime, full_model=a.full_model)
         if a.only_step is not None:
             avail = {k: v for k, v in avail.items() if k == a.only_step}
         todo = sorted(k for k in avail if k not in done)
@@ -243,22 +331,25 @@ def main():
         t1 = time.time()
         name = f"ck{s}"
         log(f"evaluating step {s} ({ck})")   # the launcher pauses volume reloads while an eval is in progress
-        try:
-            actor.load_adapter(ck, adapter_name=name)
-            actor.set_adapter(name)
-        except Exception as e:  # noqa — a mid-save commit raced us: retry next poll
-            log(f"step {s}: adapter load failed ({type(e).__name__}: {e}); will retry")
-            time.sleep(a.poll_s)
-            continue
-        if cur_name != name:
-            try:
-                actor.delete_adapter(cur_name)
-            except Exception as e:  # noqa
-                log(f"could not delete adapter {cur_name}: {e}")
-            cur_name = name
         lora_dir = f"/tmp/rl_lora/rank0/step{s}"        # the path rl.py inline_eval / run_extra_evals_gpu read the LoRA from
-        n_t = _save_adapter_for_vllm(actor, name, lora_dir)
-        t_load = time.time() - t1
+        if a.full_model:
+            n_t, t_load = 0, 0.0                        # the engine already IS this checkpoint
+        else:
+            try:
+                actor.load_adapter(ck, adapter_name=name)
+                actor.set_adapter(name)
+            except Exception as e:  # noqa — a mid-save commit raced us: retry next poll
+                log(f"step {s}: adapter load failed ({type(e).__name__}: {e}); will retry")
+                time.sleep(a.poll_s)
+                continue
+            if cur_name != name:
+                try:
+                    actor.delete_adapter(cur_name)
+                except Exception as e:  # noqa
+                    log(f"could not delete adapter {cur_name}: {e}")
+                cur_name = name
+            n_t = _save_adapter_for_vllm(actor, name, lora_dir)
+            t_load = time.time() - t1
         ev = R.inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, s, s, 0, 1, EV)
         ex = {}
         if EX is not None:
@@ -279,7 +370,8 @@ def main():
         json.dump({"ckpt_step": s, "ckpt": ck, "metrics": row, "n_lora_tensors": n_t, "protocol": {
             "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]), "bo": a.eval_bo, "temp": a.eval_temp,
             "min_new": a.eval_min_new, "max_new": a.eval_max_new, "eval_cache": a.eval_cache,
-            "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
+            "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "full_model": a.full_model,
+            "injection_check": chk}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
         if EX is not None and "extra/locality/fire_frac" in ex:
             try:
                 IX.launch_judge_stage(None, s, EX, a)

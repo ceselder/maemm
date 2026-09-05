@@ -116,6 +116,91 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
         raise RuntimeError(f"eval daemon exited rc={rc}")
 
 
+def _scan_full(ckpt_dir, final_step):
+    import glob
+    avail = {}
+    for p in glob.glob(f"{ckpt_dir}/step_*"):
+        try:
+            s = int(p.rsplit("_", 1)[-1])
+        except ValueError:
+            continue
+        if os.path.exists(f"{p}/SAVE_DONE"):
+            avail[s] = p
+    if os.path.exists(f"{ckpt_dir}/final/SAVE_DONE"):
+        avail[final_step] = f"{ckpt_dir}/final"
+    return avail
+
+
+@app.function(image=image, gpu=GPU, volumes={"/data": vol},
+              secrets=[modal.Secret.from_name("maemm-hf"), modal.Secret.from_name("maemm-wandb"),
+                       modal.Secret.from_name("maemm-anthropic"), modal.Secret.from_name("maemm-openrouter")],
+              timeout=24 * 3600)
+def fullmodel_daemon(ckpt_dir: str, tag: str, wandb_name: str = "", final_step: int = 1000, poll_s: int = 120,
+                     vllm_gpu_mem: float = 0.5, extra_args: str = "", idle_exit_s: int = 6 * 3600, once_all: bool = False):
+    """FULL-model checkpoints (sft/fullft.py layout): one eval_ckpt_daemon.py PROCESS per checkpoint (`--full-model --once
+    --only-step k`, its vLLM engine loads that checkpoint), looping latest-first over every <ckpt_dir>/step_* + final that
+    carries SAVE_DONE, until `final` (logged as final_step) is evaluated (or nothing new for idle_exit_s). State:
+    /data/eval_state/evaled_ckpt_<tag>.json. Same wandb run (<wandb_name>, id == name) across processes."""
+    import json
+    import subprocess
+    import time
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/pmx/helpers:/pmx/eval:/pmx/RL"
+    env["HF_HOME"] = "/data/hf_cache"
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
+    env["TOKENIZERS_PARALLELISM"] = "false"
+    env["WANDB_DIR"] = "/tmp/wandb"
+    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.makedirs("/tmp/wandb", exist_ok=True)
+    state = f"/data/eval_state/evaled_ckpt_{tag}.json"
+    os.makedirs(os.path.dirname(state), exist_ok=True)
+    try:
+        done = set(json.load(open(state))["done"])
+    except Exception:  # noqa
+        done = set()
+    fails = {}
+    last_new = time.time()
+    print(f"[modal-full] tag {tag} ckpt_dir {ckpt_dir} previously evaled {sorted(done)}", flush=True)
+    while True:
+        try:
+            vol.reload()
+        except Exception as e:  # noqa
+            print(f"[modal-full] vol.reload failed: {e}", flush=True)
+        avail = _scan_full(ckpt_dir, final_step)
+        todo = sorted(k for k in avail if k not in done and fails.get(k, 0) < 2)
+        if not todo:
+            if final_step in done or once_all or time.time() - last_new > idle_exit_s:
+                print(f"[modal-full] done: evaled {sorted(done)} (final {'yes' if final_step in done else 'NO'}); exiting", flush=True)
+                break
+            time.sleep(poll_s)
+            continue
+        last_new = time.time()
+        s = todo[-1]
+        cmd = ["python", "/pmx/eval/eval_ckpt_daemon.py", "--ckpt-dir", ckpt_dir, "--tag", tag, "--final-step", str(final_step),
+               "--vllm-gpu-mem", str(vllm_gpu_mem), "--full-model", "--once", "--only-step", str(s)]
+        if wandb_name:
+            cmd += ["--wandb-name", wandb_name]
+        if extra_args:
+            cmd += extra_args.split()
+        print(f"[modal-full] pending {todo} -> step {s}: {' '.join(cmd)}", flush=True)
+        t0 = time.time()
+        p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in p.stdout:
+            print(line, end="", flush=True)
+        rc = p.wait()
+        if rc == 0:
+            done.add(s)
+            json.dump({"done": sorted(done), "tag": tag, "ckpt_dir": ckpt_dir, "full_model": True}, open(state, "w"))
+            vol.commit()
+            print(f"[modal-full] step {s} DONE in {time.time() - t0:.0f}s", flush=True)
+        else:
+            fails[s] = fails.get(s, 0) + 1
+            print(f"[modal-full] step {s} FAILED rc={rc} (attempt {fails[s]}); {'giving up on it' if fails[s] >= 2 else 'will retry'}", flush=True)
+            time.sleep(60)
+
+
 @app.local_entrypoint()
 def main(ckpt_dir: str = "/data/ckpts_last5_v15_g8", tag: str = "last5_v15_g8", rl_run_id: str = "", once: bool = False,
          only_step: int = -1, final_step: int = 1000, extra_args: str = ""):

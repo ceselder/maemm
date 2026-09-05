@@ -40,7 +40,9 @@ def make_inject_hook(vecs, positions, coeff, device, dtype, mode="add"):
         if h.shape[0] != len(vecs):
             raise RuntimeError(f"inject batch {h.shape[0]} != {len(vecs)} vector rows")
         base = h[rows, cols]
-        if mode == "add":
+        if mode in ("add", "add_clone"):
+            if mode == "add_clone":   # same arithmetic on a copy: FSDP2 hangs backward hooks on the layer output tensor
+                h = h.clone()
             scale = base.norm(dim=-1, keepdim=True) * coeff
             h[rows, cols] = base + (normed * scale).to(h.dtype).detach()
         elif mode == "replace":
