@@ -83,9 +83,15 @@ if have:
     best_lr = max(means, key=means.get)
     spread = max(means.values()) - min(means.values())
     base = means.get(1e-4)
-    hi, lo = max(have), min(have)
-    if spread < 0.01:
-        claim = f"SFT learning rate does not move held-out fidelity: mean_all spans only {spread:.3f} across lr {lo:g}..{hi:g} at a fixed 2M-example budget"
+    core = [lr for lr in have if lr <= 3e-4] or have            # the arms whose CE ties; 5e-4 is the edge-of-stability probe
+    core_vals = [means[lr] for lr in core]
+    spread_core = max(core_vals) - min(core_vals)
+    if spread_core < 0.01 and base is not None and means[best_lr] - base <= 0.005:
+        claim = (f"SFT learning rate does not move held-out fidelity between lr {min(core):g} and {max(core):g} "
+                 f"(mean_all {min(core_vals):.3f}-{max(core_vals):.3f}) at a fixed 2M-example budget")
+        edge = [lr for lr in have if lr > max(core)]
+        if edge and means[edge[0]] < min(core_vals) - 0.005:
+            claim += f"; {edge[0]:g} is slightly worse ({means[edge[0]]:.3f})"
     elif base is not None and means[best_lr] - base > 0.005:
         claim = f"lr {best_lr:g} beats the production lr 1e-4 on held-out fidelity (mean_all {means[best_lr]:.3f} vs {base:.3f}) at a fixed 2M-example SFT budget"
     else:
