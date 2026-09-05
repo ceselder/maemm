@@ -499,7 +499,7 @@ def main():
                 m = stage_metrics(table, a, stage); c = stage_metrics(table, "acts100", stage)
                 if not m:
                     continue
-                for k, _, _ in COLS:
+                for k in [k for k, _, _ in COLS] + ["eval/sae/unverbalized_frac"]:
                     v = m.get(k); iv = init_m.get(k); cv = (c or {}).get(k)
                     w.writerow([a, ARM_LABEL[a], "after_midtrain" if stage == "sft" else "rl", 0 if stage == "sft" else stage, k,
                                 v, iv, None if (v is None or iv is None) else v - iv, cv, None if (v is None or cv is None) else v - cv])
