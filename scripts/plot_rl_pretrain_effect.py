@@ -81,10 +81,10 @@ seen = {}
 for ax in axes.flat:
     for h, l in zip(*ax.get_legend_handles_labels()):
         seen.setdefault(l, h)
-fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=2, frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.01))
-fig.suptitle("RL from three SFT inits (same ScaleRL recipe, lr 7e-6): the 23M realact pretrain + datamix midtrain overtakes the 500k-datamix start on the mean, SAE and real "
-             "activations by ~0.4M rollouts; the realact-only pretrain wins real activations but never learns SAE/probes (banks differ, see legend) — all logged eval metrics", fontsize=11, y=0.995)
-fig.tight_layout(rect=(0, 0.06, 1, 0.975))
+fig.legend(seen.values(), seen.keys(), loc="lower center", ncol=2, frameon=False, fontsize=9, bbox_to_anchor=(0.5, 0.0))
+fig.suptitle("RL from three SFT inits (same ScaleRL recipe, lr 7e-6), every logged eval metric: the 23M realact pretrain + datamix midtrain overtakes the 500k-datamix start\n"
+             "on the mean, SAE and real activations by ~0.4M rollouts; the realact-only pretrain wins real activations but never learns SAE/probes (its RL bank has none)", fontsize=12, y=0.995)
+fig.tight_layout(rect=(0, 0.075, 1, 0.965))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/rl_pretrain_effect.{ext}", dpi=160)
 plt.close(fig)
