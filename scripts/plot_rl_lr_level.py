@@ -130,8 +130,8 @@ for j, (key, title) in enumerate(cols):
         ax.set_xlabel({"step": "RL step", "rollouts": "rollouts consumed (millions)", "lr_steps": "cumulative lr × steps (×1e-3); dashed = onset"}[xmode], fontsize=9)
 h, l = axes[0, 0].get_legend_handles_labels()
 fig.legend(h, l, loc="lower center", ncol=2, frameon=False, fontsize=9.5, bbox_to_anchor=(0.5, 0.0))
-fig.suptitle(f"Held-out fidelity: per STEP the lower lr is slower; per cumulative lr × steps the two runs overlay almost exactly (bottom row) and reach the same best "
-             f"({H['best']['eval/mean_all']:.3f} @{H['best']['ckpt_step']} vs {F['best']['eval/mean_all']:.3f} @{F['best']['ckpt_step']}) — the walk is the same, only its speed changes", fontsize=11, y=0.995)
+fig.suptitle(f"Held-out fidelity: per STEP the lower lr is slower (top); per cumulative lr × steps the two runs overlay almost exactly (bottom) and reach the same best\n"
+             f"({H['best']['eval/mean_all']:.3f} @{H['best']['ckpt_step']} at lr 5e-6 vs {F['best']['eval/mean_all']:.3f} @{F['best']['ckpt_step']} at lr 1e-5) — the walk is the same, only its speed changes", fontsize=11, y=0.995)
 fig.tight_layout(rect=(0, 0.05, 1, 0.96))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/lr_evals.{ext}", dpi=160)
