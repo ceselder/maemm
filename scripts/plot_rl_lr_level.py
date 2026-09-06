@@ -105,7 +105,7 @@ for ax in axes[1]:
     ax.set_xlabel("RL step (dashed verticals = grad-norm onset of the runaway)", fontsize=9.5)
 h, l = axes.flat[0].get_legend_handles_labels()
 fig.legend(h, l, loc="lower center", ncol=2, frameon=False, fontsize=9.5, bbox_to_anchor=(0.5, 0.0))
-fig.suptitle(f"Halving the learning rate {verdict}:\\nrunaway onset at step {H['onset_gnorm_gt1']} (lr 5e-6) vs {F['onset_gnorm_gt1']} (lr 1e-5), same batch, same everything else",
+fig.suptitle(f"Halving the learning rate {verdict}:\nrunaway onset at step {H['onset_gnorm_gt1']} (lr 5e-6) vs {F['onset_gnorm_gt1']} (lr 1e-5), same batch, same everything else",
              fontsize=11, y=0.995)
 fig.tight_layout(rect=(0, 0.07, 1, 0.94))
 for ext in ("png", "pdf"):
