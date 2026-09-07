@@ -244,6 +244,7 @@ def _stage_parallel(local_of: dict, size_of: dict, streams_per_big_file: int = 4
     multiply throughput. A monitor prints the aggregate rate every 60 s and raises if it stays below `stall_mib_s` for
     `stall_minutes` (after a 3-min grace) so a throttled leg fails fast and gets respawned instead of crawling for hours."""
     import threading
+    import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     jobs = []  # (fn, args)
     progress = [0]; total = 0
