@@ -11,6 +11,7 @@ Speed knobs (all exact -- none changes the optimization):
     --grad-ckpt 0 --autocast-bf16                                     no recompute, bf16 LoRA matmuls
     --head-on-labels                                                  lm_head + CE only at label positions
     --grad-accum N                                                    N micro-batches per optimizer step
+    --prefix-cache --prefix-share-step                               one prefix fwd/bwd per optimizer step
     --pad-multiple 1                                                  --prefix-cache: no suffix-length rounding (default 8 = ~15% pad)
 Composition knob (NOT exact -- changes which examples share an optimizer step, not the objective):
     --length-bucket   i.i.d. example windows per optimizer step, length-sorted into micro-batches (see step_groups)
@@ -71,6 +72,27 @@ def open_vec_bank(data_dir, n_vecs):
 def gather_rows(vecs, idx):
     """Bank rows -> float32 CPU tensor (f16 banks are upcast here; f32 rows are a plain copy)."""
     return torch.from_numpy(np.array(vecs[idx], dtype=np.float32))   # np.array = always a writable copy
+
+
+def tokenize_records(records, tok, max_seq, chunk_size=4096):
+    """Tokenize targets in batches and build the constant chat prompt only once.
+
+    Same IDs/labels/truncation as build_sft_ids per record, without millions of repeated
+    chat-template calls. Bounded tokenizer batches keep startup memory independent of
+    the bank size beyond the tokenized rows the trainer already retains.
+    """
+    prompt, positions = build_prompt_ids(tok)
+    prompt_labels = [-100] * len(prompt)
+    rows = []
+    for start in range(0, len(records), chunk_size):
+        chunk = records[start:start + chunk_size]
+        targets = tok([r["target_text"] for r in chunk], add_special_tokens=False,
+                      padding=False, truncation=False)["input_ids"]
+        for record, ids in zip(chunk, targets):
+            target = list(ids) + [tok.eos_token_id]
+            rows.append(((prompt + target)[:max_seq], (prompt_labels + target)[:max_seq],
+                         positions, record["vec_idx"]))
+    return rows
 
 
 class LabelHeadLM(torch.nn.Module):
@@ -299,6 +321,10 @@ def main():
                          "forward (token-weighted losses => identical to one big-batch mean-loss step). Amortizes the "
                          "B=1 prefix fwd+bwd (~225 ms/step on B200) and lowers peak memory: e.g. --batch-size 128 "
                          "--prefix-accum 2 fits one B200 where a single 128 micro-batch OOMs.")
+    ap.add_argument("--prefix-share-step", action="store_true",
+                    help="LoRA + --prefix-cache: share one prefix forward AND backward across all --grad-accum / "
+                         "--prefix-accum micro-batches of an optimizer step. Accumulates cache gradients in fp32, "
+                         "then reduces completed parameter gradients once. Same objective; bf16 reduction order differs.")
     ap.add_argument("--pad-multiple", type=int, default=8,
                     help="--prefix-cache: round each micro-batch's padded suffix length up to a multiple of N. The legacy 8 "
                          "pads ~15%% of suffix tokens on 8-32-token targets (micro-batches are already length-sorted, so "
@@ -335,6 +361,8 @@ def main():
     ap.add_argument("--wandb-id", default="", help="crash-resume: continue this wandb run id (resume='allow')")
     a = ap.parse_args()
     assert a.grad_accum >= 1, "--grad-accum must be >= 1"
+    assert not a.prefix_share_step or (a.prefix_cache and not a.full_ft), \
+        "--prefix-share-step requires --prefix-cache and LoRA (FSDP2/full-ft is not supported)"
     assert a.pad_multiple >= 1, "--pad-multiple must be >= 1"
     assert not (a.length_bucket and a.pack_len), "--length-bucket is for the per-example path (no --pack-len)"
 
@@ -455,11 +483,11 @@ def main():
     prefix_cache = None
     if a.prefix_cache:
         try:
-            from sft.prefix_cache import PrefixCache  # repo layout (needs the transformers fork; checked inside)
+            from sft.prefix_cache import PrefixCache, PrefixGradientAccumulator, sync_accumulated_gradients
         except ImportError:  # mounted next to this file (modal_sft.py puts both under /pmx/SL/)
             import sys
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from prefix_cache import PrefixCache
+            from prefix_cache import PrefixCache, PrefixGradientAccumulator, sync_accumulated_gradients
         assert not a.pack_len, "--prefix-cache is the per-example path (no --pack-len)"
         assert not a.head_on_labels, "--prefix-cache uses HF's loss on the short suffix (its head cost is already ~all labels); not combinable with --head-on-labels"
         assert not a.grad_ckpt, "--prefix-cache needs --grad-ckpt 0 (GradientCheckpointingLayer drops past_key_values)"
@@ -471,18 +499,26 @@ def main():
                                    # and its pre-backward unshard hangs on module outputs -> the prefix output needs a grad path
                                    inject_mode="add_clone" if a.full_ft else "add", keep_prefix_grad_path=a.full_ft)
         assert a.prefix_accum >= 1 and a.batch_size % a.prefix_accum == 0, "--prefix-accum must divide --batch-size"
+        if a.prefix_share_step:
+            # Sharing stochastic prefix computations changes the objective. This trainer creates
+            # zero-dropout LoRAs, but reject a resumed adapter/base with active dropout as well.
+            assert not any(isinstance(m, torch.nn.Dropout) and m.p > 0 for m in model.modules()), \
+                "--prefix-share-step requires zero dropout"
         if is_main:
             print(f"[pretrain] prefix-cache ON: shared prefix {prefix_cache.prefix_len} tokens, suffix = "
                   f"{len(prefix_cache.suffix_prompt)} prompt token(s) + target, prefix shared by {a.prefix_accum} "
                   f"micro-batch(es) of {a.batch_size // a.prefix_accum}, suffix padded to a multiple of {a.pad_multiple}",
                   flush=True)
+            if a.prefix_share_step:
+                print("[pretrain] prefix-share-step ON: one prefix fwd/bwd per optimizer step; "
+                      "fp32 cache-gradient accumulation, one parameter-gradient reduction", flush=True)
 
     # pre-tokenize once. Packed path: shuffle-once greedy packing into fixed pack-len blocks (zero
     # intra-block padding, one static shape for compile). Legacy path: length-bucketed padded batches.
-    toks_cache = []
-    for r in records:
-        ids, labs, pos = build_sft_ids(tok, r["target_text"])
-        toks_cache.append((ids[: a.max_seq], labs[: a.max_seq], pos, r["vec_idx"]))
+    t_tokenize = time.time()
+    toks_cache = tokenize_records(records, tok, a.max_seq)
+    if is_main:
+        print(f"[pretrain] tokenized {len(toks_cache)} local records in {time.time() - t_tokenize:.1f}s", flush=True)
     if a.pack_len:
         blocks = pack_examples(toks_cache, a.pack_len, seed=0)
         if world > 1:  # equalize block count across ranks (packing yields ±1 per rank → DDP deadlock)
@@ -554,6 +590,11 @@ def main():
             probe_ctx = (FT.injection_probe(model, INJECT_LAYER, log=print) if (a.full_ft and step == a.skip_steps and is_main)
                          else contextlib.nullcontext())
             probe_ctx.__enter__()
+            shared_prefix = None
+            if a.prefix_share_step:
+                ac = lambda: autocast_region(model, a.autocast_bf16)
+                shared_prefix = PrefixGradientAccumulator(prefix_cache.run_prefix(ac))
+                n_real_step += prefix_cache.prefix_len
             for mi, batch in enumerate(group):
                 last_in_group = mi == len(group) - 1
                 if not a.pack_len:
@@ -566,7 +607,30 @@ def main():
                     targets = [t[0][n_prompt:] for t in batch]
                     vmat = gather_rows(vecs, [t[3] for t in batch])
                     ac = lambda: autocast_region(model, a.autocast_bf16)  # noqa: E731
-                    if a.prefix_accum == 1:
+                    if shared_prefix is not None:
+                        # All suffix backwards stop at the cache leaves. The prefix is traversed
+                        # once below, before clipping/Adam. DDP must not reduce partial gradients.
+                        n_tot = sum(len(t) for t in targets)
+                        if n_tot == 0:
+                            raise ValueError("prefix-cache batch has no target tokens; increase --max-seq")
+                        mb = a.batch_size // a.prefix_accum
+                        loss = torch.zeros((), device=device)
+                        n_real = 0
+                        for start in range(0, len(batch), mb):
+                            sl = slice(start, start + mb)
+                            ctx = ddp.no_sync() if world > 1 else contextlib.nullcontext()
+                            with ctx:
+                                out = prefix_cache.forward(vmat[sl], targets[sl], autocast=ac,
+                                                           prefix_cache=shared_prefix.cache)
+                                weight = out.n_target_tokens / n_tot
+                                (out.loss * weight / len(group)).backward()
+                            shared_prefix.accumulate()
+                            loss += out.loss.detach() * weight
+                            n_suf = int(out.suffix_mask.sum())
+                            n_real += n_suf
+                            n_pad_real += n_suf; n_pad_slots += out.suffix_len * out.suffix_mask.shape[0]
+                            del out
+                    elif a.prefix_accum == 1:
                         sync_ctx = ddp.no_sync() if (world > 1 and not last_in_group) else contextlib.nullcontext()
                         with sync_ctx:
                             out = prefix_cache.forward(vmat, targets, autocast=ac)
@@ -651,6 +715,11 @@ def main():
                     loss = out if a.head_on_labels else out.loss
                     (loss / len(group)).backward()
                 loss_step += loss.detach() / len(group)
+            if shared_prefix is not None:
+                ctx = ddp.no_sync() if world > 1 else contextlib.nullcontext()
+                with ctx:
+                    shared_prefix.backward()
+                sync_accumulated_gradients(model.parameters())
             probe_ctx.__exit__(None, None, None)
             if a.full_ft:
                 FT.clip_grad_norm([p for p in model.parameters() if p.requires_grad], 1.0)
