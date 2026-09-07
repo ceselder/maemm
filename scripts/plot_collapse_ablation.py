@@ -36,14 +36,20 @@ ROUND2 = {
     "kl002": ("KL 0.02 to the SFT init", "#9a3b8f"),
     "enttarget": ("adaptive entropy floor 1.2", "#b5542b"),
 }
+ROUND3 = {  # variance-floor filter: groups whose within-group reward std <= eps leave the effective batch (default eps 1e-6 never fires: continuous reward)
+    "zv01": ("drop groups with reward std ≤ 0.01 (≈10% of groups)", "#2a7f62"),
+    "zv02": ("drop groups with reward std ≤ 0.02 (≈38% of groups)", "#4a6fa5"),
+}
 REF_TRAIN, REF_EVAL = "bc3nzllu", "rl_D_mix1m_lr1e-5_from_realact23m_mixsft_eval"   # RL-D
-TRAIN_KEYS = ["reward/mean", "policy/entropy", "grad_norm", "grad_norm_did_clip", "policy/sampler_abs_dlogp", "ratio/clipfrac", "rollout/len_mean", "lr", "policy/kl_to_init"]
+TRAIN_KEYS = ["reward/mean", "policy/entropy", "grad_norm", "grad_norm_did_clip", "policy/sampler_abs_dlogp", "ratio/clipfrac", "rollout/len_mean", "lr", "policy/kl_to_init",
+              "scalerl/zero_var_dropped_frac", "scalerl/effective_groups", "reward/within_group_std"]
 EVAL_KEYS = [("eval/mean_all", "mean over held-out families"), ("eval/sae/norm_act", "SAE norm_act"), ("eval/sae/rank1_frac", "SAE rank-1 fraction"),
              ("eval/sae/unverbalized_frac", "SAE unverbalized (lower = better)"), ("eval/realact/cos", "real activations (cos)"),
              ("eval/bsf/cos", "BSF (cos)"), ("eval/cluster/cos", "cluster probes (cos)")]
 PANELS = [("grad_norm", "gradient norm (log; dotted = clip 1.0)", True), ("policy/sampler_abs_dlogp", "sampler vs trainer |Δ log-prob| per token", True),
           ("reward/mean", "training reward (max cos, last-5 window)", False), ("policy/entropy", "policy entropy (nats/token)", False),
           ("rollout/len_mean", "mean rollout length (tokens)", False), ("ratio/clipfrac", "fraction of tokens with clipped IS ratio", True)]
+PANELS3 = PANELS[:5] + [("scalerl/zero_var_dropped_frac", "fraction of groups dropped by the variance floor (std ≤ eps)", False)]
 
 api = wandb.Api()
 
@@ -71,12 +77,18 @@ def arm_record(label, run_name, eval_name):
     tr = train_rows(rs[0]) if rs else []
     g = np.array([r["grad_norm"] for r in tr]); dl = np.array([r["policy/sampler_abs_dlogp"] for r in tr]); st = np.array([r["step"] for r in tr])
     return {"label": label, "train_id": rs[0].id if rs else None, "state": rs[0].state if rs else None, "train": tr, "evals": eval_rows(eval_name),
-            "onset_gnorm_gt1": int(st[g > 1][0]) if (g > 1).any() else None, "onset_dlogp_gt05": int(st[dl > 0.05][0]) if (dl > 0.05).any() else None,
+            # onsets skip step 251: the first update after a resume carries a one-step transient (grad norm 1.0-1.3 in the round-3 arms) that is not the runaway
+            "onset_gnorm_gt1": int(st[(g > 1) & (st >= 252)][0]) if ((g > 1) & (st >= 252)).any() else None,
+            "onset_dlogp_gt05": int(st[(dl > 0.05) & (st >= 252)][0]) if ((dl > 0.05) & (st >= 252)).any() else None,
             "steps_gnorm_gt1": int((g > 1).sum()), "n_steps": len(tr),
-            "last10": {k: float(np.mean([r[k] for r in tr[-10:]])) for k in ("reward/mean", "grad_norm", "policy/sampler_abs_dlogp", "rollout/len_mean", "policy/entropy")} if tr else {}}
+            "last10": {k: float(np.mean([r[k] for r in tr[-10:] if r.get(k) is not None])) for k in ("reward/mean", "grad_norm", "policy/sampler_abs_dlogp", "rollout/len_mean", "policy/entropy",
+                                                                                              "scalerl/zero_var_dropped_frac", "scalerl/effective_groups", "reward/within_group_std")
+                       if any(r.get(k) is not None for r in tr[-10:])} if tr else {},
+            "first10": {k: float(np.mean([r[k] for r in tr[:10] if r.get(k) is not None])) for k in ("scalerl/zero_var_dropped_frac", "scalerl/effective_groups", "reward/within_group_std")
+                        if any(r.get(k) is not None for r in tr[:10])} if tr else {}}
 
 
-def render(arms, run_prefix, prefix, title_dyn, extra_refs):
+def render(arms, run_prefix, prefix, title_dyn, extra_refs, panels=PANELS):
     """arms: key -> (label, colour); run_prefix: wandb run-name prefix; extra_refs: list of (label, train rows) plotted as extra grey references."""
     ref_run = api.run(f"{PROJ}/{REF_TRAIN}")
     data = {"reference": {"train_id": REF_TRAIN, "eval_run": REF_EVAL, "train": [r for r in train_rows(ref_run) if 225 <= r["step"] <= 310],
@@ -88,7 +100,7 @@ def render(arms, run_prefix, prefix, title_dyn, extra_refs):
 
     fig, axes = plt.subplots(2, 3, figsize=(17, 8.8), sharex=True)
     ref = data["reference"]["train"]
-    for ax, (k, title, logy) in zip(axes.flat, PANELS):
+    for ax, (k, title, logy) in zip(axes.flat, panels):
         ax.plot([r["step"] for r in ref], [r[k] for r in ref], color="#b0b0b0", lw=2.6, ls="--", label="RL-D itself (the run being resumed), steps 225-310")
         for rl, rrows in extra_refs:
             ax.plot([r["step"] for r in rrows], [r[k] for r in rrows], color="#d8c8b0", lw=2.2, ls=":", label=rl)
@@ -151,5 +163,15 @@ def title2(d):
             "the two raw-advantage arms with LOADED Adam moments look stable only because the stale second moment cuts their effective lr ~25x")
 
 
+def title3(d):
+    A = d["arms"]; fmt = lambda a: str(A[a]["onset_dlogp_gt05"]) if A[a]["onset_dlogp_gt05"] else "none"
+    dr = lambda a, w: A[a].get(w, {}).get("scalerl/zero_var_dropped_frac", float("nan"))
+    return ("Round 3 — a variance floor (drop low-spread groups from the batch) does not prevent the runaway either: drift onset "
+            f"{fmt('zv01')} with 10% of groups dropped, {fmt('zv02')} with 38% dropped (control 277)\n"
+            f"the filter defeats itself: within-group spread RISES once the policy destabilises, so the dropped fraction falls "
+            f"({dr('zv02', 'first10'):.2f} → {dr('zv02', 'last10'):.2f} for eps 0.02) exactly when a brake would matter")
+
+
 d1 = render(ROUND1, "rl_ablate_", "ablation", title1, [])
 render(ROUND2, "rl_ablate2_", "ablation2", title2, [("round-1 control (same recipe, loaded moments)", d1["arms"]["control"]["train"])])
+render(ROUND3, "rl_ablate3_", "ablation3", title3, [("round-1 control (same recipe, loaded moments)", d1["arms"]["control"]["train"])], panels=PANELS3)
