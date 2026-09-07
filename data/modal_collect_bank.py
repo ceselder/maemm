@@ -307,7 +307,8 @@ def collect_b200x4(n_examples: int = 3_000_000, out_name: str = "realact_short_2
     _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from)
 
 
-@app.function(image=image, volumes={"/data": vol}, timeout=4 * 3600, cpu=16, memory=128 * 1024, ephemeral_disk=512 * 1024)
+@app.function(image=image, volumes={"/data": vol}, timeout=8 * 3600, cpu=16, memory=64 * 1024,
+              ephemeral_disk=int(os.environ.get("MERGE_DISK_GB", "1200")) * 1024)   # volume writes stage on local disk: 50M rows = 512 GB, 200M = 2.1 TB (max 3 TiB)
 def merge(out_name: str, parts: str, seed: int = 0):
     """Concatenate finalized part banks (comma list) into /data/banks/<out_name>: vecs.f16 (parts in order), records with
     re-based vec_idx, globally shuffled; build_stats = sums + per-part stats."""
@@ -327,32 +328,33 @@ def merge(out_name: str, parts: str, seed: int = 0):
     stats = [json.load(open(f"/data/banks/{n}/build_stats.json")) for n in names]
     total = sum(st["n_examples"] for st in stats)
     vecs = np.memmap(f"{out}/vecs.f16.tmp", np.float16, "w+", shape=(total, D_MODEL))
-    recs, off = [], 0
-    for n, st in zip(names, stats):
-        N = st["n_examples"]
-        src = np.memmap(f"/data/banks/{n}/vecs.f16", np.float16, "r", shape=(N, D_MODEL))
-        for s0 in range(0, N, 200_000):
-            vecs[off + s0 : off + min(N, s0 + 200_000)] = src[s0 : min(N, s0 + 200_000)]
-        with open(f"/data/banks/{n}/records.jsonl") as f:
-            for line in f:
-                r = json.loads(line); r["vec_idx"] += off; r["part"] = n
-                recs.append(r)
-        off += N
-        print(f"[merge] {n}: {N} examples appended ({time.time() - t0:.0f}s)", flush=True)
-    assert off == total and len(recs) == total
+    # STREAMING: records are re-based and written part by part (no in-RAM list -- 200M dicts would need >150 GB); rows are NOT
+    # globally shuffled (sft/pretrain.py length-sorts and shuffles micro-batches itself; rl samples rows uniformly), so
+    # records.jsonl is in part order. `seed` is kept for signature compatibility.
+    off, n_rec = 0, 0
+    with open(f"{out}/records.jsonl.tmp", "w") as fout:
+        for n, st in zip(names, stats):
+            N = st["n_examples"]
+            src = np.memmap(f"/data/banks/{n}/vecs.f16", np.float16, "r", shape=(N, D_MODEL))
+            for s0 in range(0, N, 200_000):
+                vecs[off + s0 : off + min(N, s0 + 200_000)] = src[s0 : min(N, s0 + 200_000)]
+            del src
+            with open(f"/data/banks/{n}/records.jsonl") as f:
+                for line in f:
+                    r = json.loads(line); r["vec_idx"] += off; r["part"] = n
+                    fout.write(json.dumps(r, ensure_ascii=False) + "\n"); n_rec += 1
+            off += N
+            print(f"[merge] {n}: {N} examples appended ({time.time() - t0:.0f}s)", flush=True)
+    assert off == total and n_rec == total, (off, n_rec, total)
     vecs.flush(); del vecs
     os.replace(f"{out}/vecs.f16.tmp", f"{out}/vecs.f16")
-    order = np.random.default_rng(seed).permutation(total)
-    with open(f"{out}/records.jsonl.tmp", "w") as f:
-        for i in order:
-            f.write(json.dumps(recs[i], ensure_ascii=False) + "\n")
     os.replace(f"{out}/records.jsonl.tmp", f"{out}/records.jsonl")
     merged = {"kind": "merge of " + ", ".join(names) + " (disjoint FineFineWeb files; see parts)", "n_examples": total,
               "families": {"realact": total}, "parts": {n: st for n, st in zip(names, stats)},
               "docs_seen": sum(st.get("docs_seen", 0) for st in stats),
               "docs_excluded_eval_hash": sum(st.get("docs_excluded_eval_hash", 0) for st in stats),
               "ctx_range": stats[0]["ctx_range"], "w_range": stats[0]["w_range"], "created": time.time(),
-              "files": {"vecs.f16": f"float16 [{total},{D_MODEL}]", "records.jsonl": "shuffled; vec_idx -> row; part = source bank"}}
+              "files": {"vecs.f16": f"float16 [{total},{D_MODEL}]", "records.jsonl": "PART ORDER (not shuffled; loaders shuffle); vec_idx -> row; part = source bank"}}
     json.dump(merged, open(f"{out}/build_stats.json", "w"), indent=2)
     vol.commit()
     print(f"[merge] FINALIZED {out}: {total} examples from {names} in {time.time() - t0:.0f}s", flush=True)
