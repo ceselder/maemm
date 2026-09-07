@@ -237,7 +237,7 @@ def _copy_range(src: str, dst: str, start: int, end: int, chunk: int = 64 * 2**2
 
 
 def _stage_parallel(local_of: dict, size_of: dict, streams_per_big_file: int = 4, big_file_bytes: int = 4 * 2**30,
-                    stall_mib_s: float = 60.0, stall_minutes: float = 5.0):
+                    stall_mib_s: float = 250.0, stall_minutes: float = 5.0):
     """Stage every part with MANY parallel streams: one worker per small file, `streams_per_big_file` byte-range workers per
     file > big_file_bytes (vecs.f16 is 85-512 GiB). Modal's volume read path throttles a single long-running stream to ~20 MiB/s
     after a burst (measured Sep 7: 1.2 GB/s -> 19 MiB/s), while fresh streams read at 400-700 MiB/s, so parallel ranges
