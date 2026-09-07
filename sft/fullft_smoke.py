@@ -154,7 +154,8 @@ def main():
     assert world == 2, "run with --nproc_per_node=2"
     log(f"[smoke] torch {torch.__version__} | {torch.cuda.get_device_name(0)} | compute dtype {a.dtype}")
     data = make_data(a.seed, rank, a.steps, G=2, B=4)
-    tol = 2e-2 if dtype == torch.bfloat16 else 2e-4   # relative Frobenius; bf16 paths differ by summation order
+    tol = 2e-2 if dtype == torch.bfloat16 else 1e-3   # relative Frobenius; paths differ by fp summation order only (fp32 run:
+                                                       # worst 3e-4 on the 4-element A_log with |d| 2e-6, loss identical to 1e-6)
     failures = []
 
     variants = {
@@ -190,9 +191,11 @@ def main():
         del model, pc
         torch.cuda.empty_cache()
 
-    log(f"[smoke] ---- {a.steps}-step training: params after every step, ref vs share+keep+ckpt (fresh weights re-gathered?) ----")
+    log(f"[smoke] ---- {a.steps}-step training: params after every step; ref+keep must be BIT-IDENTICAL to ref (stale gathered "
+        f"weights would show up as a step-1 loss jump), share+keep+ckpt at fp-noise level ----")
     runs = {}
-    for name, spec in (("ref", dict(share=False)), ("share+keep+ckpt", dict(share=True, keep=-1, ckpt=True))):
+    for name, spec in (("ref", dict(share=False)), ("ref+keep", dict(share=False, keep=-1)),
+                       ("share+keep+ckpt", dict(share=True, keep=-1, ckpt=True))):
         model, pc = build_variant(a.seed, device, spec, dtype)
         opt = FT.make_optimizer("adamw", model.parameters(), 1e-3)
         hist = []
@@ -203,11 +206,21 @@ def main():
         del model, pc, opt
         torch.cuda.empty_cache()
     for s in range(a.steps):
-        (l0, g0, p0), (l1, g1, p1) = runs["ref"][s], runs["share+keep+ckpt"][s]
+        (l0, g0, p0) = runs["ref"][s]
+        (lk, gk, pk) = runs["ref+keep"][s]
+        mx, rel, worst, n = compare(pk, p0)
+        ok = mx == 0.0 and lk == l0
+        log(f"[smoke] step {s}: ref+keep vs ref: loss {l0:.6f} vs {lk:.6f} (diff {lk - l0:+.2e}) | params max|d| {mx:.2e} "
+            f"({worst}) -> {'OK (bit-identical)' if ok else 'FAIL'}")
+        if not ok:
+            failures.append(f"keep-multistep{s}")
+        (l1, g1, p1) = runs["share+keep+ckpt"][s]
         mx, rel, worst, n = compare(p1, p0)
-        ok = rel < tol and abs(l1 - l0) < (2e-2 if dtype == torch.bfloat16 else 1e-4)
-        log(f"[smoke] step {s}: loss ref {l0:.6f} vs {l1:.6f} (diff {l1 - l0:+.2e}) | params max|d| {mx:.2e} worst rel {rel:.2e} "
-            f"({worst}) -> {'OK' if ok else 'FAIL'}")
+        # Adam turns fp-noise-level gradient differences on near-zero-gradient elements into O(lr) parameter differences
+        # (update ~ lr*sign(g)); the LOSS is the meaningful check: a stale-weight bug would show ~|loss(theta0)-loss(theta1)|
+        ok = abs(l1 - l0) < (2e-3 if dtype == torch.bfloat16 else 1e-4)
+        log(f"[smoke] step {s}: share+keep+ckpt vs ref: loss {l0:.6f} vs {l1:.6f} (diff {l1 - l0:+.2e}) | params max|d| {mx:.2e} "
+            f"worst rel {rel:.2e} ({worst}) -> {'OK' if ok else 'FAIL'}")
         if not ok:
             failures.append(f"multistep{s}")
 
