@@ -34,31 +34,307 @@ class FSDPNoSync:
         return contextlib.nullcontext()
 
 
-def shard_full_model(model, world, device, log=print):
-    """In-place: all params trainable, fp32 masters, FSDP2-sharded per decoder layer + root. Returns the model."""
+def shard_full_model(model, world, device, log=print, keep_unsharded_layers=0, prefetch=0, param_dtype=torch.bfloat16,
+                     device_type="cuda"):
+    """In-place: all params trainable, fp32 masters, FSDP2-sharded per decoder layer + root. Returns the model.
+
+    keep_unsharded_layers: 0 = every layer re-all-gathers its bf16 params for every forward AND backward (FSDP2 default,
+        reshard_after_forward=True). N > 0 = the root group (embed/norm/lm_head) and the first N decoder layers keep their
+        gathered bf16 params resident for a whole optimizer step (reshard_after_forward=False at construction +
+        set_reshard_after_backward(False) between the step's backwards, see set_persistent_unshard): ONE all-gather per
+        step instead of 2 per micro-batch, at +0.84 GB/rank per layer (+5 GB root). -1 = all layers (+54 GB/rank). Grads
+        are still reduce-scattered in fp32 after every micro-batch, so the update is unchanged (exact).
+    prefetch: 0 = FSDP2's implicit one-module-ahead all-gather prefetch; N > 0 = explicit forward/backward prefetch of
+        the next N layers (set_modules_to_{forward,backward}_prefetch; +0.84 GB/rank per extra module in flight).
+    """
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
-    mesh = init_device_mesh("cuda", (world,))
-    mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    mesh = init_device_mesh(device_type, (world,))
+    mp = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=torch.float32)
     for p in model.parameters():
         p.requires_grad_(True)
     t0 = time.time()
     layers = model.model.layers
-    for layer in layers:
+    n_keep = len(layers) if keep_unsharded_layers < 0 else min(keep_unsharded_layers, len(layers))
+    for i, layer in enumerate(layers):
         layer.float()                                   # fp32 master for THIS layer only ...
-        fully_shard(layer, mesh=mesh, mp_policy=mp)     # ... then shard it before touching the next one
+        fully_shard(layer, mesh=mesh, mp_policy=mp,     # ... then shard it before touching the next one
+                    reshard_after_forward=(i >= n_keep))
     for m in (model.model.embed_tokens, model.model.norm, model.lm_head):
         m.float()
-    fully_shard(model, mesh=mesh, mp_policy=mp)         # root group: embed_tokens + norm + lm_head
-    torch.cuda.synchronize()
+    fully_shard(model, mesh=mesh, mp_policy=mp)         # root group: embed_tokens + norm + lm_head (never resharded after fwd)
+    if prefetch > 0:
+        L = list(layers)
+        for i, layer in enumerate(L):
+            layer.set_modules_to_forward_prefetch(L[i + 1 : i + 1 + prefetch])
+            layer.set_modules_to_backward_prefetch(L[max(0, i - prefetch) : i][::-1])
+    # groups whose gathered params persist across the step's micro-batches (toggled by set_persistent_unshard)
+    model._fullft_persistent = ([model] + list(layers[:n_keep])) if n_keep else []
+    if device_type == "cuda":
+        torch.cuda.synchronize()
     n = sum(p.numel() for p in model.parameters())
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    mem = (f"resident {torch.cuda.memory_allocated() / 2**30:.1f} GB (peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB)"
+           if device_type == "cuda" else "")
     log(f"[fullft] FSDP2 sharded {len(layers)} layers + root over {world} ranks in {time.time() - t0:.0f}s | "
-        f"{n / 1e9:.2f}B params, {n_tr / 1e9:.2f}B trainable | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB "
-        f"(peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB)")
+        f"{n / 1e9:.2f}B params, {n_tr / 1e9:.2f}B trainable | compute {str(param_dtype).split('.')[-1]} | "
+        f"persistent-unshard: {'root + ' + str(n_keep) + ' layers' if n_keep else 'off'} | explicit prefetch {prefetch} | {mem}")
     model.no_sync = FSDPNoSync()   # pretrain.py calls ddp.no_sync() for grad accumulation
     return model
+
+
+def set_persistent_unshard(model, on):
+    """keep_unsharded_layers > 0: call with on=True at the start of an optimizer step (the persistent groups skip the
+    post-backward reshard, so the next micro-batch's forward finds them gathered) and on=False right BEFORE the step's
+    LAST backward, so that backward reshards them and the optimizer updates the sharded fp32 masters with nothing
+    stale left gathered (the next step's first forward all-gathers the fresh weights). Exact: only comm changes."""
+    for m in getattr(model, "_fullft_persistent", []):
+        m.set_reshard_after_backward(not on, recurse=False)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# optimizers over FSDP2 DTensor params
+# ---------------------------------------------------------------------------------------------------------------
+def _local(t):
+    try:
+        from torch.distributed.tensor import DTensor
+        if isinstance(t, DTensor):
+            return t.to_local()
+    except ImportError:
+        pass
+    return t
+
+
+class LowPrecisionStateAdamW(torch.optim.Optimizer):
+    """AdamW with the two moment buffers stored in lower precision (fp32 masters + fp32 grads untouched). Elementwise, so
+    it runs on the LOCAL shard of every FSDP2 DTensor (padding rows are zero in param and grad and stay zero). Update
+    math == torch.optim.AdamW (lerp / mul+addcmul / sqrt-div-add / addcdiv, fp32); with fp32 moments it reproduces it.
+    m_dtype/v_dtype = bfloat16 halves the moment memory (27 -> 13.5 GB/rank for the 27B). CAUTION on a bf16 exp_avg_sq:
+    beta2=0.999 means each step changes v by ~0.1%%, below bf16's 8-bit mantissa (0.4%%) -- v only moves when g^2 differs
+    from v by > ~0.4%%; the update is no longer exact AdamW (torchao's block-quantized 8-bit states re-scale per block and
+    are the tested alternative). 'adamw-mbf16' (bf16 m, fp32 v) avoids that caveat at 3/4 of the memory."""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0,
+                 m_dtype=torch.bfloat16, v_dtype=torch.float32):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+        self.m_dtype, self.v_dtype = m_dtype, v_dtype
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        import math
+        for group in self.param_groups:
+            lr = float(group["lr"]); b1, b2 = group["betas"]; eps = group["eps"]; wd = group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                pl, gl = _local(p), _local(p.grad)
+                st = self.state[p]
+                if not st:
+                    st["step"] = 0
+                    st["exp_avg"] = torch.zeros_like(pl, dtype=self.m_dtype)
+                    st["exp_avg_sq"] = torch.zeros_like(pl, dtype=self.v_dtype)
+                st["step"] += 1
+                t = st["step"]
+                g = gl.float()
+                m = st["exp_avg"].float().lerp_(g, 1 - b1)                       # fp32 temporaries (alias the state if fp32)
+                v = st["exp_avg_sq"].float().mul_(b2).addcmul_(g, g, value=1 - b2)
+                if st["exp_avg"].dtype != torch.float32:
+                    st["exp_avg"].copy_(m)
+                if st["exp_avg_sq"].dtype != torch.float32:
+                    st["exp_avg_sq"].copy_(v)
+                if wd:
+                    pl.mul_(1 - lr * wd)
+                denom = (v.sqrt() / math.sqrt(1 - b2 ** t)).add_(eps)             # out-of-place sqrt: v may alias the state
+                pl.addcdiv_(m, denom, value=-lr / (1 - b1 ** t))
+        return None
+
+
+OPTIMS = ("adamw", "adamw8bit", "adamw4bit", "adamwfp8", "adamw-bf16", "adamw-mbf16", "adamw-fp32states")
+
+
+def make_optimizer(name, params, lr):
+    """--optim: adamw = torch.optim.AdamW (fp32 moments, 27 GB/rank for the 27B); adamw8bit / adamw4bit / adamwfp8 =
+    torchao.optim block-quantized moments (FSDP2 DTensor-aware; ~7 / ~3.5 / ~7 GB); adamw-bf16 / adamw-mbf16 =
+    LowPrecisionStateAdamW (13.5 / 20 GB); adamw-fp32states = LowPrecisionStateAdamW with fp32 moments (== adamw, sanity)."""
+    params = [p for p in params if p.requires_grad]
+    if name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+    if name in ("adamw8bit", "adamw4bit", "adamwfp8"):
+        import torchao.optim as tao
+        cls = {"adamw8bit": tao.AdamW8bit, "adamw4bit": tao.AdamW4bit, "adamwfp8": tao.AdamWFp8}[name]
+        return cls(params, lr=lr, weight_decay=0.0)
+    if name == "adamw-bf16":
+        return LowPrecisionStateAdamW(params, lr=lr, m_dtype=torch.bfloat16, v_dtype=torch.bfloat16)
+    if name == "adamw-mbf16":
+        return LowPrecisionStateAdamW(params, lr=lr, m_dtype=torch.bfloat16, v_dtype=torch.float32)
+    if name == "adamw-fp32states":
+        return LowPrecisionStateAdamW(params, lr=lr, m_dtype=torch.float32, v_dtype=torch.float32)
+    raise ValueError(f"unknown --optim {name!r}; choose from {OPTIMS}")
+
+
+def optimizer_state_gb(opt):
+    """Bytes of every tensor in the optimizer state on this rank (tensor subclasses report their own storage)."""
+    total = 0
+    seen = set()
+    for st in opt.state.values():
+        for v in st.values():
+            if isinstance(v, torch.Tensor) and id(v) not in seen:
+                seen.add(id(v))
+                v = _local(v)
+                try:
+                    inner = getattr(v, "codes", None)   # torchao OptimState{8bit,4bit,Fp8}: codes (+ scale, + qmap)
+                    if inner is not None:
+                        total += inner.numel() * inner.element_size()
+                        for extra in ("scale", "qmap"):
+                            e = getattr(v, extra, None)
+                            if isinstance(e, torch.Tensor):
+                                total += e.numel() * e.element_size()
+                        continue
+                    total += v.numel() * v.element_size()
+                except Exception:  # noqa
+                    pass
+    return total / 2**30
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# diagnostics: kernel backends, one profiled step, memory attribution at the activation peak
+# ---------------------------------------------------------------------------------------------------------------
+def _find_impl(fn, prefix="fla", depth=0):
+    """Walk a decorated function's closures/__wrapped__ for a callable whose module starts with `prefix`."""
+    if depth > 6 or not callable(fn):
+        return None
+    if (getattr(fn, "__module__", "") or "").startswith(prefix):
+        return fn
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            v = cell.cell_contents
+        except ValueError:
+            continue
+        if callable(v) and v is not fn:
+            r = _find_impl(v, prefix, depth + 1)
+            if r is not None:
+                return r
+    w = getattr(fn, "__wrapped__", None)
+    return _find_impl(w, prefix, depth + 1) if w is not None and w is not fn else None
+
+
+def kernel_backends(model):
+    """Which implementation transformers' hub-kernel dispatch resolved for the GDN chunk rule / causal conv."""
+    import sys
+    base = model.module if hasattr(model, "module") else model
+    base = base.get_base_model() if hasattr(base, "get_base_model") else base
+    layer = next(l for l in base.model.layers if hasattr(l, "linear_attn"))
+    mod = sys.modules[type(layer.linear_attn).__module__]
+    out = {}
+    for name, pkg in (("torch_chunk_gated_delta_rule", "fla"), ("causal_conv1d_fn", "causal_conv1d")):
+        fn = getattr(mod, name, None)
+        impl = _find_impl(fn, pkg) if fn is not None else None
+        out[name] = f"{impl.__module__}.{getattr(impl, '__qualname__', '?')}" if impl is not None else "torch fallback"
+    try:
+        import fla
+        out["fla"] = "v" + str(getattr(fla, "__version__", "?"))
+    except Exception as e:  # noqa
+        out["fla"] = f"ABSENT ({type(e).__name__})"
+    out["attn_implementation"] = getattr(base.config, "_attn_implementation", "?")
+    return out
+
+
+def memory_attribution(snap, top=28):
+    """Aggregate the live blocks of a torch.cuda.memory._snapshot() by the most specific model-code frame."""
+    import collections
+    import os
+    PRIO = ("fla", "modeling_qwen3_5", "cache_utils", "sdpa_attention", "loss_utils", "functional.py", "prefix_cache",
+            "_fsdp", "fullft.py", "pretrain.py")
+    agg, total, n_blocks = collections.Counter(), 0, 0
+    for seg in snap.get("segments", []):
+        for blk in seg.get("blocks", []):
+            if blk.get("state") != "active_allocated":
+                continue
+            size = blk["size"]; total += size; n_blocks += 1
+            frames = blk.get("frames") or []
+            best, best_rank = None, len(PRIO)
+            for fr in frames:
+                fn = fr.get("filename", "")
+                for r, pat in enumerate(PRIO):
+                    if pat in fn and r < best_rank:
+                        best, best_rank = fr, r
+                        break
+            if best is None and frames:
+                best = frames[0]
+            key = f"{os.path.basename(best['filename'])}:{best['line']} {best['name']}" if best else "<no frames>"
+            agg[key] += size
+    lines = [f"[mem] {total / 2**30:.1f} GB live in {n_blocks} blocks at the probe point; attribution by most specific model-code frame:"]
+    for k, v in agg.most_common(top):
+        lines.append(f"[mem]  {v / 2**30:7.2f} GB  {k}")
+    return "\n".join(lines)
+
+
+class StepProfiler:
+    """Profile ONE optimizer step (rank 0): kernel table by self device time, GPU busy / NCCL fractions, and a memory
+    attribution snapshot taken by ``mem_probe`` (call it after the first micro-batch's forward, before its backward =
+    the activation peak). ``report`` returns the text. Everything is off when enabled=False."""
+
+    def __init__(self, enabled, mem=True):
+        self.enabled, self.mem = enabled, mem
+        self.prof = None
+        self.mem_text = None
+        self.t0 = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        torch.cuda.synchronize()
+        if self.mem:
+            torch.cuda.memory._record_memory_history(max_entries=400000)
+        self.prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                       torch.profiler.ProfilerActivity.CUDA])
+        self.prof.__enter__()
+        self.t0 = time.time()
+        return self
+
+    def mem_probe(self):
+        if not (self.enabled and self.mem) or self.mem_text is not None:
+            return
+        torch.cuda.synchronize()
+        alloc = torch.cuda.memory_allocated() / 2**30
+        snap = torch.cuda.memory._snapshot()
+        torch.cuda.memory._record_memory_history(enabled=None)
+        self.mem_text = f"[mem] probe: allocated {alloc:.1f} GB, peak so far {torch.cuda.max_memory_allocated() / 2**30:.1f} GB\n" + memory_attribution(snap)
+
+    def __exit__(self, *exc):
+        if not self.enabled:
+            return False
+        torch.cuda.synchronize()
+        self.wall = time.time() - self.t0
+        self.prof.__exit__(*exc)
+        if self.mem:
+            torch.cuda.memory._record_memory_history(enabled=None)
+        return False
+
+    def report(self, rows=22):
+        if not self.enabled or self.prof is None:
+            return ""
+        ka = self.prof.key_averages()
+        def dev(e):
+            return getattr(e, "self_device_time_total", None) or getattr(e, "self_cuda_time_total", 0.0)
+        dev_total = sum(dev(e) for e in ka) / 1e6
+        nccl = sum(dev(e) for e in ka if "nccl" in e.key.lower()) / 1e6
+        copies = sum(dev(e) for e in ka if any(t in e.key for t in ("copy_", "Copy", "_to_copy", "cast", "fill_"))) / 1e6
+        gemm = sum(dev(e) for e in ka if any(t in e.key.lower() for t in ("gemm", "cutlass", "matmul", "nvjet", "sm100", "sm90"))) / 1e6
+        triton = sum(dev(e) for e in ka if "triton" in e.key.lower() or "chunk_" in e.key or "fused_" in e.key) / 1e6
+        lines = [f"[prof] step wall {self.wall:.3f} s | device kernel time (sum of self, all streams) {dev_total:.3f} s = "
+                 f"{dev_total / self.wall:.0%} of wall | NCCL {nccl:.3f} s ({nccl / self.wall:.0%}) | GEMM-like {gemm:.3f} s "
+                 f"({gemm / self.wall:.0%}) | triton/fla-like {triton:.3f} s ({triton / self.wall:.0%}) | copies/casts {copies:.3f} s",
+                 "[prof] top kernels by self device time:"]
+        try:
+            table = ka.table(sort_by="self_device_time_total", row_limit=rows)
+        except Exception:  # noqa -- older sort key name
+            table = ka.table(sort_by="self_cuda_time_total", row_limit=rows)
+        lines += ["[prof] " + l for l in table.splitlines()]
+        if self.mem_text:
+            lines.append(self.mem_text)
+        return "\n".join(lines)
 
 
 def clip_grad_norm(params, max_norm):
