@@ -112,11 +112,21 @@ def _exclusion_hashes():
 def _other_bank_files(bank_name: str):
     """Files used by another (running or finalized) bank, for disjoint parallel collections."""
     import json
-    for cand in (f"/data/banks/{bank_name}/shards/assignment.json", f"/data/banks/{bank_name}/assignment.json"):
-        if os.path.exists(cand):
-            a = json.load(open(cand))
-            return [f for r in a.get("ranks", []) for f in r]
-    raise FileNotFoundError(f"no assignment.json for bank {bank_name}")
+    import time
+    # A bank that is FINALIZING moves shards/assignment.json -> <bank>/assignment.json (copy + rmtree of shards); a container
+    # whose /data mount predates that copy can see neither path for a while -> reload the volume and retry before failing
+    # (this exact race killed part p of the 200M collection while part m finalized).
+    for attempt in range(12):
+        for cand in (f"/data/banks/{bank_name}/shards/assignment.json", f"/data/banks/{bank_name}/assignment.json"):
+            if os.path.exists(cand):
+                a = json.load(open(cand))
+                return [f for r in a.get("ranks", []) for f in r]
+        try:
+            vol.reload()
+        except Exception as e:  # noqa
+            print(f"[modal] vol.reload() failed ({e}); retrying", flush=True)
+        time.sleep(15)
+    raise FileNotFoundError(f"no assignment.json for bank {bank_name} after 3 min of retries")
 
 
 def _run(out_name: str, n_examples: int, world: int, batch: int, per_window: int, p_lo: int, p_hi: int, w_lo: int,
