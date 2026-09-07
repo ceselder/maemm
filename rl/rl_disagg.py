@@ -66,6 +66,14 @@ sets the whole bundle, flags given explicitly still win. Pure pieces are unit-te
   metrics under scalerl/*: is_weight_mean, is_trunc_frac, zero_var_dropped_frac, effective_groups, npr_* , lag_max,
   trunc_frac, step_skipped. Every pre-existing metric name is unchanged.
 
+Trainer speed knobs (opt-in, defaults = the behaviour above; exact up to bf16 kernel noise, rl/test_rl_disagg_prefix.py):
+  --prefix-cache        the ~102-token shared prompt prefix runs ONCE per pass (policy: 1 fwd + 1 bwd per step via fp32
+                        cache-gradient accumulation; KL-ref: 1 no-grad fwd), only [marker]+response per rollout on the
+                        batch-expanded cache. Needs the transformers fork (modal_rl_disagg.py DISAGG_TRANSFORMERS).
+  --score-length-bucket the scoring pass runs on length-sorted rollouts (each --score-batch pads to its own longest response).
+                        The update's micro-batches have always been length-sorted (update_disagg chunks()); trainer/pad_frac and
+                        trainer/body_tokens_per_rollout log the residual padding / the tokens actually run per rollout.
+
 Launch inside the container (see modal_rl_disagg.py):
     python RL/rl_disagg.py --role launch --n-rollout 1 --n-trainer 3 --data-dir <pool> --init-adapter <sft> ...
 """
@@ -137,7 +145,8 @@ def parse_args(argv=None):
     ap.add_argument("--vllm-gpu-mem", type=float, default=0.85, help="rollout ranks own the GPU: 0.85-0.9")
     ap.add_argument("--vllm-logp-tol", type=float, default=0.10, help="IGNORED (see policy/sampler_abs_dlogp at step 0)")
     ap.add_argument("--micro-batch", type=int, default=0, help="0 = auto: largest of --mb-candidates that fits at max length")
-    ap.add_argument("--mb-candidates", default="64,48,40,32,24,16,12,8,6,4")
+    ap.add_argument("--mb-candidates", default="64,48,40,32,24,16,12,8,6,4",
+                    help="micro-batch probe candidates (with --prefix-cache the untouched default also tries 128,96)")
     ap.add_argument("--ref-micro-batch", type=int, default=32)
     ap.add_argument("--score-batch", type=int, default=128)
     ap.add_argument("--vocab-chunk", type=int, default=32, help="positions per fp32 log_softmax chunk over the 248k vocab")
@@ -254,6 +263,20 @@ def parse_args(argv=None):
     ap.add_argument("--length-control", choices=("penalty", "interrupt"), default=None,
                     help="penalty = the --len-penalty-* hinge (default, also under --recipe scalerl) | interrupt = no length "
                          "penalty, cap-hit snippets scored as generated (our analogue of ScaleRL's forced interruption)")
+    # trainer speed knobs (both opt-in, both exact up to bf16 kernel noise; defaults = the behaviour above)
+    ap.add_argument("--prefix-cache", action="store_true",
+                    help="trainer: run the shared prompt prefix (every token before the marker, identical for all rollouts) ONCE per "
+                         "pass -- with grad for the policy pass (one prefix fwd + one prefix bwd per step; the micro-batches' cache "
+                         "gradients are accumulated in fp32 and pushed through the prefix graph once) and without grad for the KL-ref "
+                         "pass -- expand its cache (attention K/V + GDN conv/recurrent states) to each micro-batch and run only "
+                         "[marker]+response per rollout (sft/prefix_cache.py machinery). Needs the transformers fork "
+                         "ceselder/transformers@maemm-prefix-cache (modal_rl_disagg.py: DISAGG_TRANSFORMERS).")
+    ap.add_argument("--score-length-bucket", action="store_true",
+                    help="trainer: run the SCORING pass on the rollouts sorted by response length so every --score-batch pads to its "
+                         "own longest response instead of the step's (reorder only: rl.py score() reads each response standalone on "
+                         "the clean base, so the rewards are unchanged up to bf16 kernel noise). The policy/KL-ref update needs no "
+                         "such flag: update_disagg has always length-sorted its micro-batches (chunks(); trainer/pad_frac logs the "
+                         "residual padding).")
     a = ap.parse_args(argv)
     assert a.div_coef == 0 and a.firsttok_coef == 0
     assert not (a.std_norm and a.batch_norm)
@@ -584,6 +607,133 @@ def _hook_outside_autocast(hook, enabled):
         with torch.autocast(h.device.type, enabled=False):
             return hook(mod, inp, out)
     return wrapped
+
+
+# ----------------------------------------------------------------------------------------------
+# --prefix-cache: the shared prompt prefix once per pass (sft/prefix_cache.py machinery, RL-update flavour).
+# Every rollout sequence = the same ~102-token prompt (chat template + marker) + its response; everything strictly before
+# the marker is identical across rollouts and, by causality, untouched by the injection -> its forward (and the backward
+# through it) is shared. The suffix forward gets the prefix's cache expanded to the micro-batch; the injection hook then
+# fires at SUFFIX index 0 (the marker). Exact incl. gradients up to bf16 kernel noise (measured in rl/test_rl_disagg_prefix.py).
+# ----------------------------------------------------------------------------------------------
+def _prefix_cache_module():
+    try:
+        from sft import prefix_cache as pc
+    except ImportError:                 # modal_rl_disagg.py mounts sft/prefix_cache.py next to mxf/ (PYTHONPATH /pmx/helpers)
+        import prefix_cache as pc
+    return pc
+
+
+class _PrefixGradAccumulator:
+    """Share one differentiable prefix forward AND backward across every micro-batch of an optimizer step (mirror of
+    sft/prefix_cache.PrefixGradientAccumulator). ``cache`` holds DETACHED leaves of the prefix cache tensors: the suffix
+    backwards stop there; ``accumulate`` moves the leaves' grads into fp32 sums; ``backward`` pushes the summed cache
+    gradients through the original prefix graph ONCE (chain rule -- not a frozen prefix). Summation order differs from the
+    naive full-sequence path, so bf16 gradients agree to kernel noise, not bitwise. Build a new one after every update."""
+
+    def __init__(self, cache):
+        import copy
+        import torch
+        self._pairs, self._sums, self._finished = [], [], False
+        seen = {}
+
+        def detach(v):
+            if isinstance(v, torch.Tensor):
+                if id(v) not in seen:
+                    leaf = v.detach().requires_grad_(v.requires_grad)
+                    seen[id(v)] = leaf
+                    if v.requires_grad:
+                        self._pairs.append((v, leaf)); self._sums.append(None)
+                return seen[id(v)]
+            if isinstance(v, dict):
+                return {k: detach(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [detach(x) for x in v]
+            if isinstance(v, tuple):
+                return tuple(detach(x) for x in v)
+            return v
+        self.cache = copy.copy(cache)
+        self.cache.layers = []
+        for layer in cache.layers:
+            new = copy.copy(layer)
+            for name, v in vars(layer).items():
+                setattr(new, name, detach(v))
+            self.cache.layers.append(new)
+
+    def accumulate(self):
+        """After each suffix backward (no GPU sync)."""
+        import torch
+        if self._finished:
+            raise RuntimeError("prefix gradients already consumed; build a new accumulator")
+        for i, (_, leaf) in enumerate(self._pairs):
+            if leaf.grad is not None:
+                if self._sums[i] is None:   # bf16/fp16 grads accumulate in fp32 (fp64 stays fp64 for the CPU equivalence test)
+                    self._sums[i] = leaf.grad.detach().to(torch.float64 if leaf.dtype == torch.float64 else torch.float32)
+                else:
+                    self._sums[i].add_(leaf.grad.detach())
+                leaf.grad = None
+
+    def backward(self):
+        """Once per step: the accumulated cache gradients through the prefix graph."""
+        import torch
+        self.accumulate()
+        outs, grads = [], []
+        for (orig, _), g in zip(self._pairs, self._sums):
+            if g is not None:
+                outs.append(orig); grads.append(g.to(orig.dtype))
+        if outs:
+            torch.autograd.backward(outs, grads)
+        self._finished = True
+        self.cache = None
+        self._pairs.clear(); self._sums.clear()
+
+
+class PrefixRunner:
+    """--prefix-cache for one actor: ``run_prefix`` = the batch-1 forward over prompt_ids[:marker] (use_cache=True; grad iff
+    enabled by the caller) -> cache; ``suffix_logits`` = the micro-batch forward of [marker]+response (+ right pad) on a
+    batch-expanded COPY of that cache -> logits [B, S, V] for all S suffix positions (position s predicts response token s;
+    the last one is discarded by the caller exactly like the full-sequence path's logits_to_keep=Tc+1 [:, :-1])."""
+
+    def __init__(self, actor, prompt_ids, marker, device):
+        import torch
+        pc = _prefix_cache_module()
+        pc.check_transformers()          # stock transformers: in-place cache writes break autograd, no GDN batch expansion
+        self._expand = pc.expand_cache_copy
+        assert 0 < marker == len(prompt_ids) - 1, "the marker must be the LAST prompt token (suffix prompt == [marker])"
+        self.actor, self.device, self.P = actor, device, int(marker)
+        self._prefix = torch.tensor(list(prompt_ids[:marker]), dtype=torch.long, device=device)[None]
+
+    def run_prefix(self, autocast_cm=None):
+        with (autocast_cm if autocast_cm is not None else contextlib.nullcontext()):
+            out = self.actor(input_ids=self._prefix, use_cache=True, logits_to_keep=1)
+        assert out.past_key_values is not None, "prefix forward returned no cache"
+        return out.past_key_values
+
+    def suffix_logits(self, cache, ids_suf, attn_suf):
+        """ids_suf / attn_suf: [B, S] on device (S = 1 + Tc: marker, response, right pad). Caller holds the autocast +
+        injection-hook contexts. The expanded cache copy dies here (its post-suffix states are useless for training)."""
+        import torch
+        B, S = ids_suf.shape
+        cache_b = self._expand(cache, B)
+        full_mask = torch.cat([torch.ones((B, self.P), dtype=attn_suf.dtype, device=self.device), attn_suf], 1)
+        pos = torch.arange(self.P, self.P + S, device=self.device)[None].expand(B, -1)
+        out = self.actor(input_ids=ids_suf, attention_mask=full_mask, position_ids=pos, past_key_values=cache_b, use_cache=True)
+        out.past_key_values = None
+        del cache_b
+        return out.logits
+
+
+def score_bucketed(R, texts, dirs_rep, actor, tok, device, a, lens, with_fluency=False):
+    """--score-length-bucket: rl.py score() cuts --score-batch batches in arrival order and pads each to its
+    longest text; calling it on the rollouts sorted by response length makes every batch nearly pad-free. Pure reorder --
+    every row is scored standalone (sink + response on the clean base) and SCORE_STATS only holds order-invariant
+    aggregates -- so the rewards equal the unsorted call up to bf16 kernel noise."""
+    import torch
+    order = torch.argsort(torch.as_tensor(lens, dtype=torch.long), stable=True)
+    inv = torch.empty_like(order); inv[order] = torch.arange(len(order))
+    out = R.score([texts[i] for i in order.tolist()], dirs_rep[order.to(dirs_rep.device)], actor, tok, device, a,
+                  with_fluency=with_fluency)
+    return tuple(t[inv] for t in out) if with_fluency else out[inv]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1127,13 +1277,16 @@ def _chunked_logp(logits, targets, vocab_chunk, need_entropy_grad):
     return torch.cat(lp_chunks, 1), torch.cat(ent_chunks, 1)
 
 
-def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=None):
+def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=None, pfx=None):
     """rl.py update() with: vLLM sampler logprobs as old_lp (ratio := 1 where the sampler logp is unknown, i.e.
     the re-appended stop token), logits only for the completion positions (logits_to_keep), fp32 vocab math
     in chunks, use_cache off, exact weighted grad sync. Returns rl.py's stats + sampler_abs_dlogp.
     ScaleRL variant: a.loss (ppo | cispo), a.loss_agg (token | seq | prompt) and keep (effective-batch mask from the
     zero-variance filter, None = everything) go through pg_token_loss() / loss_weights(); the legacy flags reproduce the
-    original arithmetic bit for bit."""
+    original arithmetic bit for bit.
+    pfx (--prefix-cache, a PrefixRunner): the shared prompt prefix runs once per pass and only [marker]+response per rollout
+    (suffix logits [:, :-1] == the full path's logits_to_keep=Tc+1 [:, :-1]); loss weights, denominators, IS weights and the
+    micro-batch composition are untouched -- only how the logits are computed changes."""
     import torch
     import torch.distributed as dist
     import rl_hf as R
@@ -1145,6 +1298,7 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     w_all, sync_w = loss_weights(gen_mask, a.loss_agg, a.group_size, keep)
     lo, hi = 1 - a.clip_eps, 1 + a.clip_eps
     trunc_cap = a.cispo_eps_max if a.loss == "cispo" else a.tis_cap
+    inj_pos = 0 if pfx is not None else marker            # prefix-cache: the marker is suffix index 0
     t_ref = time.time()
     # micro-batches of LENGTH-SORTED rollouts, each padded only to ITS longest sequence: the loss weights are
     # per-sequence and independent of batching, so this is exactly the same gradient as global padding while
@@ -1158,24 +1312,33 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
             # pad to a multiple of 16 completion tokens (right padding is masked -> numerically inert; fewer distinct
             # shapes -> far fewer fla Triton autotune stalls in the first steps)
             yield ix, p_len + min(T, -(-int(lens[ix].max()) // 16) * 16)
+
+    def policy_logits(ix, Lc, cache=None):
+        """[len(ix), Tc, V]: logits predicting completion tokens 0..Tc-1 (Tc = Lc - p_len), full-sequence or prefix-cached."""
+        if pfx is not None:
+            return pfx.suffix_logits(cache, ids[ix, marker:Lc].to(device), attn[ix, marker:Lc].to(device))[:, :-1]
+        return actor(input_ids=ids[ix, :Lc].to(device), attention_mask=attn[ix, :Lc].to(device), use_cache=False,
+                     logits_to_keep=Lc - p_len + 1).logits[:, :-1]
     ref_lp_all = None
     if a.kl_coef > 0:
         ref_lp_all = torch.zeros_like(old_lp)
         actor.set_adapter("ref")
         try:
             with torch.no_grad():
+                cache_ref = pfx.run_prefix() if pfx is not None else None      # ref adapter's prefix, no grad
                 for ix, Lc in chunks(a.ref_micro_batch):
                     Tc = Lc - p_len
-                    b_ids, b_attn = ids[ix, :Lc].to(device), attn[ix, :Lc].to(device)
-                    hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[marker]] * len(ix),
+                    tgt = ids[ix, p_len:Lc].to(device)
+                    hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[inj_pos]] * len(ix),
                                               STEER_COEFF, device, torch.bfloat16)
                     with R.hooked(submodule, hook):
-                        lg = actor(input_ids=b_ids, attention_mask=b_attn, use_cache=False, logits_to_keep=Tc + 1).logits[:, :-1]
+                        lg = policy_logits(ix, Lc, cache_ref)
                     for c0 in range(0, Tc, a.vocab_chunk):
                         c1 = min(c0 + a.vocab_chunk, Tc)
                         ref_lp_all[ix, c0:c1] = torch.log_softmax(lg[:, c0:c1].float(), -1).gather(
-                            -1, b_ids[:, p_len + c0 : p_len + c1, None]).squeeze(-1).cpu()
+                            -1, tgt[:, c0:c1, None]).squeeze(-1).cpu()
                     del lg
+                del cache_ref
         finally:
             actor.set_adapter("default")
     t_ref = time.time() - t_ref
@@ -1183,17 +1346,24 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     loss_sum, clipped_tok, ent_sum, kl_sum, ratio_sum, dlp_sum, dlp_n = 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0
     isw_sum, trunc_tok = 0.0, 0
     t_fb = time.time()
+    acc = None
+    body_tok = 0                 # tokens actually run through the transformer body this pass (prompt/prefix + response + pad)
+    if pfx is not None:   # ONE differentiable prefix forward for the whole step; its backward runs once after the micro-batches
+        with _policy_precision(actor, a.autocast_bf16):
+            acc = _PrefixGradAccumulator(pfx.run_prefix())
+        body_tok += pfx.P
     for ix, Lc in chunks(mb):
         Tc = Lc - p_len
-        b_ids, b_attn = ids[ix, :Lc].to(device), attn[ix, :Lc].to(device)
+        body_tok += len(ix) * ((Lc - marker) if pfx is not None else Lc)
+        tgt = ids[ix, p_len:Lc].to(device)
         m = gen_mask[ix, :Tc].to(device); w = w_all[ix, :Tc].to(device); A = adv[ix, None].to(device)
         olp = old_lp[ix, :Tc].to(device); kn = known[ix, :Tc].to(device)
-        hook = _hook_outside_autocast(R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[marker]] * len(ix), STEER_COEFF, device, torch.bfloat16),
+        hook = _hook_outside_autocast(R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[inj_pos]] * len(ix), STEER_COEFF, device, torch.bfloat16),
                                       a.autocast_bf16)
         with R.hooked(submodule, hook):
             with _policy_precision(actor, a.autocast_bf16):   # --autocast-bf16: bf16 LoRA matmuls/activations; fp32 vocab math below is outside
-                logits = actor(input_ids=b_ids, attention_mask=b_attn, use_cache=False, logits_to_keep=Tc + 1).logits[:, :-1]
-            new_lp, ent = _chunked_logp(logits, b_ids[:, p_len:], a.vocab_chunk, a.entropy_coef > 0)
+                logits = policy_logits(ix, Lc, acc.cache if acc is not None else None)
+            new_lp, ent = _chunked_logp(logits, tgt, a.vocab_chunk, a.entropy_coef > 0)
             del logits
             olp_eff = torch.where(kn, olp, new_lp.detach())
             loss_tok, ratio, rho = pg_token_loss(new_lp, olp_eff, A, a.loss, a.clip_eps, a.tis_cap, a.cispo_eps_max)
@@ -1208,6 +1378,8 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
                 loss = loss + a.kl_coef * (kl * w).sum()
                 kl_sum += float((kl.detach() * m).sum())
             loss.backward()
+        if acc is not None:
+            acc.accumulate()
         loss_sum += loss.item()
         clipped_tok += int((((ratio < lo) | (ratio > hi)) & m).sum())
         ratio_sum += float((ratio.detach() * m).sum())
@@ -1217,6 +1389,8 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         mk = m & kn
         dlp_sum += float(((new_lp.detach() - olp).abs() * mk).sum()); dlp_n += int(mk.sum())
         del new_lp, ent, ratio, loss, olp_eff, loss_tok, rho, eff
+    if acc is not None:
+        acc.backward()               # the summed cache gradients through the shared prefix forward, once
     t_fb = time.time() - t_fb
     params = [p for p in actor.parameters() if p.requires_grad]
     t_sync = time.time()
@@ -1235,15 +1409,45 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         else:
             opt.zero_grad(set_to_none=True); skipped = 1
             print(f"[update] non-finite grad norm ({gn}) -- skipping step", flush=True)
+    # padding accounting: completion positions the policy micro-batches ran vs real completion tokens (the pad-to-16 rule +
+    # length spread inside a micro-batch), and body tokens per rollout (what the transformer actually processed)
+    comp_pos = sum(len(ix) * (Lc - p_len) for ix, Lc in chunks(mb))
     return {"loss": loss_sum, "grad_norm": gn, "clipfrac": clipped_tok / total_tok, "entropy": ent_sum / total_tok,
             "kl": kl_sum / total_tok, "ratio_mean": ratio_sum / total_tok, "sampler_abs_dlogp": dlp_sum / max(dlp_n, 1),
             "t_ref": t_ref, "t_fb": t_fb, "t_sync": t_sync, "n_unknown_lp": int((gen_mask & ~known).sum()),
-            "is_weight_mean": isw_sum / total_tok, "is_trunc_frac": trunc_tok / total_tok, "sync_w": sync_w, "skipped": skipped}
+            "is_weight_mean": isw_sum / total_tok, "is_trunc_frac": trunc_tok / total_tok, "sync_w": sync_w, "skipped": skipped,
+            "pad_frac": 1.0 - int(gen_mask.sum()) / max(comp_pos, 1), "body_tok_per_rollout": body_tok / max(n, 1),
+            "real_tok_per_rollout": (int(gen_mask.sum()) + (1 if pfx is not None else p_len) * n) / max(n, 1)}
 
 
-def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag):
+def _make_prefix_runner(actor, prompt_ids, marker, device, a, tag):
+    """--prefix-cache -> PrefixRunner (after the actor + adapters exist), else None. Refuses stock transformers loudly."""
+    if not getattr(a, "prefix_cache", False):
+        return None
+    import transformers
+    pfx = PrefixRunner(actor, prompt_ids, marker, device)
+    _log(tag, f"prefix cache ON: shared prefix {pfx.P} tokens run once per pass, [marker]+response per rollout "
+              f"(transformers {transformers.__version__} fork at {os.path.dirname(transformers.__file__)})")
+    return pfx
+
+
+_MB_CANDIDATES_DEFAULT = "64,48,40,32,24,16,12,8,6,4"
+
+
+def _mb_candidates(a):
+    """--mb-candidates; with --prefix-cache and the untouched default the probe also tries 128/96 (the suffix-only
+    activations are ~3x smaller per rollout, so the old 64 cap is far below what fits)."""
+    cands = [int(x) for x in a.mb_candidates.split(",")]
+    if getattr(a, "prefix_cache", False) and a.mb_candidates == _MB_CANDIDATES_DEFAULT:
+        cands = [128, 96] + cands
+    return cands
+
+
+def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx=None):
     """Largest micro-batch whose forward+backward at MAX length (prompt + max_new_tokens) fits with <90% of the GPU
-    allocated. Synthetic tokens; same hook, same chunked vocab math as update_disagg.
+    allocated. Synthetic tokens; same hook, same chunked vocab math as update_disagg. pfx (--prefix-cache): the probe
+    runs the prefix-cached suffix path (prefix fwd + expanded cache + [marker]+max_new_tokens suffix + prefix bwd), i.e.
+    exactly the per-micro-batch memory shape of the real update.
 
     Strategy (Sep 3): measure mb=1 and mb=2 (always fit), fit peak ~= fixed + mb * per_seq, predict the largest candidate
     under 85% of the GPU and VERIFY it (<90%); only on a failed verification step down. The old descending scan started at
@@ -1273,15 +1477,25 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
             ids[:, :p_len] = torch.tensor(prompt_ids, device=device)
             attn = torch.ones_like(ids)
             dirs = F.normalize(torch.randn(mb, D_MODEL, device=device), dim=-1)
-            hook = _hook_outside_autocast(R.make_inject_hook([dirs[i : i + 1] for i in range(mb)], [[marker]] * mb, STEER_COEFF, device, torch.bfloat16),
-                                          getattr(a, "autocast_bf16", False))
+            ac = getattr(a, "autocast_bf16", False)
+            hook = _hook_outside_autocast(R.make_inject_hook([dirs[i : i + 1] for i in range(mb)], [[0 if pfx is not None else marker]] * mb,
+                                                             STEER_COEFF, device, torch.bfloat16), ac)
+            acc = None
+            if pfx is not None:
+                with _policy_precision(actor, ac):
+                    acc = _PrefixGradAccumulator(pfx.run_prefix())
             with R.hooked(submodule, hook):
-                with _policy_precision(actor, getattr(a, "autocast_bf16", False)):
-                    logits = actor(input_ids=ids, attention_mask=attn, use_cache=False, logits_to_keep=L - p_len + 1).logits[:, :-1]
+                with _policy_precision(actor, ac):
+                    if pfx is not None:
+                        logits = pfx.suffix_logits(acc.cache, ids[:, marker:], attn[:, marker:])[:, :-1]
+                    else:
+                        logits = actor(input_ids=ids, attention_mask=attn, use_cache=False, logits_to_keep=L - p_len + 1).logits[:, :-1]
                 new_lp, ent = _chunked_logp(logits, ids[:, p_len:], a.vocab_chunk, False)
                 del logits
                 loss = new_lp.mean() * 0.0
                 loss.backward()
+            if acc is not None:
+                acc.backward()
             torch.cuda.synchronize()
             peak = torch.cuda.max_memory_allocated()
             ok = peak < 0.90 * total
@@ -1603,6 +1817,7 @@ def run_trainer(a):
         actor.set_adapter("default")
     n_train = sum(p.numel() for p in actor.parameters() if p.requires_grad)
     _log(tag, f"actor ready in {time.time() - t0:.0f}s | trainable {n_train / 1e6:.0f}M | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB")
+    pfx = _make_prefix_runner(actor, prompt_ids, marker, device, a, tag)
 
     # publish the init policy FIRST so the rollout ranks start generating while we tune the micro-batch
     if is_main:
@@ -1614,15 +1829,16 @@ def run_trainer(a):
     mb = a.micro_batch
     mb_res = {}
     if mb <= 0:
-        cands = [int(x) for x in a.mb_candidates.split(",")]
-        mb, mb_res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag)
+        cands = _mb_candidates(a)
+        mb, mb_res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx=pfx)
         assert mb is not None, f"no micro-batch candidate fits: {mb_res}"
         if world > 1:
             t = torch.tensor([mb], dtype=torch.int64, device=device if a.backend == "nccl" else "cpu")
             dist.all_reduce(t, op=dist.ReduceOp.MIN)
             mb = int(t.item())
     _peak = (mb_res.get(mb) or {}).get("peak_gb")
-    _log(tag, f"micro-batch = {mb} (no gradient checkpointing; autocast bf16 policy forward {'ON' if a.autocast_bf16 else 'off'}"
+    _log(tag, f"micro-batch = {mb} (no gradient checkpointing; autocast bf16 policy forward {'ON' if a.autocast_bf16 else 'off'}; "
+              f"prefix cache {'ON' if pfx is not None else 'off'}; score length-bucket {'ON' if a.score_length_bucket else 'off'}"
               + (f"; probe peak {_peak:.1f} GB" if _peak else "") + ")")
     # ---- inline eval assets (held-out sets + SAE on every trainer rank; extra-eval testbed/judge) — after the
     # micro-batch search so the SAE's 2.7 GB is not part of the OOM probe ----
@@ -1758,9 +1974,15 @@ def run_trainer(a):
         texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
         dirs_rep = dirs.repeat_interleave(G, 0).to(device)
 
-        # ---- reward + shaping (identical to rl.py main) ----
+        # ---- reward + shaping (identical to rl.py main; --score-length-bucket = the same score() on length-sorted rows) ----
         t_sc = time.time()
-        if use_gates:
+        if a.score_length_bucket:
+            _lens = [len(g) for g in gen_ids]
+            if use_gates:
+                r, flu, dis = score_bucketed(R, texts, dirs_rep, actor, tok, device, a, _lens, with_fluency=True)
+            else:
+                r = score_bucketed(R, texts, dirs_rep, actor, tok, device, a, _lens)
+        elif use_gates:
             r, flu, dis = R.score(texts, dirs_rep, actor, tok, device, a, with_fluency=True)
         else:
             r = R.score(texts, dirs_rep, actor, tok, device, a)
@@ -1825,7 +2047,7 @@ def run_trainer(a):
             for _g in opt.param_groups:
                 _g["lr"] = lr_now
 
-        stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=keep)
+        stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=keep, pfx=pfx)
         if a.entropy_target > 0:   # SAC-style temperature adaptation on the measured per-token entropy of this step
             a.entropy_coef = float(min(a.entropy_coef_max, max(a.entropy_coef_min,
                                    a.entropy_coef * math.exp(a.entropy_adapt_rate * (a.entropy_target - stats["entropy"])))))
@@ -1881,6 +2103,8 @@ def run_trainer(a):
                "time/ref_pass_s": stats["t_ref"], "time/fwd_bwd_s": stats["t_fb"], "time/grad_sync_s": stats["t_sync"],
                "time/publish_s": t_pub, "time/rollout_s": gen_s,
                "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, "micro_batch": mb,
+               "trainer/pad_frac": stats["pad_frac"], "trainer/body_tokens_per_rollout": stats["body_tok_per_rollout"],
+               "trainer/real_tokens_per_rollout": stats["real_tok_per_rollout"],
                # ScaleRL diagnostics (present in every run; zero/inert when the variant flags are off)
                "scalerl/is_weight_mean": stats["is_weight_mean"], "scalerl/is_trunc_frac": stats["is_trunc_frac"],
                "scalerl/zero_var_dropped_frac": float(loc[10] / n_groups_all), "scalerl/effective_groups": float(n_groups_all - loc[10]),
@@ -1998,10 +2222,12 @@ def run_bench_trainer(a):
         actor.load_adapter(a.ref_adapter or a.init_adapter, adapter_name="ref"); actor.set_adapter("default")
     resident = torch.cuda.memory_allocated() / 2**30
     _log(tag, f"actor in {time.time() - t0:.0f}s | resident {resident:.1f} GB | fla {fla_v} | world {world} {a.backend}")
-    out = {"fla": fla_v, "resident_gb": resident, "gpu": torch.cuda.get_device_name(0), "world": world, "backend": a.backend}
+    pfx = _make_prefix_runner(actor, prompt_ids, marker, device, a, tag)
+    out = {"fla": fla_v, "resident_gb": resident, "gpu": torch.cuda.get_device_name(0), "world": world, "backend": a.backend,
+           "prefix_cache": pfx is not None, "score_length_bucket": bool(a.score_length_bucket)}
     mb = a.micro_batch
     if mb <= 0:
-        mb, res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, [int(x) for x in a.mb_candidates.split(",")], tag)
+        mb, res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, _mb_candidates(a), tag, pfx=pfx)
         out["mb_search"] = res
         if world > 1:
             t = torch.tensor([mb], dtype=torch.int64, device=device if a.backend == "nccl" else "cpu")
@@ -2024,7 +2250,10 @@ def run_bench_trainer(a):
         dirs = F.normalize(torch.randn(Bl, D_MODEL), dim=-1)
         dirs_rep = dirs.repeat_interleave(G, 0).to(device)
         torch.cuda.synchronize(); t_s = time.time()
-        r = R.score(texts, dirs_rep, actor, tok, device, a)
+        if a.score_length_bucket:
+            r = score_bucketed(R, texts, dirs_rep, actor, tok, device, a, [len(g) for g in gen_ids])
+        else:
+            r = R.score(texts, dirs_rep, actor, tok, device, a)
         torch.cuda.synchronize(); t_s = time.time() - t_s
         adv = R.compute_advantages(r, Bl, G, "group")
         L = p_len + max(len(g) for g in gen_ids)
@@ -2034,7 +2263,7 @@ def run_bench_trainer(a):
             ids[i, :p_len] = prompt.cpu(); ids[i, p_len : p_len + len(g)] = torch.tensor(g); attn[i, : p_len + len(g)] = 1
             old_lp[i, : len(g)] = -2.5; known[i, : len(g)] = True
         torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); t_u = time.time()
-        st = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb)
+        st = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, pfx=pfx)
         torch.cuda.synchronize(); t_u = time.time() - t_u
         row = {"rollouts_per_rank": Bl * G, "score_s": t_s, "update_s": t_u, "ref_s": st["t_ref"], "fwd_bwd_s": st["t_fb"], "sync_s": st["t_sync"],
                "peak_gb": torch.cuda.max_memory_allocated() / 2**30, "len_mean": float(lens.mean()), "L": L}
