@@ -32,7 +32,7 @@ def _records(bank):
     return recs, n
 
 
-@app.function(image=image, cpu=16, memory=196_608, ephemeral_disk=256 * 1024, volumes={"/data": vol}, timeout=4 * 3600)
+@app.function(image=image, cpu=16, memory=196_608, ephemeral_disk=512 * 1024, volumes={"/data": vol}, timeout=4 * 3600)
 def build(out_name: str = "mix_eq_1p45m", n_per_family: int = 241_741, seed: int = 2028, overwrite: bool = False):
     import time
     import numpy as np
