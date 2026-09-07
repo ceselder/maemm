@@ -215,13 +215,80 @@ def _preflight(run_name: str, data_dir: str, n_ckpts: int, resume_from: str, dis
         raise RuntimeError(f"not enough local disk to stage the bank(s): need {need_gb:.0f} GiB (incl. margin) but the cap is "
                            f"{cap_gb:.0f} GiB -- redeploy with SFT_DISK_GB={int(math.ceil(need_gb / 100.0)) * 100 + 200} or larger")
     t_all = time.time()
-    for d, local in local_of.items():
-        t0 = time.time()
-        if not os.path.exists(local):
-            shutil.copytree(d, local)
-        print(f"[modal] bank part staged: {d} -> {local} ({size_of[d] / 2**30:.1f} GiB, {time.time() - t0:.0f}s)", flush=True)
+    _stage_parallel(local_of, size_of)
     print(f"[modal] bank staged to {','.join(staged)} ({len(staged)} part(s), {total_gb:.1f} GiB, {time.time() - t_all:.0f}s)", flush=True)
     return save_dir, ",".join(staged), D_MODEL
+
+
+def _copy_range(src: str, dst: str, start: int, end: int, chunk: int = 64 * 2**20, progress=None):
+    """Copy bytes [start, end) of src into the SAME offsets of a pre-sized dst (pread/pwrite; parallel-safe)."""
+    fi = os.open(src, os.O_RDONLY); fo = os.open(dst, os.O_WRONLY)
+    try:
+        pos = start
+        while pos < end:
+            b = os.pread(fi, min(chunk, end - pos), pos)
+            if not b:
+                raise IOError(f"short read at {pos} of {src}")
+            os.pwrite(fo, b, pos); pos += len(b)
+            if progress is not None:
+                progress[0] += len(b)
+    finally:
+        os.close(fi); os.close(fo)
+
+
+def _stage_parallel(local_of: dict, size_of: dict, streams_per_big_file: int = 4, big_file_bytes: int = 4 * 2**30,
+                    stall_mib_s: float = 60.0, stall_minutes: float = 5.0):
+    """Stage every part with MANY parallel streams: one worker per small file, `streams_per_big_file` byte-range workers per
+    file > big_file_bytes (vecs.f16 is 85-512 GiB). Modal's volume read path throttles a single long-running stream to ~20 MiB/s
+    after a burst (measured Sep 7: 1.2 GB/s -> 19 MiB/s), while fresh streams read at 400-700 MiB/s, so parallel ranges
+    multiply throughput. A monitor prints the aggregate rate every 60 s and raises if it stays below `stall_mib_s` for
+    `stall_minutes` (after a 3-min grace) so a throttled leg fails fast and gets respawned instead of crawling for hours."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    jobs = []  # (fn, args)
+    progress = [0]; total = 0
+    for d, local in local_of.items():
+        if os.path.exists(local) and os.path.exists(f"{local}/.staged"):
+            print(f"[modal] bank part already staged: {local}", flush=True); continue
+        os.makedirs(local, exist_ok=True)
+        for root, _, files in os.walk(d):
+            rel = os.path.relpath(root, d); os.makedirs(os.path.join(local, rel), exist_ok=True)
+            for fn in files:
+                src = os.path.join(root, fn); dst = os.path.join(local, rel, fn); n = os.path.getsize(src); total += n
+                with open(dst, "wb") as f:
+                    if n:
+                        f.truncate(n)
+                if n > big_file_bytes:
+                    step = -(-n // streams_per_big_file)
+                    for k in range(streams_per_big_file):
+                        a, b = k * step, min(n, (k + 1) * step)
+                        if a < b:
+                            jobs.append((_copy_range, (src, dst, a, b, 64 * 2**20, progress)))
+                else:
+                    jobs.append((_copy_range, (src, dst, 0, n, 64 * 2**20, progress)))
+    if not jobs:
+        return
+    print(f"[modal] parallel staging: {len(jobs)} streams over {len(local_of)} part(s), {total / 2**30:.1f} GiB", flush=True)
+    stop = threading.Event(); t0 = time.time(); hist = []
+
+    def monitor():
+        last = 0
+        while not stop.wait(60):
+            now = progress[0]; rate = (now - last) / 60 / 2**20; last = now; hist.append(rate)
+            print(f"[modal] staging {now / 2**30:.0f}/{total / 2**30:.0f} GiB ({100 * now / max(total, 1):.0f}%) at {rate:.0f} MiB/s "
+                  f"(avg {now / 2**20 / max(time.time() - t0, 1):.0f} MiB/s, {(time.time() - t0) / 60:.0f} min)", flush=True)
+            if len(hist) >= 3 + stall_minutes and all(r < stall_mib_s for r in hist[-int(stall_minutes):]):
+                print(f"[modal] STAGING THROTTLED: < {stall_mib_s} MiB/s for {stall_minutes:.0f} min -- aborting this leg (respawn lands on a fresh host)", flush=True)
+                os._exit(75)
+    th = threading.Thread(target=monitor, daemon=True); th.start()
+    with ThreadPoolExecutor(max_workers=min(16, len(jobs))) as ex:
+        futs = [ex.submit(fn, *args) for fn, args in jobs]
+        for f in as_completed(futs):
+            f.result()
+    stop.set()
+    for local in local_of.values():
+        open(f"{local}/.staged", "w").close()
+    print(f"[modal] parallel staging done: {progress[0] / 2**30:.1f} GiB in {time.time() - t0:.0f}s ({progress[0] / 2**20 / max(time.time() - t0, 1):.0f} MiB/s)", flush=True)
 
 
 def _train_env(backend: str):
