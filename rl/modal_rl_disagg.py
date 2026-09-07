@@ -39,13 +39,15 @@ GPU = os.environ.get("DISAGG_GPU", "B200:4")
 #   DISAGG_TRANSFORMERS="transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
 PREFIX_CACHE_TRANSFORMERS = "transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
 _TRANSFORMERS = os.environ.get("DISAGG_TRANSFORMERS", "transformers==5.15.0")
-image = modal.Image.debian_slim(python_version="3.12")
-if "git+" in _TRANSFORMERS:
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("torch==2.10.0", index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("vllm==0.19.0", "vllm-lens==1.1.0")
+)
+if "git+" in _TRANSFORMERS:   # AFTER the torch/vllm layers so the fork build reuses the production image's cached layers
     image = image.apt_install("git")
 image = (
     image
-    .pip_install("torch==2.10.0", index_url="https://download.pytorch.org/whl/cu128")
-    .pip_install("vllm==0.19.0", "vllm-lens==1.1.0")
     .pip_install(
         _TRANSFORMERS,
         "peft==0.20.0",
