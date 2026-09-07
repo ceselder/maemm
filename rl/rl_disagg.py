@@ -74,6 +74,16 @@ Trainer speed knobs (opt-in, defaults = the behaviour above; exact up to bf16 ke
                         The update's micro-batches have always been length-sorted (update_disagg chunks()); trainer/pad_frac and
                         trainer/body_tokens_per_rollout log the residual padding / the tokens actually run per rollout.
 
+--policy-base <dir|hub id>  (default MODEL = byte-identical to before): the POLICY lives on another base -- a FULL fine-tuned
+                      checkpoint in sft/fullft.py layout (SAVE_DONE required) -- while the REWARD stays the ORIGINAL base.
+                      Rollout engines serve <policy-base> (+ the LoRA slots), the trainer builds/continues the LoRA on
+                      <policy-base> (--init-adapter may be omitted = fresh rsLoRA r64/a16; `--init-adapter none` unsets the
+                      launcher default), and every trainer rank loads a SECOND, frozen copy of MODEL for rl.py score() /
+                      the inline-eval scorers (with the gates off it keeps only layers [0, READ_LAYER]: read_resid stops
+                      there; --scorer-layers). --kl-coef without any ref/init adapter anchors to <policy-base> itself (LoRA
+                      disabled). Checkpoints are PEFT adapters as before + run_meta.json ({"policy_base": ...}) next to
+                      them, which eval/eval_ckpt_daemon.py reads to rebuild policy = base + adapter, scorer = MODEL.
+
 Launch inside the container (see modal_rl_disagg.py):
     python RL/rl_disagg.py --role launch --n-rollout 1 --n-trainer 3 --data-dir <pool> --init-adapter <sft> ...
 """
@@ -115,6 +125,15 @@ def parse_args(argv=None):
     ap.add_argument("--n-eval-dirs", type=int, default=64)
     ap.add_argument("--init-adapter", default=None)
     ap.add_argument("--ref-adapter", default=None)
+    ap.add_argument("--policy-base", default=None,
+                    help="HF model the POLICY is built on (the vLLM rollout engines serve it, the trainer puts the LoRA on it): a FULL "
+                         "fine-tuned checkpoint dir in sft/fullft.py layout (must carry SAVE_DONE) or a hub id. Default = mxf.config.MODEL "
+                         "(the original base; byte-identical to before). The REWARD scorer always stays MODEL: with another policy base "
+                         "every trainer rank loads a second, frozen copy of MODEL for scoring (--scorer-layers). 'none' = default.")
+    ap.add_argument("--scorer-layers", type=int, default=0,
+                    help="--policy-base != MODEL only: decoder layers kept in the frozen scorer copy of MODEL (the reward reads layer "
+                         "READ_LAYER=42 and read_resid stops there, so layers 43+ and lm_head never run). 0 = auto: READ_LAYER+1 when the "
+                         "fluency/distinct gates are off (~-18 GB per trainer rank), the full model otherwise; -1 = always the full model")
     ap.add_argument("--step-offset", type=int, default=0)
     ap.add_argument("--wandb-id", default=None)
     ap.add_argument("--save-dir", default="checkpoints/rl_disagg")
@@ -278,6 +297,9 @@ def parse_args(argv=None):
                          "such flag: update_disagg has always length-sorted its micro-batches (chunks(); trainer/pad_frac logs the "
                          "residual padding).")
     a = ap.parse_args(argv)
+    for k in ("init_adapter", "ref_adapter", "policy_base"):   # launcher lists can only APPEND flags: `--init-adapter none` unsets an earlier one
+        if getattr(a, k) in ("", "none", "None"):
+            setattr(a, k, None)
     assert a.div_coef == 0 and a.firsttok_coef == 0
     assert not (a.std_norm and a.batch_norm)
     assert a.temperature == 1.0, "T must be 1.0: the sampler's logprobs are the behaviour policy"
@@ -369,6 +391,164 @@ def _bank_open(a):
                 i += 1
         eval_rows = i
     return bank, n_vecs, eval_rows
+
+
+# ----------------------------------------------------------------------------------------------
+# --policy-base: the policy on a different (full fine-tuned) base than the reward scorer. Pure parts unit-tested on CPU in
+# rl/test_rl_disagg_policy_base.py.
+# ----------------------------------------------------------------------------------------------
+def policy_base_of(a):
+    """The HF model the policy (rollout engines + trainer LoRA) is built on: MODEL unless --policy-base is given."""
+    from mxf.config import MODEL
+    return getattr(a, "policy_base", None) or MODEL
+
+
+def policy_base_is_model(a):
+    from mxf.config import MODEL
+    return policy_base_of(a) == MODEL
+
+
+def check_policy_base(a):
+    """A local --policy-base must be a COMPLETE sft/fullft.py checkpoint (SAVE_DONE is written last, after the rename). Returns the path."""
+    pb = policy_base_of(a)
+    if os.path.isdir(pb):
+        assert os.path.exists(f"{pb}/config.json"), f"--policy-base {pb}: no config.json"
+        assert os.path.exists(f"{pb}/SAVE_DONE"), f"--policy-base {pb}: no SAVE_DONE -- incomplete full-FT checkpoint (fullft.py writes it last)"
+    return pb
+
+
+class BaseActor:
+    """A plain HF model with the PEFT-actor surface the SCORING code touches (rl.py score(), eval_universal._reencode,
+    inline_extra_evals._profiles, rl._marker_norm(adapter=False)): disable_adapter() is a no-op context (it IS the clean base),
+    get_base_model() returns the model, forward/generate/eval pass through. Used wherever the clean ORIGINAL base is held next
+    to a policy built on another base (--policy-base trainer scorer; eval_ckpt_daemon --full-model / --policy-base)."""
+
+    def __init__(self, base):
+        self.base = base
+
+    def __call__(self, *args, **kw):
+        return self.base(*args, **kw)
+
+    def forward(self, *args, **kw):
+        return self.base(*args, **kw)
+
+    def generate(self, *args, **kw):
+        return self.base.generate(*args, **kw)
+
+    def get_base_model(self):
+        return self.base
+
+    def disable_adapter(self):
+        return contextlib.nullcontext()
+
+    def eval(self):
+        self.base.eval(); return self
+
+    def train(self, mode=True):
+        self.base.train(mode); return self
+
+    def parameters(self, *args, **kw):
+        return self.base.parameters(*args, **kw)
+
+    def named_modules(self, *args, **kw):
+        return self.base.named_modules(*args, **kw)
+
+    @property
+    def training(self):
+        return self.base.training
+
+    @property
+    def generation_config(self):
+        return self.base.generation_config
+
+    @property
+    def config(self):
+        return self.base.config
+
+
+def _truncate_scorer(base, n_keep):
+    """Keep decoder layers [0, n_keep) of a CausalLM and replace lm_head by a module that raises. Every scorer read path is
+    mxf.inject.read_resid, whose forward hook on layer READ_LAYER raises _Stop BEFORE layer READ_LAYER+1 runs (the HF forward
+    enumerates self.layers[:num_hidden_layers], so a shorter ModuleList is simply a shorter loop; layer_types[i] is still indexed
+    by the kept i) -> layer-42 states are unchanged to the bit; only logits consumers (the gates) would notice, and they raise.
+    Returns (n_layers_before, head_dropped)."""
+    import torch
+    n_layers = len(base.model.layers)
+    if not (0 < n_keep < n_layers):
+        return n_layers, False
+    base.model.layers = base.model.layers[:n_keep]
+    tied = base.lm_head.weight.data_ptr() == base.model.embed_tokens.weight.data_ptr()
+    if not tied:
+        class _NoHead(torch.nn.Module):
+            def forward(self, *args, **kw):
+                raise RuntimeError("truncated scorer: lm_head unavailable (only the fluency/distinct gates need logits; use --scorer-layers -1)")
+        base.lm_head = _NoHead()
+    return n_layers, not tied
+
+
+def load_scorer(a, actor, device, tag, use_gates):
+    """The REWARD model. --policy-base == MODEL (default): the actor itself -- rl.py score() disables the LoRA, i.e. the clean base,
+    byte-identical to before. Otherwise the policy's own base is a fine-tuned model, so `actor.disable_adapter()` is NOT the
+    original base any more: load a second, frozen bf16 copy of MODEL on this rank's GPU (BaseActor), truncated per --scorer-layers
+    (auto = READ_LAYER+1 layers, lm_head dropped, when the gates are off; the gates need logits -> full model)."""
+    if policy_base_is_model(a):
+        return actor
+    import torch
+    from transformers import AutoModelForCausalLM
+    from mxf.config import MODEL, READ_LAYER
+    n_keep = a.scorer_layers
+    if n_keep == 0:
+        n_keep = -1 if use_gates else READ_LAYER + 1
+    assert n_keep == -1 or n_keep > READ_LAYER, f"--scorer-layers {n_keep} would drop the read layer {READ_LAYER}"
+    assert n_keep == -1 or not use_gates, "the fluency/distinct gates need the scorer's logits: use --scorer-layers -1"
+    t0 = time.time()
+    base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+    base.eval()
+    for p in base.parameters():
+        p.requires_grad_(False)
+    n_layers, head_dropped = _truncate_scorer(base, n_keep)
+    gc.collect(); torch.cuda.empty_cache()
+    _log(tag, f"scorer = frozen ORIGINAL base {MODEL} ({len(base.model.layers)}/{n_layers} layers{', lm_head dropped' if head_dropped else ''}) "
+              f"loaded in {time.time() - t0:.0f}s | resident now {torch.cuda.memory_allocated() / 2**30:.1f} GB | policy base = {policy_base_of(a)}")
+    return BaseActor(base)
+
+
+@contextlib.contextmanager
+def _ref_policy(actor):
+    """The KL reference policy for one pass: the frozen 'ref' adapter when one was loaded (--ref-adapter / --init-adapter; the
+    set_adapter round trip exactly as before), else the policy base with the LoRA disabled (fresh LoRA on --policy-base: the
+    reference IS the base the RL started from)."""
+    if "ref" in (getattr(actor, "peft_config", None) or {}):
+        actor.set_adapter("ref")
+        try:
+            yield
+        finally:
+            actor.set_adapter("default")
+    else:
+        with actor.disable_adapter():
+            yield
+
+
+def write_run_meta(a, path, micro_batch=None, step=None):
+    """run_meta.json next to the checkpoints (the run dir and every step_*/final): how to REBUILD the policy that produced them
+    (the adapter ON WHICH base) and what scored them. eval/eval_ckpt_daemon.py reads `policy_base` from <ckpt_dir>/run_meta.json
+    to serve policy_base + adapter in vLLM while scoring with MODEL."""
+    from mxf.config import INJECT_LAYER, MODEL, READ_LAYER, TrainConfig
+    tr = TrainConfig()
+    ref_src = (a.ref_adapter or a.init_adapter) if a.kl_coef > 0 else None
+    meta = {"format": "rl_disagg_lora_v1", "policy_base": policy_base_of(a), "policy_base_is_model": policy_base_is_model(a),
+            "scorer_base": MODEL, "tokenizer": MODEL, "init_adapter": a.init_adapter, "ref_adapter": ref_src,
+            "kl_ref": "none" if a.kl_coef <= 0 else ("adapter" if ref_src else "policy_base_lora_off"),
+            "lora": ("from init_adapter" if a.init_adapter else
+                     {"r": tr.lora_r, "alpha": tr.lora_alpha, "rslora": True, "target_modules": "all-linear"}),
+            "inject_layer": INJECT_LAYER, "read_layer": READ_LAYER, "run_name": a.run_name, "save_dir": a.save_dir, "seed": a.seed,
+            "micro_batch": micro_batch, "step": step, "argv": sys.argv[1:], "written_at": time.time()}
+    os.makedirs(path, exist_ok=True)
+    tmp = f"{path}/run_meta.json.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(meta, f, indent=1)
+    os.replace(tmp, f"{path}/run_meta.json")
+    return meta
 
 
 # ----------------------------------------------------------------------------------------------
@@ -848,8 +1028,9 @@ def _build_engine(a, rank, p_len, max_seqs, use_graphs, tag):
         from mxf.config import MODEL
         max_len = p_len + a.max_new_tokens + 8
         # engine_model / engine_lora (eval_ckpt_daemon --full-model): serve a FULL fine-tuned checkpoint dir instead of
-        # base+LoRA. Defaults = the base with 2 LoRA slots (live policy + eval ckpt), byte-identical to before.
-        engine_model = getattr(a, "engine_model", None) or MODEL
+        # base+LoRA; --policy-base: that base with the LoRA slots. Defaults = MODEL with 2 LoRA slots (live policy + eval
+        # ckpt), byte-identical to before.
+        engine_model = getattr(a, "engine_model", None) or getattr(a, "policy_base", None) or MODEL
         engine_lora = bool(getattr(a, "engine_lora", True))
         kw = dict(model=engine_model, tensor_parallel_size=1, gpu_memory_utilization=a.vllm_gpu_mem, max_model_len=max_len,
                   attention_backend="TRITON_ATTN", language_model_only=True, enable_prefix_caching=False,
@@ -1055,6 +1236,8 @@ def run_rollout(a):
     Bb = a.rollout_block_groups
 
     # the engine can load while the trainer is still loading the actor; the first block waits for step 0
+    if not policy_base_is_model(a):
+        _log(tag, f"policy base = {check_policy_base(a)} (full-FT checkpoint served by vLLM; tokenizer/prompt/eos from {MODEL})")
     llm = _build_engine(a, rank, p_len, a.max_num_seqs, a.cuda_graphs, tag)
     t_wait = time.time()
     while _read_latest(work) is None:
@@ -1322,25 +1505,21 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     ref_lp_all = None
     if a.kl_coef > 0:
         ref_lp_all = torch.zeros_like(old_lp)
-        actor.set_adapter("ref")
-        try:
-            with torch.no_grad():
-                cache_ref = pfx.run_prefix() if pfx is not None else None      # ref adapter's prefix, no grad
-                for ix, Lc in chunks(a.ref_micro_batch):
-                    Tc = Lc - p_len
-                    tgt = ids[ix, p_len:Lc].to(device)
-                    hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[inj_pos]] * len(ix),
-                                              STEER_COEFF, device, torch.bfloat16)
-                    with R.hooked(submodule, hook):
-                        lg = policy_logits(ix, Lc, cache_ref)
-                    for c0 in range(0, Tc, a.vocab_chunk):
-                        c1 = min(c0 + a.vocab_chunk, Tc)
-                        ref_lp_all[ix, c0:c1] = torch.log_softmax(lg[:, c0:c1].float(), -1).gather(
-                            -1, tgt[:, c0:c1, None]).squeeze(-1).cpu()
-                    del lg
-                del cache_ref
-        finally:
-            actor.set_adapter("default")
+        with _ref_policy(actor), torch.no_grad():   # 'ref' adapter (as before) or, without one, the policy base with the LoRA off
+            cache_ref = pfx.run_prefix() if pfx is not None else None      # ref policy's prefix, no grad
+            for ix, Lc in chunks(a.ref_micro_batch):
+                Tc = Lc - p_len
+                tgt = ids[ix, p_len:Lc].to(device)
+                hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[inj_pos]] * len(ix),
+                                          STEER_COEFF, device, torch.bfloat16)
+                with R.hooked(submodule, hook):
+                    lg = policy_logits(ix, Lc, cache_ref)
+                for c0 in range(0, Tc, a.vocab_chunk):
+                    c1 = min(c0 + a.vocab_chunk, Tc)
+                    ref_lp_all[ix, c0:c1] = torch.log_softmax(lg[:, c0:c1].float(), -1).gather(
+                        -1, tgt[:, c0:c1, None]).squeeze(-1).cpu()
+                del lg
+            del cache_ref
     t_ref = time.time() - t_ref
     opt.zero_grad(set_to_none=True)
     loss_sum, clipped_tok, ent_sum, kl_sum, ratio_sum, dlp_sum, dlp_n = 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0
@@ -1790,12 +1969,14 @@ def run_trainer(a):
     tr = TrainConfig()
 
     t0 = time.time()
-    actor = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+    pb = check_policy_base(a)   # MODEL unless --policy-base (a full-FT checkpoint dir); tokenizer, prompt and eos ids stay MODEL's
+    actor = AutoModelForCausalLM.from_pretrained(pb, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
     if a.init_adapter:
         actor = PeftModel.from_pretrained(actor, a.init_adapter, is_trainable=True)
     else:
         actor = get_peft_model(actor, LoraConfig(r=tr.lora_r, lora_alpha=tr.lora_alpha, lora_dropout=0.0, use_rslora=True,
                                                  target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
+        _log(tag, f"fresh rsLoRA r{tr.lora_r}/a{tr.lora_alpha} all-linear on {pb}")
     actor.train()
     if a.fp32_head:   # before the micro-batch search so its +memory is part of the OOM probe
         install_fp32_head(actor)
@@ -1812,11 +1993,15 @@ def run_trainer(a):
     submodule = get_layer(actor, INJECT_LAYER)
     if a.kl_coef > 0:
         ref_src = a.ref_adapter or a.init_adapter
-        assert ref_src, "--kl-coef needs --init-adapter or --ref-adapter"
-        actor.load_adapter(ref_src, adapter_name="ref")
-        actor.set_adapter("default")
+        if ref_src:
+            actor.load_adapter(ref_src, adapter_name="ref")
+            actor.set_adapter("default")
+        else:   # fresh LoRA (typically on a full-FT --policy-base): the KL anchor is the policy base itself = the LoRA disabled
+            _log(tag, f"KL reference = {pb} with the LoRA disabled (no --init-adapter / --ref-adapter)")
     n_train = sum(p.numel() for p in actor.parameters() if p.requires_grad)
-    _log(tag, f"actor ready in {time.time() - t0:.0f}s | trainable {n_train / 1e6:.0f}M | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB")
+    _log(tag, f"actor ready in {time.time() - t0:.0f}s | policy base {pb} | trainable {n_train / 1e6:.0f}M | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB")
+    use_gates = a.fluency_floor is not None or a.distinct_floor is not None
+    scorer = load_scorer(a, actor, device, tag, use_gates)   # the REWARD model: the actor with its LoRA off (default) or a frozen copy of MODEL
     pfx = _make_prefix_runner(actor, prompt_ids, marker, device, a, tag)
 
     # publish the init policy FIRST so the rollout ranks start generating while we tune the micro-batch
@@ -1862,7 +2047,6 @@ def run_trainer(a):
                   f"dirs x Bo{a.eval_bo} + sae + {'extra testbed' if EX is not None else 'NO extra evals'}; trainer ranks score sharded")
 
     adv_mode = a.adv_mode or ("batch" if a.batch_norm else ("group" if a.std_norm else "none"))
-    use_gates = a.fluency_floor is not None or a.distinct_floor is not None
     tgt_map = {}
     if is_main and a.transcript_every > 0 and a.direction_source == "cluster" and os.path.exists(f"{a.data_dir}/records.jsonl"):
         with open(f"{a.data_dir}/records.jsonl") as f:
@@ -1886,14 +2070,16 @@ def run_trainer(a):
                   + f" | loss-agg {a.loss_agg} | zero-var filter {a.zero_var_filter} (eps {a.zero_var_eps}) | NPR {a.npr_threshold}"
                   + (f" (pass cos {a.npr_pass_cos}, {n_bank_avail} directions)" if npr is not None else " (off)")
                   + f" | max lag {a.max_lag} step(s) | fp32 head {a.fp32_head} | length control {a.length_control}")
+        _log(tag, f"policy base {pb} | scorer {'the actor with its LoRA off (= MODEL)' if scorer is actor else 'a frozen copy of MODEL'}")
         if not a.no_wandb:
             wandb.init(project="maxact-fast", name=a.run_name, config={**vars(a), "micro_batch_used": mb, "mb_search": mb_res,
-                                                                        "fla": fla_v, "disagg": True},
+                                                                        "fla": fla_v, "disagg": True, "policy_base_resolved": pb},
                        id=a.wandb_id or None, resume="must" if a.wandb_id else None)
             wandb.define_metric("ckpt_step")
             wandb.define_metric("eval/*", step_metric="ckpt_step")
             wandb.define_metric("extra/*", step_metric="ckpt_step")
         os.makedirs(a.save_dir, exist_ok=True)
+        write_run_meta(a, a.save_dir, mb)
         json.dump({"micro_batch": mb, "search": mb_res}, open(f"{work}/trainer_mb.json", "w"))
     eos_set = set(R._eos_ids(tok, actor))
     step_hist = []
@@ -1923,7 +2109,7 @@ def run_trainer(a):
         take, stale, ev_ready = pick
         if ev_ready is not None:
             kk, paths = ev_ready
-            ev, ex = _score_eval_block(kk, paths, EV, EX, IX, actor, tok, device, rank, world, a)
+            ev, ex = _score_eval_block(kk, paths, EV, EX, IX, scorer, tok, device, rank, world, a)
             if is_main:
                 for pth in paths + [_eval_req_path(work, kk)]:
                     try:
@@ -1979,13 +2165,13 @@ def run_trainer(a):
         if a.score_length_bucket:
             _lens = [len(g) for g in gen_ids]
             if use_gates:
-                r, flu, dis = score_bucketed(R, texts, dirs_rep, actor, tok, device, a, _lens, with_fluency=True)
+                r, flu, dis = score_bucketed(R, texts, dirs_rep, scorer, tok, device, a, _lens, with_fluency=True)
             else:
-                r = score_bucketed(R, texts, dirs_rep, actor, tok, device, a, _lens)
+                r = score_bucketed(R, texts, dirs_rep, scorer, tok, device, a, _lens)
         elif use_gates:
-            r, flu, dis = R.score(texts, dirs_rep, actor, tok, device, a, with_fluency=True)
+            r, flu, dis = R.score(texts, dirs_rep, scorer, tok, device, a, with_fluency=True)
         else:
-            r = R.score(texts, dirs_rep, actor, tok, device, a)
+            r = R.score(texts, dirs_rep, scorer, tok, device, a)
         r = r * a.reward_scale
         raw_r, gate_frac = r.clone(), 1.0                      # raw_r = the TRUE cosine (logged/transcripts), before any shaping (rl.py fd2d144)
         trunc = torch.tensor([len(g) >= a.max_new_tokens and (not g or g[-1] not in eos_set) for g in gen_ids])
@@ -2151,6 +2337,7 @@ def run_trainer(a):
             _save_steps = {int(x) for x in a.save_steps.split(",") if x.strip()}
             if (a.save_every and step and step % a.save_every == 0) or (step in _save_steps):
                 actor.save_pretrained(f"{a.save_dir}/step_{step}")
+                write_run_meta(a, f"{a.save_dir}/step_{step}", mb, step=step)
                 torch.save(opt.state_dict(), f"{a.save_dir}/step_{step}/optim.pt")
                 if a.save_every:   # rolling optim.pt cleanup only for the periodic schedule (log-spaced ckpts keep theirs)
                     stale_o = os.path.join(a.save_dir, f"step_{step - 2 * a.save_every}", "optim.pt")
@@ -2158,6 +2345,7 @@ def run_trainer(a):
                         os.remove(stale_o)
     if is_main:
         actor.save_pretrained(f"{a.save_dir}/final")
+        write_run_meta(a, f"{a.save_dir}/final", mb, step=a.total_steps)
         if a.save_every:
             torch.save(opt.state_dict(), f"{a.save_dir}/final/optim.pt")
         # rl.py-format round trip: the checkpoint must load as a PEFT adapter next to the live one
@@ -2189,10 +2377,10 @@ def run_bench_trainer(a):
     import torch.nn.functional as F
     if a.no_fla:
         sys.modules["fla"] = None
-    from peft import PeftModel
+    from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
     import rl_hf as R
-    from mxf.config import D_MODEL, INJECT_LAYER, MODEL
+    from mxf.config import D_MODEL, INJECT_LAYER, MODEL, TrainConfig
     from mxf.inject import get_layer
     from mxf.prompts import build_prompt_ids
     rank = int(os.environ["DISAGG_RANK"]); world = int(os.environ["DISAGG_WORLD"]); tag = f"BT{rank}"
@@ -2211,15 +2399,21 @@ def run_bench_trainer(a):
     marker, p_len = mpos[0], len(prompt_ids)
     prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
     t0 = time.time()
-    actor = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
-    actor = PeftModel.from_pretrained(actor, a.init_adapter, is_trainable=True)
+    actor = AutoModelForCausalLM.from_pretrained(check_policy_base(a), dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+    if a.init_adapter:
+        actor = PeftModel.from_pretrained(actor, a.init_adapter, is_trainable=True)
+    else:
+        tr = TrainConfig()
+        actor = get_peft_model(actor, LoraConfig(r=tr.lora_r, lora_alpha=tr.lora_alpha, lora_dropout=0.0, use_rslora=True,
+                                                 target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
     actor.train()
     if a.fp32_head:
         install_fp32_head(actor)
     opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0, eps=a.adam_eps, betas=tuple(a.adam_betas))
     submodule = get_layer(actor, INJECT_LAYER)
-    if a.kl_coef > 0:
+    if a.kl_coef > 0 and (a.ref_adapter or a.init_adapter):
         actor.load_adapter(a.ref_adapter or a.init_adapter, adapter_name="ref"); actor.set_adapter("default")
+    scorer = load_scorer(a, actor, device, tag, use_gates=False)
     resident = torch.cuda.memory_allocated() / 2**30
     _log(tag, f"actor in {time.time() - t0:.0f}s | resident {resident:.1f} GB | fla {fla_v} | world {world} {a.backend}")
     pfx = _make_prefix_runner(actor, prompt_ids, marker, device, a, tag)
@@ -2251,9 +2445,9 @@ def run_bench_trainer(a):
         dirs_rep = dirs.repeat_interleave(G, 0).to(device)
         torch.cuda.synchronize(); t_s = time.time()
         if a.score_length_bucket:
-            r = score_bucketed(R, texts, dirs_rep, actor, tok, device, a, [len(g) for g in gen_ids])
+            r = score_bucketed(R, texts, dirs_rep, scorer, tok, device, a, [len(g) for g in gen_ids])
         else:
-            r = R.score(texts, dirs_rep, actor, tok, device, a)
+            r = R.score(texts, dirs_rep, scorer, tok, device, a)
         torch.cuda.synchronize(); t_s = time.time() - t_s
         adv = R.compute_advantages(r, Bl, G, "group")
         L = p_len + max(len(g) for g in gen_ids)

@@ -19,6 +19,13 @@ Loop (eval/modal_eval_last5.py conventions): vol.reload -> newest un-evaled <ckp
 judge stage in the background (results polled and logged under their ckpt_step) -> state file on the volume.
 One wandb run per RL run (name/id = <tag>), NEVER resuming the RL run itself (two writers race on _step).
 
+RL adapters trained on a FULL fine-tuned policy base (rl_disagg --policy-base): <ckpt_dir>/run_meta.json carries
+"policy_base"; the daemon picks it up automatically (--policy-base auto) and evaluates policy = policy_base + adapter
+(the vLLM engine serves the full-FT dir with the LoRA slots; the adapter is renamed to the vLLM key layout from its
+safetensors file, no PEFT actor) while the HF side is the clean ORIGINAL base for every score (same scoring code, same
+eval cache). The adapter-on marker norm the steering scale needs is captured from the engine itself (vllm_lens residual
+capture with the LoRA request; the LoRA protocol's HF _marker_norm agrees within the injection check's 3%).
+
     python eval/eval_ckpt_daemon.py --ckpt-dir /data/ckpts_last5_v15_g8 --tag last5_v15_g8 --once --only-step 90
 """
 import argparse
@@ -50,6 +57,10 @@ def parse_args(argv=None):
     ap.add_argument("--first-adapter", default="/data/sft_mix/last5_rp/final",
                     help="an adapter of the run's LoRA geometry to build the PEFT actor with before the engine (the SFT init)")
     ap.add_argument("--no-extra-evals", action="store_true")
+    ap.add_argument("--policy-base", default="auto",
+                    help="base the RL adapters were trained on (rl_disagg --policy-base, a full-FT checkpoint dir): the engine serves it + "
+                         "the adapter, scoring stays the clean MODEL. 'auto' (default) = <ckpt_dir>/run_meta.json's policy_base when present "
+                         "(MODEL or absent -> the plain LoRA-on-MODEL protocol, byte-identical to before); '' / 'none' = force MODEL")
     ap.add_argument("--full-model", action="store_true",
                     help="checkpoints are FULL HF models (dirs carrying SAVE_DONE, sft/fullft.py layout): the vLLM engine loads the "
                          "checkpoint ITSELF (no LoRA) while scoring stays on the clean base; the adapter-on marker norm becomes the "
@@ -88,55 +99,14 @@ def parse_args(argv=None):
     return a
 
 
-class _BaseActor:
-    """The plain HF base with the PEFT-actor surface the eval code touches: disable_adapter() (a no-op: it IS the clean
-    base), get_base_model(), forward/generate, generation_config, eval(). Used by --full-model, where generation runs
-    inside vLLM on the fine-tuned checkpoint and every HF-side score is the clean base by construction."""
-
-    def __init__(self, base):
-        self.base = base
-
-    def __call__(self, *args, **kw):
-        return self.base(*args, **kw)
-
-    def forward(self, *args, **kw):
-        return self.base(*args, **kw)
-
-    def generate(self, *args, **kw):
-        return self.base.generate(*args, **kw)
-
-    def get_base_model(self):
-        return self.base
-
-    def disable_adapter(self):
-        import contextlib
-        return contextlib.nullcontext()
-
-    def eval(self):
-        self.base.eval(); return self
-
-    def train(self, mode=True):
-        self.base.train(mode); return self
-
-    @property
-    def training(self):
-        return self.base.training
-
-    @property
-    def generation_config(self):
-        return self.base.generation_config
-
-    @property
-    def config(self):
-        return self.base.config
-
-
-def _vllm_marker_norm(llm, prompt_ids, marker, inject_layer):
-    """||h|| at the marker of the served model's INJECT_LAYER residual (vllm_lens capture, clean prompt, greedy 1 token)."""
+def _vllm_marker_norm(llm, prompt_ids, marker, inject_layer, lora_request=None):
+    """||h|| at the marker of the served model's INJECT_LAYER residual (vllm_lens capture, clean prompt, greedy 1 token); with
+    `lora_request` = the served policy WITH that adapter (the LoRA protocol's 'adapter-on' marker norm, taken from the engine)."""
     from vllm import SamplingParams
+    kw = {"lora_request": lora_request} if lora_request is not None else {}
     out = llm.generate([{"prompt_token_ids": list(prompt_ids)}],
                        [SamplingParams(temperature=0.0, max_tokens=1, extra_args={"output_residual_stream": [inject_layer]})],
-                       use_tqdm=False)[0]
+                       use_tqdm=False, **kw)[0]
     act = getattr(out, "activations", None)
     assert act is not None and "residual_stream" in act, "vllm_lens capture returned nothing -- plugin not active?"
     return act["residual_stream"][0].float()[marker].norm().item()
@@ -157,6 +127,38 @@ def _save_adapter_for_vllm(actor, adapter_name, lora_dir):
     save_file(out, f"{lora_dir}/adapter_model.safetensors", metadata={"format": "pt"})
     actor.peft_config[adapter_name].save_pretrained(lora_dir)
     return len(out)
+
+
+def _convert_adapter_dir_for_vllm(src_dir, lora_dir):
+    """A saved PEFT adapter dir -> the vLLM key layout, from its FILES (no PEFT actor; rl_disagg.run_bench_rollout does the same):
+    `model.layers.` -> `model.language_model.layers.` (Qwen3_5ForConditionalGeneration), bf16, adapter_config.json copied."""
+    import torch
+    from safetensors.torch import load_file, save_file
+    os.makedirs(lora_dir, exist_ok=True)
+    sd = load_file(f"{src_dir}/adapter_model.safetensors")
+    out = {}
+    for k, v in sd.items():
+        k2 = k if "language_model" in k else k.replace("model.layers.", "model.language_model.layers.", 1)
+        out[k2] = v.to(torch.bfloat16).contiguous()
+    save_file(out, f"{lora_dir}/adapter_model.safetensors", metadata={"format": "pt"})
+    shutil.copy(f"{src_dir}/adapter_config.json", f"{lora_dir}/adapter_config.json")
+    return len(out)
+
+
+def resolve_policy_base(ckpt_dir, flag, model, log=print):
+    """--policy-base -> the full-FT base dir the adapters under ckpt_dir were trained on, or '' for the plain LoRA-on-MODEL protocol."""
+    pb = flag or ""
+    if pb == "auto":
+        pb = ""
+        mp = f"{ckpt_dir}/run_meta.json"
+        if os.path.exists(mp):
+            try:
+                pb = json.load(open(mp)).get("policy_base") or ""
+            except Exception as e:  # noqa
+                log(f"could not read {mp} ({type(e).__name__}: {e}); assuming policy base = {model}")
+    if pb in ("none", "None", model):
+        pb = ""
+    return pb
 
 
 def _scan(ckpt_dir, final_step, min_mtime, full_model=False):
@@ -216,6 +218,13 @@ def main():
 
     device = "cuda:0"
     torch.cuda.set_device(0)
+    policy_base = resolve_policy_base(a.ckpt_dir, a.policy_base, MODEL, log)   # '' = adapters on MODEL (the protocol so far)
+    fft_lora = bool(policy_base) and not a.full_model
+    if fft_lora:
+        if os.path.isdir(policy_base):
+            assert os.path.exists(f"{policy_base}/SAVE_DONE"), f"policy base {policy_base} has no SAVE_DONE (incomplete full-FT checkpoint)"
+        log(f"policy base {policy_base} (from {'run_meta.json' if a.policy_base == 'auto' else '--policy-base'}): the engine serves it + each "
+            f"RL adapter; every score runs on the clean {MODEL}")
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -224,8 +233,8 @@ def main():
     t0 = time.time()
     # ---- HF actor FIRST (vllm's import clobbers transformers' AutoConfig for this model, see rl.py main) ----
     base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
-    if a.full_model:
-        actor = _BaseActor(base)          # scoring side = the clean base; the checkpoint lives in the engine
+    if a.full_model or fft_lora:
+        actor = DG.BaseActor(base)        # scoring side = the clean base; the policy (full model / full-FT base + LoRA) lives in the engine
     else:
         actor = PeftModel.from_pretrained(base, a.first_adapter, adapter_name="init", is_trainable=False)
     actor.eval()
@@ -248,18 +257,27 @@ def main():
         assert a.only_step in avail0, f"--full-model: step {a.only_step} has no complete checkpoint (SAVE_DONE) under {a.ckpt_dir}: {sorted(avail0)}"
         a.engine_model, a.engine_lora = avail0[a.only_step], False
         log(f"full-model mode: engine serves {a.engine_model} (no LoRA); HF side = clean base for scoring")
+    elif fft_lora:
+        a.engine_model, a.engine_lora = policy_base, True
+        log(f"policy-base mode: engine serves {policy_base} + LoRA slots; HF side = clean base for scoring")
     llm = DG._build_engine(a, 0, p_len, a.max_num_seqs, a.cuda_graphs, "eval-ckpt")
-    if a.full_model:
+    _hn = {"v": None}   # policy-base mode: the served (policy base + adapter) marker norm, refreshed per checkpoint
+    if a.full_model or fft_lora:
         # the 'adapter-on' marker norm of the LoRA protocol == the SERVED model's own marker norm here; take it from the engine
         prompt_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
-        hnorm_ft = _vllm_marker_norm(llm, prompt_ids, marker, INJECT_LAYER)
+        hnorm_ft = _vllm_marker_norm(llm, prompt_ids, marker, INJECT_LAYER)            # served base weights, no LoRA
         hnorm_base = R._marker_norm(actor, submodule, prompt_t, marker, device, adapter=False)
         chk = DG._verify_injection(llm, prompt_ids, marker, hnorm_ft, "eval-ckpt", seed=a.seed)
-        chk.update({"hnorm_served": hnorm_ft, "hnorm_hf_base": hnorm_base, "hnorm_agree": hnorm_ft / max(hnorm_base, 1e-6), "mode": "full_model"})
-        R._marker_norm = lambda *args, **kw: hnorm_ft            # inline_eval / extra evals ask the actor for it
-        _orig_generate = llm.generate
-        llm.generate = lambda *args, **kw: _orig_generate(*args, **{k: v for k, v in kw.items() if k != "lora_request"})
-        log(f"injection check (full model): cos {chk['cos']:.4f} | magnitude ratio {chk['norm_ratio']:.3f} | marker ||h|| served {hnorm_ft:.1f} "
+        chk.update({"hnorm_served": hnorm_ft, "hnorm_hf_base": hnorm_base, "hnorm_agree": hnorm_ft / max(hnorm_base, 1e-6),
+                    "mode": "full_model" if a.full_model else "policy_base_lora", "policy_base": a.engine_model})
+        if a.full_model:
+            R._marker_norm = lambda *args, **kw: hnorm_ft            # inline_eval / extra evals ask the actor for it
+            _orig_generate = llm.generate
+            llm.generate = lambda *args, **kw: _orig_generate(*args, **{k: v for k, v in kw.items() if k != "lora_request"})
+        else:
+            _hn["v"] = hnorm_ft
+            R._marker_norm = lambda *args, **kw: _hn["v"]           # set per checkpoint below (adapter ON, from the engine)
+        log(f"injection check ({chk['mode']}): cos {chk['cos']:.4f} | magnitude ratio {chk['norm_ratio']:.3f} | marker ||h|| served {hnorm_ft:.1f} "
             f"vs clean base {hnorm_base:.1f} (x{chk['hnorm_agree']:.3f}) -> {'OK' if chk['ok'] else 'FAIL'}")
     else:
         chk = R.verify_vllm_injection(llm, actor, submodule, prompt_ids, marker, device, seed=a.seed)
@@ -274,7 +292,7 @@ def main():
                    config={"ckpt_dir": a.ckpt_dir, "rl_run_id": a.rl_run_id, "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]),
                            "bo": a.eval_bo, "temp": a.eval_temp, "max_new": a.eval_max_new, "min_new": a.eval_min_new, "cache": a.eval_cache,
                            "sae_rank_metric": True, "extra_evals": EX is not None, "engine": "vllm fast_lens_ext" + (" cudagraphs" if a.cuda_graphs else " eager"),
-                           "schedule": "latest-first", "injection_check": chk})
+                           "schedule": "latest-first", "injection_check": chk, "policy_base": policy_base or MODEL, "full_model": a.full_model})
         wandb.define_metric("ckpt_step")
         wandb.define_metric("eval/*", step_metric="ckpt_step")
         wandb.define_metric("extra/*", step_metric="ckpt_step")
@@ -332,8 +350,24 @@ def main():
         name = f"ck{s}"
         log(f"evaluating step {s} ({ck})")   # the launcher pauses volume reloads while an eval is in progress
         lora_dir = f"/tmp/rl_lora/rank0/step{s}"        # the path rl.py inline_eval / run_extra_evals_gpu read the LoRA from
+        hnorm_on = None
         if a.full_model:
             n_t, t_load = 0, 0.0                        # the engine already IS this checkpoint
+        elif fft_lora:
+            try:
+                n_t = _convert_adapter_dir_for_vllm(ck, lora_dir)
+                from vllm.lora.request import LoRARequest   # same name/id/path as rl.py inline_eval's request -> one adapter load
+                hnorm_on = _vllm_marker_norm(llm, prompt_ids, marker, INJECT_LAYER,
+                                             lora_request=LoRARequest(lora_name=f"step{s}", lora_int_id=s + 1, lora_path=lora_dir))
+            except Exception as e:  # noqa — a mid-save commit raced us: retry next poll
+                log(f"step {s}: adapter load failed (convert / marker norm: {type(e).__name__}: {e}); will retry")
+                shutil.rmtree(lora_dir, ignore_errors=True)
+                time.sleep(a.poll_s)
+                continue
+            _hn["v"] = hnorm_on
+            t_load = time.time() - t1
+            log(f"step {s}: adapter -> vLLM layout ({n_t} tensors) | marker ||h|| served with the adapter ON {hnorm_on:.2f} "
+                f"(policy base alone {hnorm_ft:.2f}, x{hnorm_on / max(hnorm_ft, 1e-6):.4f})")
         else:
             try:
                 actor.load_adapter(ck, adapter_name=name)
@@ -365,12 +399,15 @@ def main():
             log(f"step {s}: extra evals FAILED: {ex['error']}")
             ex = {}
         row = {**ev, **ex, "ckpt_step": s, "time/ckpt_eval_s": secs, "time/adapter_load_publish_s": t_load}
+        if hnorm_on is not None:
+            row["eval/marker_hnorm_adapter_on"] = hnorm_on
         if not a.no_wandb:
             wandb.log(row, commit=True)
         json.dump({"ckpt_step": s, "ckpt": ck, "metrics": row, "n_lora_tensors": n_t, "protocol": {
             "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]), "bo": a.eval_bo, "temp": a.eval_temp,
             "min_new": a.eval_min_new, "max_new": a.eval_max_new, "eval_cache": a.eval_cache,
             "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "full_model": a.full_model,
+            "policy_base": policy_base or MODEL, "hnorm_adapter_on": hnorm_on,
             "injection_check": chk}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
         if EX is not None and "extra/locality/fire_frac" in ex:
             try:

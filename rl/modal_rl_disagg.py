@@ -16,6 +16,11 @@ Launch (MODAL_PROFILE=safety-sahan):
     DISAGG_GPU=B200:8 modal run --detach modal_rl_disagg.py::main --n-rollout 2 --n-trainer 6 --total-steps 400 \
         --extra-args "--cuda-graphs --run-name rl_everything_8x128_disagg --save-dir /data/ckpts_last5_v15_disagg"
 Resume from a checkpoint: --extra-args "... --init-adapter <ckpt>/step_N --ref-adapter /data/sft_mix/last5_rp/final --step-offset N+1 --wandb-id <id>"
+RL on a FULL fine-tuned policy (sft/fullft.py checkpoint dir; fresh LoRA, reward on the ORIGINAL base -- rl_disagg --policy-base):
+    DISAGG_APP=maemm-rl-disagg-fftbase-x4 DISAGG_GPU=B200:4 DISAGG_TRANSFORMERS="transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3" \
+        modal run --detach modal_rl_disagg.py::main --n-rollout 1 --n-trainer 3 --total-steps 5 \
+        --policy-base /data/sft_mix/fullft2m_lr1e-05/final --extra-args "--prefix-cache --score-length-bucket --cuda-graphs ..."
+    (adds `--policy-base <dir> --init-adapter none` to TRAIN_ARGS unless --extra-args sets --init-adapter itself; --kl-coef then anchors to the policy base)
 Set DISAGG_GPU (e.g. H200:4) at `modal run` time to pick the GPU request; the container's real GPU count
 is what the launcher uses.
 Trainer speed knobs (rl_disagg --prefix-cache / --score-length-bucket): the prefix cache needs the transformers fork in the image --
@@ -140,13 +145,15 @@ def _env():
     return env
 
 
-def _stage(pool_dir: str = ""):
+def _stage(pool_dir: str = "", need_sft_init: bool = True):
     import shutil
     import time
     os.environ["HF_HOME"] = "/data/hf_cache"
     pool = pool_dir or POOL_DIR
-    for p in (f"{pool}/vecs.f32", f"{pool}/records.jsonl", f"{pool}/build_stats.json",
-              f"{SFT_INIT}/adapter_model.safetensors", f"{SFT_INIT}/adapter_config.json"):
+    need = [f"{pool}/vecs.f32", f"{pool}/records.jsonl", f"{pool}/build_stats.json"]
+    if need_sft_init:   # a --policy-base run starts a FRESH LoRA on the full-FT checkpoint; the SFT adapter is not involved
+        need += [f"{SFT_INIT}/adapter_model.safetensors", f"{SFT_INIT}/adapter_config.json"]
+    for p in need:
         assert os.path.exists(p), f"missing {p}"
     t0 = time.time()
     local_pool = "/root/pool"
@@ -216,9 +223,16 @@ def _collect(work="/tmp/disagg"):
                        modal.Secret.from_name("maemm-anthropic")],   # native Sonnet 5 judge: ANTHROPIC_API_KEY + ANTHROPIC_WORKSPACE_ID
               timeout=24 * 3600)
 def train(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_args: str = "", no_wandb: bool = False,
-          pool_dir: str = ""):
-    local_pool = _stage(pool_dir)   # pool_dir: a different direction bank than POOL_DIR (e.g. /data/banks/rl_randctx)
+          pool_dir: str = "", policy_base: str = ""):
+    """policy_base: a FULL fine-tuned checkpoint dir (sft/fullft.py layout, SAVE_DONE) the policy is built on; the rollout engines
+    serve it, the trainer starts a FRESH LoRA on it (unless extra_args gives --init-adapter), the reward stays the original base."""
+    local_pool = _stage(pool_dir, need_sft_init=not policy_base)   # pool_dir: a different direction bank than POOL_DIR (e.g. /data/banks/rl_randctx)
     args = list(TRAIN_ARGS)
+    if policy_base:
+        assert os.path.exists(f"{policy_base}/SAVE_DONE"), f"policy base {policy_base} has no SAVE_DONE (incomplete full-FT checkpoint)"
+        args += ["--policy-base", policy_base]
+        if "--init-adapter" not in extra_args:
+            args += ["--init-adapter", "none"]   # unsets TRAIN_ARGS' SFT init -> fresh rsLoRA on the full-FT weights
     if no_wandb:
         args.append("--no-wandb")
     if extra_args:
@@ -251,8 +265,10 @@ def bench(n_rollout: int = 2, n_trainer: int = 2, extra_args: str = ""):
 
 
 @app.local_entrypoint()
-def main(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_args: str = "", no_wandb: bool = False):
-    train.remote(n_rollout=n_rollout, n_trainer=n_trainer, total_steps=total_steps, extra_args=extra_args, no_wandb=no_wandb)
+def main(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_args: str = "", no_wandb: bool = False,
+         policy_base: str = "", pool_dir: str = ""):
+    train.remote(n_rollout=n_rollout, n_trainer=n_trainer, total_steps=total_steps, extra_args=extra_args, no_wandb=no_wandb,
+                 pool_dir=pool_dir, policy_base=policy_base)
 
 
 @app.local_entrypoint()

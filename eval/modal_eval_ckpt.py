@@ -15,6 +15,11 @@ ONE GPU container at a time: the daemon holds its GPU while polling, so launch i
 One-off (the step_90 protocol check):
     ... .spawn(ckpt_dir='/data/ckpts_last5_v15_g8', tag='last5_v15_g8', once=True, only_step=90)
 Set EVAL_GPU (default B200:1; e.g. H200:1) at deploy time.
+RL adapters trained on a full-FT policy base (rl_disagg --policy-base): the SAME `daemon` -- eval_ckpt_daemon reads
+<ckpt_dir>/run_meta.json's policy_base and serves base+adapter in vLLM while scoring on the clean MODEL (or pass policy_base=).
+    EVAL_APP=maemm-eval-ckpt-fftbase modal deploy eval/modal_eval_ckpt.py
+    ... modal.Function.from_name('maemm-eval-ckpt-fftbase', 'daemon').spawn(ckpt_dir='/data/ckpts_<run>', tag='<run>',
+        extra_args='--eval-cache /data/eval_universal_ho/eval_sets_heldout_v2.pt')
 """
 import os
 from pathlib import Path
@@ -61,7 +66,9 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
                        modal.Secret.from_name("maemm-anthropic"), modal.Secret.from_name("maemm-openrouter")],
               timeout=24 * 3600)
 def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once: bool = False, only_step: int = -1,
-           final_step: int = 1000, vllm_gpu_mem: float = 0.5, wandb_name: str = "", extra_args: str = ""):
+           final_step: int = 1000, vllm_gpu_mem: float = 0.5, wandb_name: str = "", extra_args: str = "", policy_base: str = ""):
+    """policy_base: the full-FT base the RL adapters under ckpt_dir were trained on (rl_disagg --policy-base). Default '' = auto:
+    eval_ckpt_daemon reads <ckpt_dir>/run_meta.json (absent / MODEL -> the plain LoRA-on-MODEL protocol)."""
     import subprocess
     env = os.environ.copy()
     env["PYTHONPATH"] = "/pmx/helpers:/pmx/eval:/pmx/RL"
@@ -81,6 +88,8 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
         cmd.append("--once")
     if only_step >= 0:
         cmd += ["--only-step", str(only_step)]
+    if policy_base:
+        cmd += ["--policy-base", policy_base]
     if extra_args:
         cmd += extra_args.split()
     print("[modal] launching:", " ".join(cmd), flush=True)
