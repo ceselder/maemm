@@ -207,7 +207,7 @@ def _stream(cmd, env, tag):
         modal.Secret.from_name("maemm-wandb"),
     ],
     timeout=86400,
-    ephemeral_disk=600 * 1024,   # _preflight stages the bank locally: a 20M-example vecs.f16 is ~205 GB
+    ephemeral_disk=int(os.environ.get("SFT_DISK_GB", "600")) * 1024,   # _preflight stages the bank locally: 23M examples = 235 GB, 50M = 512 GB (deploy with SFT_DISK_GB=1200)
     memory=256 * 1024,
 )
 def train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
