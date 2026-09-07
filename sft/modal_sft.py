@@ -6,6 +6,8 @@ PYTHONPATH=/pmx/helpers. Same image/volume as modal_rl.py (no vllm — pretrain 
 Data lives on the `maemm-data` Volume:
     /data/<bank>            SFT bank: records.jsonl ({"vec_idx", "target_text"} per line)
                             + vecs.f32 or vecs.f16 (N x 5120 f32/f16 memmap, N >= max(vec_idx)+1)
+                            --data-dir may be a COMMA-SEPARATED list of such PART banks: every part is staged and
+                            pretrain.py consumes them as one virtual bank (100M+ rows no longer fit one merged file)
     /data/hf_cache          HF_HOME (Qwen/Qwen3.6-27B downloads once, persists)
     /data/sft_mix/<run>/    output: run_meta.json + heartbeat + step_* ckpts + final
 
@@ -72,8 +74,12 @@ image = (
 _SFT_TRITON = os.environ.get("SFT_TRITON", "")
 if _SFT_TRITON:
     image = image.pip_install(f"triton=={_SFT_TRITON}")
+# train()'s ephemeral disk (GiB) -- a deploy-time knob. Baked into the image env too, because inside the container
+# shutil.disk_usage reports a fictitious 2^33 GiB filesystem, so _preflight can only check the staging total against this.
+SFT_DISK_GB = int(os.environ.get("SFT_DISK_GB", "600"))
 image = (
     image
+    .env({"SFT_DISK_GB": str(SFT_DISK_GB)})
     .add_local_file(REPO / "sft" / "pretrain.py", "/pmx/SL/pretrain.py")
     .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/SL/prefix_cache.py")   # --prefix-cache sibling import
     .add_local_file(REPO / "sft" / "fullft.py", "/pmx/SL/fullft.py")               # --full-ft (FSDP2) sibling import
@@ -103,10 +109,15 @@ def _vec_bank_file(data_dir: str):
     raise AssertionError(f"bank incomplete: neither vecs.f32 nor vecs.f16 in {data_dir}")
 
 
-def _preflight(run_name: str, data_dir: str, n_ckpts: int, resume_from: str):
-    """Shared guardrails + bank staging for train/smoke. Returns (save_dir, local_bank, d_model)."""
+def _preflight(run_name: str, data_dir: str, n_ckpts: int, resume_from: str, disk_cap_gb: int = 0):
+    """Shared guardrails + bank staging for train/smoke. `data_dir` is one bank or a comma-separated list of PART banks
+    (pretrain.py --data-dir takes the same list and consumes the parts as one virtual bank -- records and vector rows
+    concatenated in the listed order). EVERY part is staged to container-local disk; the total is printed and, when
+    disk_cap_gb > 0 (train passes its deploy-time SFT_DISK_GB), refused up front if it cannot fit.
+    Returns (save_dir, staged comma list, d_model)."""
     import glob
     import json
+    import math
     import os
     import shutil
     import sys
@@ -144,24 +155,73 @@ def _preflight(run_name: str, data_dir: str, n_ckpts: int, resume_from: str):
     vol.commit()
     print(f"[modal] base model in cache ({time.time() - t0:.0f}s)", flush=True)
 
-    # ---- bank schema guard, then stage onto container-local NVMe: memmap over the volume FUSE
-    # mount is the one thing we don't trust, and per-batch random row reads are faster locally. ----
-    assert os.path.isdir(data_dir), f"bank not found on volume: {data_dir}"
-    assert os.path.exists(f"{data_dir}/records.jsonl"), f"bank incomplete: {data_dir}/records.jsonl missing"
-    vec_file, itemsize = _vec_bank_file(data_dir)   # vecs.f32 or vecs.f16 (pretrain.py reads either)
-    rec0 = json.loads(open(f"{data_dir}/records.jsonl").readline())
-    assert "vec_idx" in rec0 and "target_text" in rec0, f"records.jsonl schema: got {sorted(rec0)}"
-    vsize = os.path.getsize(f"{data_dir}/{vec_file}")
-    assert vsize % (D_MODEL * itemsize) == 0, \
-        f"{vec_file} = {vsize} B, not a multiple of one {D_MODEL}-x-{itemsize}B row"
-    print(f"[modal] bank OK: {vsize // (D_MODEL * itemsize)} vecs x {D_MODEL} ({vec_file}) + records.jsonl", flush=True)
+    # ---- bank schema guard PER PART, then stage every part onto container-local NVMe: memmap over the volume
+    # FUSE mount is the one thing we don't trust, and per-batch random row reads are faster locally. ----
+    parts = [p.strip() for p in data_dir.split(",") if p.strip()]
+    assert parts, f"empty data_dir {data_dir!r}"
+    sizes, n_vecs_total, n_ex_total = [], 0, 0
+    for d in parts:
+        assert os.path.isdir(d), f"bank not found on volume: {d}"
+        assert os.path.exists(f"{d}/records.jsonl"), f"bank incomplete: {d}/records.jsonl missing"
+        vec_file, itemsize = _vec_bank_file(d)   # vecs.f32 or vecs.f16 (pretrain.py reads either)
+        rec0 = json.loads(open(f"{d}/records.jsonl").readline())
+        assert "vec_idx" in rec0 and "target_text" in rec0, f"records.jsonl schema: got {sorted(rec0)}"
+        vsize = os.path.getsize(f"{d}/{vec_file}")
+        assert vsize % (D_MODEL * itemsize) == 0, \
+            f"{d}/{vec_file} = {vsize} B, not a multiple of one {D_MODEL}-x-{itemsize}B row"
+        rsize = os.path.getsize(f"{d}/records.jsonl")
+        n_ex = None
+        if os.path.exists(f"{d}/build_stats.json"):
+            n_ex = json.load(open(f"{d}/build_stats.json")).get("n_examples")
+            n_ex_total += n_ex or 0
+        n_vecs_total += vsize // (D_MODEL * itemsize)
+        sizes.append(vsize + rsize)
+        print(f"[modal] bank OK: {d}: {vsize // (D_MODEL * itemsize)} vecs x {D_MODEL} ({vec_file}, {vsize / 2**30:.1f} GiB) "
+              f"+ records.jsonl ({rsize / 2**30:.2f} GiB)" + (f", n_examples={n_ex}" if n_ex is not None else ""), flush=True)
+    total_gb = sum(sizes) / 2**30
+    if len(parts) > 1:
+        print(f"[modal] {len(parts)} bank parts -> one virtual bank: {n_vecs_total} vectors, build_stats n_examples sum "
+              f"{n_ex_total}, {total_gb:.1f} GiB to stage", flush=True)
 
-    t0 = time.time()
-    local_bank = f"/root/bank_{os.path.basename(data_dir.rstrip('/'))}"
-    if not os.path.exists(local_bank):
-        shutil.copytree(data_dir, local_bank)
-    print(f"[modal] bank staged to {local_bank} ({time.time() - t0:.0f}s)", flush=True)
-    return save_dir, local_bank, D_MODEL
+    # ---- stage: unique local dir per DISTINCT source (the same part listed twice is staged once and passed twice);
+    # the total must fit the container's ephemeral disk (deploy-time SFT_DISK_GB) or copytree dies hours in. ----
+    local_of = {}
+    staged, taken = [], {}
+    for d in parts:
+        if d in local_of:
+            staged.append(local_of[d])
+            continue
+        base = f"/root/bank_{os.path.basename(d.rstrip('/'))}"
+        local = base
+        k = 1
+        while local in taken:   # a DIFFERENT source with the same basename
+            local = f"{base}_{k}"; k += 1
+        taken[local] = d
+        local_of[d] = local
+        staged.append(local)
+    size_of = dict(zip(parts, sizes))                     # a source listed twice is copied (and counted) once
+    need = sum(sz for d, sz in size_of.items() if not os.path.exists(local_of[d]))
+    margin_gb = 20                                        # wandb dir, /tmp shards (--full-ft nontext shard), slack
+    du = shutil.disk_usage("/root")
+    du_real = du.total < 2**50                            # Modal's sandbox reports a 2^33 GiB filesystem: meaningless
+    print(f"[modal] staging {len(local_of)} distinct part(s), {need / 2**30:.1f} GiB to copy (total corpus {total_gb:.1f} GiB, "
+          f"+{margin_gb} GiB margin); local disk cap: "
+          + (f"{disk_cap_gb} GiB (ephemeral_disk = SFT_DISK_GB at deploy)" if disk_cap_gb else "not enforced for this function")
+          + (f"; statvfs says {du.free / 2**30:.0f} GiB free of {du.total / 2**30:.0f} GiB" if du_real
+             else "; statvfs reports a fictitious filesystem size and is ignored"), flush=True)
+    need_gb = need / 2**30 + margin_gb
+    cap_gb = min(disk_cap_gb or float("inf"), du.free / 2**30 if du_real else float("inf"))
+    if need_gb > cap_gb:
+        raise RuntimeError(f"not enough local disk to stage the bank(s): need {need_gb:.0f} GiB (incl. margin) but the cap is "
+                           f"{cap_gb:.0f} GiB -- redeploy with SFT_DISK_GB={int(math.ceil(need_gb / 100.0)) * 100 + 200} or larger")
+    t_all = time.time()
+    for d, local in local_of.items():
+        t0 = time.time()
+        if not os.path.exists(local):
+            shutil.copytree(d, local)
+        print(f"[modal] bank part staged: {d} -> {local} ({size_of[d] / 2**30:.1f} GiB, {time.time() - t0:.0f}s)", flush=True)
+    print(f"[modal] bank staged to {','.join(staged)} ({len(staged)} part(s), {total_gb:.1f} GiB, {time.time() - t_all:.0f}s)", flush=True)
+    return save_dir, ",".join(staged), D_MODEL
 
 
 def _train_env(backend: str):
@@ -207,7 +267,10 @@ def _stream(cmd, env, tag):
         modal.Secret.from_name("maemm-wandb"),
     ],
     timeout=86400,
-    ephemeral_disk=int(os.environ.get("SFT_DISK_GB", "600")) * 1024,   # _preflight stages the bank locally: 23M examples = 235 GB, 50M = 512 GB (deploy with SFT_DISK_GB=1200)
+    # _preflight stages EVERY listed bank part locally (vecs.f16 = 10 KiB/row + ~190 B/row of records): 23M rows = 224 GiB,
+    # 50M = 487 GiB (SFT_DISK_GB=1200), 104M (realact_short_50m_all + parts h..m) = 1012 GiB -> SFT_DISK_GB>=1400,
+    # 203M (all 24 realact_short_20m* parts) = 1971 GiB -> SFT_DISK_GB=2600-3000 (Modal's ephemeral-disk ceiling is ~3 TiB)
+    ephemeral_disk=SFT_DISK_GB * 1024,
     memory=256 * 1024,
 )
 def train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
@@ -227,9 +290,11 @@ def train(run_name: str, data_dir: str, n_ckpts: int = 14, epochs: int = 1,
     import threading
     import time
 
-    if not data_dir.startswith("/"):
-        data_dir = f"/data/{data_dir}"
-    save_dir, local_bank, _ = _preflight(run_name, data_dir, n_ckpts, resume_from)
+    # one bank or a comma-separated list of parts (each may be volume-relative); the normalized list is what run_meta
+    # records, so the supervisor's resume legs stage exactly the same parts in the same order
+    data_dir = ",".join(p if p.startswith("/") else f"/data/{p}" for p in (q.strip() for q in data_dir.split(",")) if p)
+    save_dir, local_bank, _ = _preflight(run_name, data_dir, n_ckpts, resume_from,
+                                         disk_cap_gb=int(os.environ.get("SFT_DISK_GB", "0")))   # baked into the image at deploy
     os.makedirs(save_dir, exist_ok=True)
 
     # ---- run_meta.json: everything the supervisor needs to respawn this run faithfully. Written
@@ -316,21 +381,26 @@ def smoke(data_dir: str, n_records: int = 256, batch_size: int = 8, extra_args: 
     import os
     import shutil
 
-    if not data_dir.startswith("/"):
-        data_dir = f"/data/{data_dir}"
+    data_dir = ",".join(p if p.startswith("/") else f"/data/{p}" for p in (q.strip() for q in data_dir.split(",")) if p)
     _, local_bank, _ = _preflight("smoke", data_dir, n_ckpts=2, resume_from="")
-    vec_file, _ = _vec_bank_file(local_bank)
-
-    tiny = "/root/bank_smoke"
-    if not os.path.exists(tiny):
-        os.makedirs(tiny)
-        with open(f"{local_bank}/records.jsonl") as fin, open(f"{tiny}/records.jsonl", "w") as fout:
-            for i, line in enumerate(fin):
-                if i >= n_records:
-                    break
-                fout.write(line)
-        shutil.copy(f"{local_bank}/{vec_file}", f"{tiny}/{vec_file}")
-    print(f"[modal-smoke] tiny bank: first {n_records} records", flush=True)
+    # one tiny bank per staged part (first n_records of its records.jsonl + its full vecs file) -> a comma list exercises
+    # pretrain.py's multi-part path end to end (a single part keeps the legacy /root/bank_smoke name)
+    parts = local_bank.split(",")
+    tinies = []
+    for k, part in enumerate(parts):
+        vec_file, _ = _vec_bank_file(part)
+        tiny = "/root/bank_smoke" if len(parts) == 1 else f"/root/bank_smoke_{k}"
+        if not os.path.exists(tiny):
+            os.makedirs(tiny)
+            with open(f"{part}/records.jsonl") as fin, open(f"{tiny}/records.jsonl", "w") as fout:
+                for i, line in enumerate(fin):
+                    if i >= n_records:
+                        break
+                    fout.write(line)
+            shutil.copy(f"{part}/{vec_file}", f"{tiny}/{vec_file}")
+        tinies.append(tiny)
+        print(f"[modal-smoke] tiny bank {k}: first {n_records} records of {part} -> {tiny}", flush=True)
+    tiny = ",".join(tinies)
 
     launcher = ["torchrun", "--standalone", f"--nproc_per_node={nproc}"] if nproc > 1 else ["python"]
     cmd = launcher + [
@@ -367,7 +437,7 @@ t0 = time.time()
 tok = AutoTokenizer.from_pretrained(MODEL)
 m = AutoModelForCausalLM.from_pretrained(ck, dtype=torch.bfloat16, attn_implementation='sdpa', device_map={{'': 'cuda:0'}})
 print(f'[reload] loaded {{type(m).__name__}} from {{ck}} in {{time.time() - t0:.0f}}s', flush=True)
-recs = [json.loads(l) for _, l in zip(range(8), open('{tiny}/records.jsonl'))]
+recs = [json.loads(l) for _, l in zip(range(8), open('{tinies[0]}/records.jsonl'))]
 losses = []
 for r in recs:
     ids, labs, pos = build_sft_ids(tok, r['target_text'])
@@ -411,6 +481,7 @@ def fp8_eval(data_dir: str, n_records: int = 6400, extra_args: str = "", script:
         if not data_dir.startswith("/"):
             data_dir = f"/data/{data_dir}"
         _, local_bank, _ = _preflight("smoke", data_dir, n_ckpts=2, resume_from="")
+        local_bank = local_bank.split(",")[0]   # the harness carves its tiny bank from the first part
         tiny = "/root/bank_fp8eval"
         if not os.path.exists(tiny):
             os.makedirs(tiny)
@@ -471,6 +542,7 @@ def fullft_bench(data_dir: str, configs: str = "32x64;64x32;128x16", n_records: 
     if not data_dir.startswith("/"):
         data_dir = f"/data/{data_dir}"
     _, local_bank, _ = _preflight("_bench_fullft", data_dir, n_ckpts=1, resume_from="")   # stages only; no save_dir is created
+    local_bank = local_bank.split(",")[0]   # the bench replicates the first part's records
     vec_file, _ = _vec_bank_file(local_bank)
     bank = f"/root/bank_bench_{n_records}"
     lines = open(f"{local_bank}/records.jsonl").read().splitlines()

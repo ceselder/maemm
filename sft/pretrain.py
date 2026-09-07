@@ -6,6 +6,11 @@ marker. Teacher-force the target.
 
     torchrun --standalone --nproc_per_node=8 scripts/pretrain.py --data-dir data/pretrain --epochs 1
 
+--data-dir takes ONE bank or a comma-separated list of PART banks (each records.jsonl + vecs.f16/f32 + build_stats.json):
+the parts are consumed as one virtual bank -- records concatenated in the listed order, vector rows likewise, so the
+per-rank sharding, length-sort/shuffle batching and --skip-steps resume are exactly those of the merged file (which no
+longer fits a Modal volume at 100M+ rows). See load_shard / VecBank / TokRows.
+
 Speed knobs (all exact -- none changes the optimization):
     --compile [--compile-mode default|max-autotune|reduce-overhead]   torch.compile the forward
     --grad-ckpt 0 --autocast-bf16                                     no recompute, bf16 LoRA matmuls
@@ -17,6 +22,7 @@ Composition knob (NOT exact -- changes which examples share an optimizer step, n
     --length-bucket   i.i.d. example windows per optimizer step, length-sorted into micro-batches (see step_groups)
 """
 import argparse
+import array
 import contextlib
 import json
 import math
@@ -74,25 +80,223 @@ def gather_rows(vecs, idx):
     return torch.from_numpy(np.array(vecs[idx], dtype=np.float32))   # np.array = always a writable copy
 
 
+def tokenize_targets(tok, texts):
+    """Target token ids + EOS for a batch of target_text strings -- the per-record tail build_sft_ids appends."""
+    ids = tok(list(texts), add_special_tokens=False, padding=False, truncation=False)["input_ids"]
+    return [list(t) + [tok.eos_token_id] for t in ids]
+
+
 def tokenize_records(records, tok, max_seq, chunk_size=4096):
     """Tokenize targets in batches and build the constant chat prompt only once.
 
     Same IDs/labels/truncation as build_sft_ids per record, without millions of repeated
     chat-template calls. Bounded tokenizer batches keep startup memory independent of
     the bank size beyond the tokenized rows the trainer already retains.
+    (The trainer itself streams through load_shard -> TokRows; this list form is kept for callers/tests.)
     """
     prompt, positions = build_prompt_ids(tok)
     prompt_labels = [-100] * len(prompt)
     rows = []
     for start in range(0, len(records), chunk_size):
         chunk = records[start:start + chunk_size]
-        targets = tok([r["target_text"] for r in chunk], add_special_tokens=False,
-                      padding=False, truncation=False)["input_ids"]
-        for record, ids in zip(chunk, targets):
-            target = list(ids) + [tok.eos_token_id]
+        for record, target in zip(chunk, tokenize_targets(tok, [r["target_text"] for r in chunk])):
             rows.append(((prompt + target)[:max_seq], (prompt_labels + target)[:max_seq],
                          positions, record["vec_idx"]))
     return rows
+
+
+# ---- multi-part banks: --data-dir a,b,c = the parts virtually concatenated in order (records AND vector rows) ----
+def parse_data_dirs(spec):
+    """--data-dir value -> list of bank dirs. 'a' -> ['a']; 'a,b,c' -> three parts, concatenated in this order."""
+    dirs = [d.strip() for d in str(spec).split(",") if d.strip()]
+    assert dirs, f"--data-dir names no bank: {spec!r}"
+    return dirs
+
+
+def count_lines(path, chunk=1 << 24):
+    """== sum(1 for _ in open(path, 'rb')): newlines, plus one for a final line without '\\n'. Counts in 16 MB blocks
+    instead of materialising one object per line (200M lines)."""
+    n, last = 0, b""
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(chunk)
+            if not buf:
+                break
+            n += buf.count(b"\n")
+            last = buf[-1:]
+    return n + (1 if last and last != b"\n" else 0)
+
+
+class VecBank:
+    """Vector rows of one or more bank parts addressed by GLOBAL row index: part p holds rows [offsets[p], offsets[p+1]),
+    exactly as if the parts' vecs files had been concatenated in --data-dir order. Indexing mirrors the single memmap it
+    replaces (int -> [D] row; list/array of ints -> [n, D]); ONE part simply forwards to its memmap (no dispatch at all,
+    so single-bank runs read bytes exactly as before). Parts may mix vecs.f32 / vecs.f16 (gather_rows upcasts anyway)."""
+
+    def __init__(self, dirs):
+        self.dirs, self.parts, self.files = list(dirs), [], []
+        for d in self.dirs:
+            for fname, dt in VEC_BANK_FILES:            # f32 preferred if both exist, as in open_vec_bank
+                path = os.path.join(d, fname)
+                if os.path.exists(path):
+                    break
+            else:
+                raise FileNotFoundError(f"no vecs.f32 / vecs.f16 in {d}")
+            n = os.path.getsize(path) // (D_MODEL * np.dtype(dt).itemsize)
+            self.parts.append(np.memmap(path, dtype=dt, mode="r", shape=(n, D_MODEL)))
+            self.files.append(fname)
+        self.sizes = np.array([p.shape[0] for p in self.parts], dtype=np.int64)
+        self.offsets = np.concatenate([[0], np.cumsum(self.sizes)]).astype(np.int64)
+        self.n = int(self.offsets[-1])
+        self.dtype = np.result_type(*[p.dtype for p in self.parts])
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        if len(self.parts) == 1:
+            return self.parts[0][idx]
+        if isinstance(idx, (int, np.integer)):
+            if not 0 <= idx < self.n:
+                raise IndexError(f"vector row {idx} out of range ({self.n} rows)")
+            p = int(np.searchsorted(self.offsets, idx, side="right")) - 1
+            return self.parts[p][int(idx) - int(self.offsets[p])]
+        idx = np.asarray(idx, dtype=np.int64)
+        if idx.size and (idx.min() < 0 or idx.max() >= self.n):
+            raise IndexError(f"vector rows out of range ({self.n} rows)")
+        part = np.searchsorted(self.offsets, idx, side="right") - 1
+        out = np.empty((len(idx), D_MODEL), dtype=self.dtype)
+        for q in np.unique(part):
+            m = part == q
+            out[m] = self.parts[q][idx[m] - self.offsets[q]]
+        return out
+
+
+class TokRows:
+    """This rank's tokenized rows in three flat numpy arrays (target ids int32, row offsets int64, GLOBAL vec_idx int64):
+    ~100 B/row, against ~3.2 KB/row for the list of (ids, labels, pos, vec_idx) tuples plus the record dicts the trainer
+    used to keep resident (measured on realact_short rows: 819 B dict + 2348 B tuple; 203M rows / 8 ranks would be
+    ~80 GB per rank, 640 GB per node). Row i materialises on demand as EXACTLY the tuple tokenize_records built --
+    ((prompt + target)[:max_seq], (prompt_labels + target)[:max_seq], positions, vec_idx) -- so the training loop,
+    pack_examples and the prefix-cache path index it unchanged; lengths() is the len(row[0]) vector step_groups sorts."""
+
+    def __init__(self, prompt, positions, max_seq):
+        self.prompt, self.prompt_labels = list(prompt), [-100] * len(prompt)
+        self.positions, self.max_seq = positions, max_seq
+        assert array.array("i").itemsize == 4 and array.array("q").itemsize == 8
+        self._flat, self._offs, self._vidx = array.array("i"), array.array("q", [0]), array.array("q")
+        self.flat = self.offs = self.vidx = None
+
+    def extend(self, targets, vec_idxs):
+        """Append rows: targets = token-id lists INCLUDING eos (tokenize_targets); vec_idxs = GLOBAL vector rows."""
+        assert self.flat is None, "TokRows already finalized"
+        for t, v in zip(targets, vec_idxs):
+            self._flat.extend(t)
+            self._offs.append(len(self._flat))
+            self._vidx.append(v)
+
+    def finalize(self):
+        """array.array -> numpy views (no copy; the views keep the buffers alive). Returns self."""
+        self.flat = np.frombuffer(self._flat, dtype=np.int32) if len(self._flat) else np.zeros(0, np.int32)
+        self.offs = np.frombuffer(self._offs, dtype=np.int64)
+        self.vidx = np.frombuffer(self._vidx, dtype=np.int64) if len(self._vidx) else np.zeros(0, np.int64)
+        return self
+
+    def __len__(self):
+        return len(self.vidx)
+
+    def __getitem__(self, i):
+        i = int(i)
+        if not -len(self) <= i < len(self):
+            raise IndexError(i)
+        if i < 0:
+            i += len(self)
+        target = self.flat[self.offs[i]:self.offs[i + 1]].tolist()
+        return ((self.prompt + target)[:self.max_seq], (self.prompt_labels + target)[:self.max_seq],
+                self.positions, int(self.vidx[i]))
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def lengths(self):
+        """len(row[0]) for every row without materialising them: min(len(prompt) + len(target), max_seq), int64."""
+        return np.minimum(len(self.prompt) + np.diff(self.offs), self.max_seq).astype(np.int64)
+
+    def nbytes(self):
+        return int(self.flat.nbytes + self.offs.nbytes + self.vidx.nbytes)
+
+
+def load_shard(data_dirs, rank, world, tok, max_seq, max_examples=0, max_examples_seed=0, chunk_size=4096):
+    """This rank's shard of the bank part(s), streamed and tokenized on the fly (the record dicts are never held).
+
+    Semantics are exactly those of ONE bank made of the parts' records.jsonl concatenated in --data-dir order (global
+    line i = the i-th record, i counting on across parts) and their vecs files concatenated the same way (each record's
+    vec_idx shifted by the vector-row offset of its part). Shard = global lines with i % world == rank, the first
+    n_use // world of them (equal shards); with max_examples > 0 the seeded random subset of n_use lines is dealt
+    round-robin instead. Same deal as the old inline loop, so a single bank is byte-identical to before.
+    Returns (TokRows, VecBank, info dict with per-part line counts / offsets)."""
+    dirs = parse_data_dirs(data_dirs) if isinstance(data_dirs, str) else list(data_dirs)
+    vecs = VecBank(dirs)
+    n_part = np.array([count_lines(os.path.join(d, "records.jsonl")) for d in dirs], dtype=np.int64)
+    rec_offsets = np.concatenate([[0], np.cumsum(n_part)]).astype(np.int64)
+    n_lines = int(n_part.sum())
+    n_use = min(n_lines, max_examples) if max_examples else n_lines
+    keep = n_use // world                                      # equal shards
+    if n_use < n_lines:   # --max-examples: seeded random subset of the bank, dealt round-robin into equal per-rank shards
+        chosen = np.sort(np.random.default_rng(max_examples_seed).permutation(n_lines)[:n_use])
+        mask = np.zeros(n_lines, dtype=bool)
+        mask[chosen[rank::world][:keep]] = True
+        take = mask.__getitem__
+        del chosen
+    else:
+        take = lambda i: i % world == rank                     # noqa: E731
+    prompt, positions = build_prompt_ids(tok)
+    toks = TokRows(prompt, positions, max_seq)
+    texts, vidx = [], []
+
+    def flush():
+        toks.extend(tokenize_targets(tok, texts), vidx)
+        texts.clear(); vidx.clear()
+
+    i = n_taken = 0
+    for p, d in enumerate(dirs):
+        voff, nv = int(vecs.offsets[p]), int(vecs.sizes[p])
+        with open(os.path.join(d, "records.jsonl")) as f:
+            for line in f:
+                if n_taken < keep and take(i):
+                    r = json.loads(line)
+                    v = r["vec_idx"]
+                    if not 0 <= v < nv:
+                        raise AssertionError(f"records reference rows beyond the vector bank: vec_idx {v} in {d} ({nv} vectors)")
+                    texts.append(r["target_text"]); vidx.append(v + voff)
+                    n_taken += 1
+                    if len(texts) == chunk_size:
+                        flush()
+                i += 1
+        assert i == int(rec_offsets[p + 1]), f"{d}/records.jsonl changed while reading ({i - int(rec_offsets[p])} vs {int(n_part[p])} lines)"
+    flush()
+    toks.finalize()
+    assert len(toks) == keep, f"rank {rank}: took {len(toks)} records, expected {keep}"
+    info = dict(dirs=dirs, n_lines_per_part=n_part.tolist(), record_offsets=rec_offsets.tolist(), n_lines=n_lines,
+                n_use=n_use, keep=keep, n_vecs_per_part=vecs.sizes.tolist(), vec_offsets=vecs.offsets.tolist(),
+                n_vecs=len(vecs), vec_files=list(vecs.files))
+    return toks, vecs, info
+
+
+def bank_stats_n_examples(dirs):
+    """Sum of build_stats.json n_examples over the parts, or None if any part lacks it (cross-check only: the
+    sharding is defined on records.jsonl line counts, which load_shard counts itself)."""
+    total = 0
+    for d in dirs:
+        path = os.path.join(d, "build_stats.json")
+        if not os.path.exists(path):
+            return None
+        try:
+            total += int(json.load(open(path))["n_examples"])
+        except (KeyError, ValueError, TypeError):
+            return None
+    return total
 
 
 class LabelHeadLM(torch.nn.Module):
@@ -277,7 +481,9 @@ def step_groups(lengths, batch_size, grad_accum, epoch, length_bucket=False):
 def main():
     cfg = TrainConfig()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", default="data/pretrain")
+    ap.add_argument("--data-dir", default="data/pretrain",
+                    help="bank dir, or a comma-separated list of PART bank dirs consumed as one virtual bank (records and "
+                         "vector rows concatenated in the listed order; sharding/batching/resume identical to the merged bank)")
     ap.add_argument("--init-adapter", default=cfg.init_adapter)
     ap.add_argument("--save-dir", default=cfg.save_dir)
     ap.add_argument("--lr", type=float, default=cfg.lr)
@@ -375,29 +581,26 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    # stream + shard while reading: 20M-record banks would otherwise put 8 full copies of the record list in host RAM
-    n_lines = sum(1 for _ in open(f"{a.data_dir}/records.jsonl", "rb"))
-    n_use = min(n_lines, a.max_examples) if a.max_examples else n_lines
-    keep = n_use // world                                     # equal shards (see below)
-    if n_use < n_lines:   # --max-examples: seeded random subset of the bank, dealt round-robin into equal per-rank shards
-        chosen = np.sort(np.random.default_rng(a.max_examples_seed).permutation(n_lines)[:n_use])
-        mine = set(chosen[rank::world][:keep].tolist())
-        take = mine.__contains__
-        del chosen
-    else:
-        take = lambda i: i % world == rank
-    records = []
-    with open(f"{a.data_dir}/records.jsonl") as f:
-        for i, l in enumerate(f):
-            if take(i) and len(records) < keep:
-                records.append(json.loads(l))
-    vec_path, vec_bytes = next((os.path.join(a.data_dir, fn), np.dtype(dt).itemsize) for fn, dt in VEC_BANK_FILES
-                               if os.path.exists(os.path.join(a.data_dir, fn)))
-    n_vecs = os.path.getsize(vec_path) // (D_MODEL * vec_bytes)
-    assert all(r["vec_idx"] < n_vecs for r in records), "records reference rows beyond the vector bank"
-    vecs, vec_file = open_vec_bank(a.data_dir, n_vecs)
+    # stream + shard + tokenize while reading (load_shard): one pass over the part(s), this rank's rows only, kept as
+    # flat arrays (~100 B/row) -- 200M-record corpora would otherwise put ~640 GB of dicts + token lists in host RAM.
+    data_dirs = parse_data_dirs(a.data_dir)
+    t_load = time.time()
+    toks_cache, vecs, bank = load_shard(data_dirs, rank, world, tok, a.max_seq, a.max_examples, a.max_examples_seed)
+    vec_file = bank["vec_files"][0] if len(data_dirs) == 1 else "+".join(bank["vec_files"])
     if is_main:
-        print(f"{len(records)*world} records, {n_vecs} vectors ({vec_file}), world={world}", flush=True)
+        if len(data_dirs) > 1:
+            for p, d in enumerate(data_dirs):
+                print(f"[pretrain] bank part {p}: {d}: {bank['n_lines_per_part'][p]} records (global rows "
+                      f"{bank['record_offsets'][p]}..{bank['record_offsets'][p + 1] - 1}), {bank['n_vecs_per_part'][p]} "
+                      f"vectors ({bank['vec_files'][p]}, global vector rows from {bank['vec_offsets'][p]})", flush=True)
+            n_stats = bank_stats_n_examples(data_dirs)
+            print(f"[pretrain] {len(data_dirs)} bank parts virtually concatenated: n_examples total = {bank['n_lines']} "
+                  f"records, {bank['n_vecs']} vectors" + ("" if n_stats is None else
+                  f" (build_stats.json n_examples sum = {n_stats}" + ("" if n_stats == bank["n_lines"] else
+                  " -- MISMATCH with the line counts, which define the sharding") + ")"), flush=True)
+        print(f"{len(toks_cache)*world} records, {len(vecs)} vectors ({vec_file}), world={world}", flush=True)
+        print(f"[pretrain] loaded + tokenized {len(toks_cache)} local records in {time.time() - t_load:.1f}s "
+              f"({toks_cache.nbytes() / 2**20:.0f} MB of tokenized rows on this rank)", flush=True)
 
     FT = None
     if a.full_ft:
@@ -513,12 +716,8 @@ def main():
                 print("[pretrain] prefix-share-step ON: one prefix fwd/bwd per optimizer step; "
                       "fp32 cache-gradient accumulation, one parameter-gradient reduction", flush=True)
 
-    # pre-tokenize once. Packed path: shuffle-once greedy packing into fixed pack-len blocks (zero
-    # intra-block padding, one static shape for compile). Legacy path: length-bucketed padded batches.
-    t_tokenize = time.time()
-    toks_cache = tokenize_records(records, tok, a.max_seq)
-    if is_main:
-        print(f"[pretrain] tokenized {len(toks_cache)} local records in {time.time() - t_tokenize:.1f}s", flush=True)
+    # rows were tokenized while loading (toks_cache). Packed path: shuffle-once greedy packing into fixed pack-len
+    # blocks (zero intra-block padding, one static shape for compile). Legacy path: length-bucketed padded batches.
     if a.pack_len:
         blocks = pack_examples(toks_cache, a.pack_len, seed=0)
         if world > 1:  # equalize block count across ranks (packing yields ±1 per rank → DDP deadlock)
@@ -535,7 +734,7 @@ def main():
     else:
         # micro-batch composition per epoch: step_groups (default = legacy length-sorted buckets; --length-bucket =
         # i.i.d. windows sorted within the step). Lengths are of the full prompt+target row (prompt is constant).
-        ex_lengths = np.fromiter((len(t[0]) for t in toks_cache), dtype=np.int64, count=len(toks_cache))
+        ex_lengths = toks_cache.lengths()   # == len(row[0]) per row, without materialising 25M rows
         micro_per_epoch = math.ceil(len(toks_cache) / a.batch_size)
         if is_main:
             print(f"[pretrain] micro-batch composition: {'length-bucket (i.i.d. step windows, length-sorted micro-batches)' if a.length_bucket else 'legacy (length-sorted micro-batches, shuffled whole)'}", flush=True)
@@ -744,7 +943,7 @@ def main():
                                "peak_mem_gb": peak_gb}, step=step)
             if step % save_every == 0 and step:
                 save_ckpt(f"{a.save_dir}/step_{step}", step)
-            global_seen = min((step + 1) * a.batch_size * a.grad_accum * world, len(records) * world)
+            global_seen = min((step + 1) * a.batch_size * a.grad_accum * world, len(toks_cache) * world)
             for requested in save_examples:
                 if requested <= global_seen and requested not in saved_examples:
                     path = f"{a.save_dir}/examples_{requested}"
