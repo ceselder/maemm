@@ -436,6 +436,165 @@ def fp8_eval(data_dir: str, n_records: int = 6400, extra_args: str = "", script:
         raise RuntimeError(f"fp8_eval exited rc={rc}")
 
 
+@app.function(
+    image=image,
+    gpu=os.environ.get("SFT_GPU", "B200:8"),
+    volumes={"/data": vol},
+    secrets=[
+        modal.Secret.from_name("maemm-hf"),
+        modal.Secret.from_name("maemm-wandb"),
+    ],
+    timeout=int(os.environ.get("SFT_BENCH_TIMEOUT_S", str(55 * 60))),   # hard cap: the container MUST exit
+    memory=256 * 1024,
+)
+def fullft_bench(data_dir: str, configs: str = "32x64;64x32;128x16", n_records: int = 132000,
+                 stop_after_step: int = 6, max_seq: int = 160, lr: float = 5e-5,
+                 common: str = "--full-ft --prefix-cache --grad-ckpt 0 --pad-multiple 1 --length-bucket --log-steps 1",
+                 oom_fallback: str = "--prefix-accum 2", deadline_min: float = 40.0) -> dict:
+    """SPEED-ONLY bench of --full-ft micro-batch configs on ONE 8-GPU container (deploy as a separate app, e.g.
+    SFT_APP_NAME=maemm-sft-fullft-bench SFT_SUPERVISOR=0). Stages the (tiny) bank, replicates records.jsonl to
+    n_records rows (same vec_idx -> the vecs file stays tiny; speed depends only on the target-length distribution),
+    then runs each `BxGA[:extra flags]` config (';'-separated) as its own world-8 torchrun (effective batch = 8*B*GA)
+    with --no-wandb and ckpts under /tmp, and SIGTERMs it after `stop_after_step` logged optimizer steps so no 54 GB
+    final save happens. A config that OOMs is re-run once with `oom_fallback` appended (--grad-ckpt 1 is not
+    combinable with --prefix-cache). Nothing is written under /data/sft_mix. Returns the parsed per-step metrics and
+    prints a JSON summary between FULLFT_BENCH_JSON_BEGIN / FULLFT_BENCH_JSON_END."""
+    import json
+    import os
+    import re
+    import shutil
+    import signal
+    import subprocess
+    import time
+
+    t_start = time.time()
+    if not data_dir.startswith("/"):
+        data_dir = f"/data/{data_dir}"
+    _, local_bank, _ = _preflight("_bench_fullft", data_dir, n_ckpts=1, resume_from="")   # stages only; no save_dir is created
+    vec_file, _ = _vec_bank_file(local_bank)
+    bank = f"/root/bank_bench_{n_records}"
+    lines = open(f"{local_bank}/records.jsonl").read().splitlines()
+    if not os.path.exists(bank):
+        os.makedirs(bank)
+        with open(f"{bank}/records.jsonl", "w") as f:
+            for i in range(n_records):
+                f.write(lines[i % len(lines)] + "\n")
+        shutil.copy(f"{local_bank}/{vec_file}", f"{bank}/{vec_file}")
+    print(f"[bench] {len(lines)} source records replicated to {n_records} rows at {bank}", flush=True)
+
+    step_re = re.compile(r"ep(\d+) step (\d+)/(\d+) loss ([\d.]+) \| (\d+) TFLOP/s MFU (\d+)% \| ([\d.]+) ex/s (\d+) tok/s "
+                         r"pad ([\d.]+)% \(([\d.]+) s/step, (\d+) micro\) \| peak ([\d.]+) GB")
+    env = _train_env("nccl")
+
+    def gpu_mem_used():
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True).stdout
+            return [int(x) for x in out.split()] if out.strip() else []
+        except Exception as e:  # noqa -- nvidia-smi missing: memory check is best-effort
+            print(f"[bench] nvidia-smi unavailable ({e!r})", flush=True)
+            return []
+
+    def kill_stragglers():
+        """SIGKILL any leftover torchrun / pretrain.py worker (pure /proc scan: debian_slim has no pkill)."""
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit() or int(pid) == os.getpid():
+                continue
+            try:
+                cmd = open(f"/proc/{pid}/cmdline", "rb").read()
+            except OSError:
+                continue
+            if b"SL/pretrain.py" in cmd or b"torchrun" in cmd:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def wait_gpus_free(timeout_s=120):
+        t0 = time.time()
+        used = gpu_mem_used()
+        while used and max(used) > 2048 and time.time() - t0 < timeout_s:
+            time.sleep(5)
+            used = gpu_mem_used()
+        return used
+
+    def run_one(tag, B, GA, extra):
+        save_dir = f"/tmp/bench_{tag}"
+        cmd = ["torchrun", "--standalone", "--nproc_per_node=8", "SL/pretrain.py",
+               "--data-dir", bank, "--save-dir", save_dir, "--run-name", f"_bench_{tag}",
+               "--n-ckpts", "1", "--epochs", "1", "--batch-size", str(B), "--grad-accum", str(GA),
+               "--lr", str(lr), "--max-seq", str(max_seq), "--no-wandb"] + common.split() + extra.split()
+        print(f"[bench {tag}] launching:", " ".join(cmd), flush=True)
+        t0 = time.time()
+        p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, start_new_session=True)
+        steps, notes, oom, stopped = [], [], False, False
+        for line in p.stdout:
+            print(line, end="", flush=True)
+            if "CUDA out of memory" in line or "OutOfMemoryError" in line:
+                oom = True
+            if (line.startswith("[fullft]") or line.startswith("[pretrain]") or line.startswith("steps_total")
+                    or "records," in line[:40]):
+                notes.append(line.rstrip())
+            m = step_re.search(line)
+            if m:
+                steps.append(dict(step=int(m[2]), steps_total=int(m[3]), loss=float(m[4]), tflops=float(m[5]),
+                                  mfu=int(m[6]), ex_s=float(m[7]), tok_s=float(m[8]), pad_frac=float(m[9]) / 100,
+                                  dt=float(m[10]), micro=int(m[11]), peak_gb=float(m[12])))
+                if int(m[2]) >= stop_after_step:
+                    stopped = True
+                    print(f"[bench {tag}] {len(steps)} steps logged -> SIGTERM torchrun (skip the final save)", flush=True)
+                    os.killpg(p.pid, signal.SIGTERM)
+                    break
+        try:
+            rest, _ = p.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            rest, _ = p.communicate()
+        if rest:
+            oom = oom or ("CUDA out of memory" in rest or "OutOfMemoryError" in rest)
+            print(rest[-3000:], flush=True)
+        kill_stragglers()
+        used = wait_gpus_free()
+        shutil.rmtree(save_dir, ignore_errors=True)
+        meas = [s for s in steps if s["step"] >= 2] or steps[1:] or steps
+        summ = {}
+        if meas:
+            ex_per_step = 8 * B * GA
+            mean_dt = sum(s["dt"] for s in meas) / len(meas)
+            summ = dict(n_measured=len(meas), mean_dt=mean_dt, median_dt=sorted(s["dt"] for s in meas)[len(meas) // 2],
+                        ex_s=ex_per_step / mean_dt, mean_ex_s_printed=sum(s["ex_s"] for s in meas) / len(meas),
+                        mean_tok_s=sum(s["tok_s"] for s in meas) / len(meas),
+                        mean_mfu=sum(s["mfu"] for s in meas) / len(meas), mean_pad=sum(s["pad_frac"] for s in meas) / len(meas),
+                        peak_gb=max(s["peak_gb"] for s in steps))
+        res = dict(tag=tag, batch_size=B, grad_accum=GA, eff_batch=8 * B * GA, extra=extra, cmd=" ".join(cmd),
+                   rc=p.returncode, stopped_by_bench=stopped, oom=oom, wall_s=time.time() - t0,
+                   gpu_mem_used_after_mib=used, steps=steps, notes=notes, summary=summ)
+        print(f"[bench {tag}] done: rc={p.returncode} stopped={stopped} oom={oom} wall={res['wall_s']:.0f}s "
+              f"summary={json.dumps(summ)} gpu_mem_after={used}", flush=True)
+        return res
+
+    results = {"data_dir": data_dir, "n_records": n_records, "common": common, "max_seq": max_seq, "lr": lr,
+               "stop_after_step": stop_after_step, "gpu": __import__("torch").cuda.get_device_name(0) if __import__("torch").cuda.is_available() else "?",
+               "runs": []}
+    for spec in [s.strip() for s in configs.split(";") if s.strip()]:
+        bga, _, extra = spec.partition(":")
+        B, GA = (int(x) for x in bga.lower().split("x"))
+        elapsed_min = (time.time() - t_start) / 60
+        if elapsed_min > deadline_min:
+            print(f"[bench] {elapsed_min:.0f} min elapsed > deadline {deadline_min} min -> skipping {spec}", flush=True)
+            results["runs"].append(dict(tag=f"mb{B}_ga{GA}", batch_size=B, grad_accum=GA, skipped="deadline"))
+            continue
+        r = run_one(f"mb{B}_ga{GA}", B, GA, extra.strip())
+        results["runs"].append(r)
+        if r["oom"] and oom_fallback and oom_fallback not in extra and (time.time() - t_start) / 60 < deadline_min:
+            print(f"[bench] {spec} OOM -> retrying with {oom_fallback!r}", flush=True)
+            results["runs"].append(run_one(f"mb{B}_ga{GA}_fb", B, GA, (extra + " " + oom_fallback).strip()))
+    results["wall_min"] = (time.time() - t_start) / 60
+    print("FULLFT_BENCH_JSON_BEGIN"); print(json.dumps(results)); print("FULLFT_BENCH_JSON_END", flush=True)
+    return results
+
+
 @app.function(image=image, timeout=600, cpu=2)
 def env_check():
     """CPU-only image check: pins + the torchao float8 imports pretrain.py --fp8-base relies on."""
@@ -584,3 +743,15 @@ def run_fp8_eval(data_dir: str = "banks/last5_rp", n_records: int = 6400, extra_
 @app.local_entrypoint()
 def run_env_check():
     env_check.remote()
+
+
+@app.local_entrypoint()
+def run_fullft_bench(data_dir: str = "/data/banks/realact_short_smoke3", configs: str = "32x64;64x32;128x16",
+                     n_records: int = 132000, stop_after_step: int = 6, max_seq: int = 160, lr: float = 5e-5,
+                     common: str = "--full-ft --prefix-cache --grad-ckpt 0 --pad-multiple 1 --length-bucket --log-steps 1",
+                     oom_fallback: str = "--prefix-accum 2", deadline_min: float = 40.0):
+    """Spawn fullft_bench on the DEPLOYED app (detached; prints the call id — poll with modal.FunctionCall.from_id)."""
+    call = modal.Function.from_name(APP_NAME, "fullft_bench").spawn(
+        data_dir=data_dir, configs=configs, n_records=n_records, stop_after_step=stop_after_step, max_seq=max_seq,
+        lr=lr, common=common, oom_fallback=oom_fallback, deadline_min=deadline_min)
+    print(f"spawned fullft_bench on {APP_NAME}: {call.object_id}")
