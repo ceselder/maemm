@@ -270,6 +270,56 @@ def memory_attribution(snap, top=28):
     return "\n".join(lines)
 
 
+def peak_attribution(snap, top=24):
+    """Replay the allocator trace of a torch.cuda.memory._snapshot() (recording must have been on for the whole step):
+    find the moment of maximal live bytes among the blocks allocated since recording started and attribute THAT live set
+    by frame -- the true within-step peak, which for FSDP training sits inside the backward, not at the end of the forward."""
+    import collections
+    import os
+    traces = snap.get("device_traces") or []
+    dev = torch.cuda.current_device()
+    tr = traces[dev] if len(traces) > dev else (traces[0] if traces else [])
+    live, total, best, best_i = {}, 0, -1, -1
+    for i, ev in enumerate(tr):
+        a = ev.get("action")
+        if a == "alloc":
+            live[ev["addr"]] = ev["size"]; total += ev["size"]
+            if total > best:
+                best, best_i = total, i
+        elif a in ("free_completed", "free"):
+            total -= live.pop(ev["addr"], 0)
+    if best_i < 0:
+        return "[mem] peak attribution: no alloc events in the trace"
+    PRIO = ("fla", "modeling_qwen3_5", "cache_utils", "sdpa_attention", "loss_utils", "functional.py", "checkpoint.py",
+            "prefix_cache", "_fsdp", "fullft.py", "pretrain.py", "autograd")
+    live = {}
+    for ev in tr[: best_i + 1]:
+        a = ev.get("action")
+        if a == "alloc":
+            live[ev["addr"]] = ev
+        elif a in ("free_completed", "free"):
+            live.pop(ev["addr"], None)
+    agg = collections.Counter()
+    for ev in live.values():
+        frames = ev.get("frames") or []
+        bestf, rank = None, len(PRIO)
+        for fr in frames:
+            fn = fr.get("filename", "")
+            for r, pat in enumerate(PRIO):
+                if pat in fn and r < rank:
+                    bestf, rank = fr, r
+                    break
+        if bestf is None and frames:
+            bestf = frames[0]
+        key = f"{os.path.basename(bestf['filename'])}:{bestf['line']} {bestf['name']}" if bestf else "<no frames>"
+        agg[key] += ev["size"]
+    lines = [f"[mem] WITHIN-STEP PEAK: {best / 2**30:.1f} GB of blocks allocated since the step began were live at trace event "
+             f"{best_i}/{len(tr)} (add the pre-step resident bytes for the absolute peak); attribution:"]
+    for k, v in agg.most_common(top):
+        lines.append(f"[mem]  {v / 2**30:7.2f} GB  {k}")
+    return "\n".join(lines)
+
+
 class StepProfiler:
     """Profile ONE optimizer step (rank 0): kernel table by self device time, GPU busy / NCCL fractions, and a memory
     attribution snapshot taken by ``mem_probe`` (call it after the first micro-batch's forward, before its backward =
@@ -285,8 +335,9 @@ class StepProfiler:
         if not self.enabled:
             return self
         torch.cuda.synchronize()
+        self.resident_gb = torch.cuda.memory_allocated() / 2**30
         if self.mem:
-            torch.cuda.memory._record_memory_history(max_entries=400000)
+            torch.cuda.memory._record_memory_history(max_entries=3_000_000)
         self.prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                        torch.profiler.ProfilerActivity.CUDA])
         self.prof.__enter__()
@@ -299,8 +350,8 @@ class StepProfiler:
         torch.cuda.synchronize()
         alloc = torch.cuda.memory_allocated() / 2**30
         snap = torch.cuda.memory._snapshot()
-        torch.cuda.memory._record_memory_history(enabled=None)
-        self.mem_text = f"[mem] probe: allocated {alloc:.1f} GB, peak so far {torch.cuda.max_memory_allocated() / 2**30:.1f} GB\n" + memory_attribution(snap)
+        self.mem_text = (f"[mem] end-of-forward probe: allocated {alloc:.1f} GB (resident at step start {self.resident_gb:.1f} GB), "
+                         f"peak so far {torch.cuda.max_memory_allocated() / 2**30:.1f} GB\n" + memory_attribution(snap, top=12))
 
     def __exit__(self, *exc):
         if not self.enabled:
@@ -309,6 +360,10 @@ class StepProfiler:
         self.wall = time.time() - self.t0
         self.prof.__exit__(*exc)
         if self.mem:
+            try:
+                self.peak_text = peak_attribution(torch.cuda.memory._snapshot())
+            except Exception as e:  # noqa
+                self.peak_text = f"[mem] peak attribution failed: {e!r}"
             torch.cuda.memory._record_memory_history(enabled=None)
         return False
 
@@ -334,6 +389,10 @@ class StepProfiler:
         lines += ["[prof] " + l for l in table.splitlines()]
         if self.mem_text:
             lines.append(self.mem_text)
+        if getattr(self, "peak_text", None):
+            lines.append(f"[mem] resident at step start {self.resident_gb:.1f} GB; max_memory_allocated now "
+                         f"{torch.cuda.max_memory_allocated() / 2**30:.1f} GB")
+            lines.append(self.peak_text)
         return "\n".join(lines)
 
 
