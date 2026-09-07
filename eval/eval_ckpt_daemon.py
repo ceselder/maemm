@@ -14,7 +14,8 @@ exactly as inside the trainer. Memory: HF base bf16 54 GB + adapter + SAE encode
 --vllm-gpu-mem 0.5 of the card (89 GB on a 178 GB B200, 70 GB on a 141 GB H200; prefill budget 24k tokens keeps KV headroom).
 
 Loop (eval/modal_eval_last5.py conventions): vol.reload -> newest un-evaled <ckpt_dir>/step_* (+ final as
---final-step) first -> load the adapter -> publish to vLLM layout -> inline_eval + run_extra_evals_gpu -> wandb.log
+--final-step, + the trainer's --save-examples points <ckpt_dir>/examples_<M>, logged at their optimizer step with an
+extra `examples` field -- see examples_ckpt_meta) first -> load the adapter -> publish to vLLM layout -> inline_eval + run_extra_evals_gpu -> wandb.log
 ({..., "ckpt_step": k}, commit=True; define_metric makes ckpt_step the x-axis, so backfill lands out of order) ->
 judge stage in the background (results polled and logged under their ckpt_step) -> state file on the volume.
 One wandb run per RL run (name/id = <tag>), NEVER resuming the RL run itself (two writers race on _step).
@@ -53,6 +54,12 @@ def parse_args(argv=None):
     ap.add_argument("--poll-s", type=int, default=120)
     ap.add_argument("--once", action="store_true", help="evaluate what is pending, then exit")
     ap.add_argument("--only-step", type=int, default=None, help="evaluate only this step (ignores the state file)")
+    ap.add_argument("--list-only", action="store_true",
+                    help="DRY RUN: print every complete checkpoint under --ckpt-dir with its ckpt_step (step_*, examples_* with the derived "
+                         "step, final), which are already in the state file and what would be evaluated, then exit (no GPU, no model)")
+    ap.add_argument("--eff-batch", type=int, default=0,
+                    help="examples per optimizer step of the run (world x batch x grad_accum), ONLY the fallback for an examples_<M> dir "
+                         "lacking training_progress.json / SAVE_DONE step metadata (ckpt_step = ceil(M / eff_batch) - 1); 0 = skip such dirs")
     ap.add_argument("--min-ckpt-mtime", type=float, default=0.0)
     ap.add_argument("--first-adapter", default="/data/sft_mix/last5_rp/final",
                     help="an adapter of the run's LoRA geometry to build the PEFT actor with before the engine (the SFT init)")
@@ -94,7 +101,7 @@ def parse_args(argv=None):
     a.save_dir = a.out_dir            # inline_extra_evals writes its artifacts under <save_dir>/extra_evals
     a.inline_eval_every = 1           # load_eval_assets prints it; every ckpt here is evaluated
     a.cuda_graphs = not a.no_cuda_graphs
-    if a.full_model:
+    if a.full_model and not a.list_only:
         assert a.once and a.only_step is not None, "--full-model needs --once --only-step k (one engine per checkpoint)"
     return a
 
@@ -161,30 +168,115 @@ def resolve_policy_base(ckpt_dir, flag, model, log=print):
     return pb
 
 
-def _scan(ckpt_dir, final_step, min_mtime, full_model=False):
-    """{ckpt_step: dir} of complete checkpoints. LoRA: adapter files present. Full model: SAVE_DONE present (written last)."""
+def examples_ckpt_meta(path, eff_batch=0):
+    """<ckpt_dir>/examples_<M> (sft/pretrain.py --save-examples) -> {"ckpt_step", "examples", "optimizer_updates"[, "examples_actual"]},
+    or None when its optimizer step cannot be determined.
+
+    Where the trainer puts it on the step_* axis: step_<k> is saved at the END of loop iteration k (k+1 optimizer updates applied)
+    and logged here as ckpt_step k. examples_<M> is saved INSIDE the iteration i whose update first brings the examples seen to
+    >= M ((i+1) x eff_batch >= M) and the trainer records step = i + 1 (training_progress.json / SAVE_DONE "step" = optimizer
+    updates applied). The same weights would have been called step_i, so ckpt_step = recorded step - 1 = ceil(M / eff_batch) - 1
+    (2,000,000 examples at eff_batch 4096 -> recorded 489, ckpt_step 488). Sources, in order: training_progress.json (LoRA + full
+    FT; written right after the checkpoint dir, so a scan can race it), SAVE_DONE's "step" (full FT), ceil(M / eff_batch) - 1."""
+    name = os.path.basename(path.rstrip("/"))
+    try:
+        m = int(name.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    rec, actual = None, None
+    tp = f"{path}/training_progress.json"
+    if os.path.exists(tp):
+        try:
+            d = json.load(open(tp))
+            rec, actual = int(d["step"]), d.get("actual_examples")
+        except Exception:  # noqa — half-written; fall through to SAVE_DONE / eff_batch
+            pass
+    if rec is None and os.path.exists(f"{path}/SAVE_DONE"):
+        try:
+            rec = int(json.load(open(f"{path}/SAVE_DONE"))["step"])
+        except Exception:  # noqa
+            pass
+    if rec is None and eff_batch > 0:
+        rec = -(-m // eff_batch)   # ceil(M / eff_batch) = the recorded step
+    if rec is None:
+        return None
+    out = {"ckpt_step": rec - 1, "examples": m, "optimizer_updates": rec}
+    if actual is not None:
+        out["examples_actual"] = int(actual)
+    return out
+
+
+_scan_warned = set()
+
+
+def _scan(ckpt_dir, final_step, min_mtime, full_model=False, eff_batch=0, log=print):
+    """{ckpt_step: dir} of complete checkpoints under ckpt_dir: step_<k> (ckpt_step k), examples_<M> (pretrain.py --save-examples;
+    ckpt_step derived by examples_ckpt_meta) and final (ckpt_step final_step). Complete = LoRA: adapter files present; full model:
+    SAVE_DONE present (written last). An examples_<M> and a step_<k> at the same ckpt_step are the same weights; the examples_ dir
+    wins so its `examples` field gets logged."""
+    def complete(p):
+        w = f"{p}/SAVE_DONE" if full_model else f"{p}/adapter_model.safetensors"
+        ok = os.path.exists(w) and (full_model or os.path.exists(f"{p}/adapter_config.json"))
+        return ok and os.path.getmtime(w) >= min_mtime
+
     avail = {}
     for p in glob.glob(f"{ckpt_dir}/step_*"):
         try:
-            s = int(p.rsplit("_", 1)[-1])
-        except ValueError:
+            k = int(p.rsplit("_", 1)[-1])
+        except ValueError:   # step_<k>.tmp mid-save
             continue
-        if full_model:
-            w = f"{p}/SAVE_DONE"
-            ok = os.path.exists(w)
-        else:
-            w = f"{p}/adapter_model.safetensors"
-            ok = os.path.exists(w) and os.path.exists(f"{p}/adapter_config.json")
-        if ok and os.path.getmtime(w) >= min_mtime:
-            avail[s] = p
-    fw = f"{ckpt_dir}/final/{'SAVE_DONE' if full_model else 'adapter_model.safetensors'}"
-    if os.path.exists(fw) and os.path.getmtime(fw) >= min_mtime:
+        if complete(p):
+            avail[k] = p
+    for p in glob.glob(f"{ckpt_dir}/examples_*"):
+        if not complete(p):
+            continue
+        meta = examples_ckpt_meta(p, eff_batch)
+        if meta is None:
+            if p not in _scan_warned and not p.endswith(".tmp"):
+                _scan_warned.add(p)
+                log(f"[eval-ckpt] {p}: complete but its optimizer step is unknown (no training_progress.json / SAVE_DONE step; "
+                    f"pass --eff-batch to derive it) -> skipped")
+            continue
+        avail[meta["ckpt_step"]] = p
+    if complete(f"{ckpt_dir}/final"):
         avail[final_step] = f"{ckpt_dir}/final"
     return avail
 
 
+def _ckpt_extras(path, eff_batch=0):
+    """Extra wandb / json fields of a checkpoint dir: the --save-examples metadata for examples_<M> ({} otherwise)."""
+    if not os.path.basename(path.rstrip("/")).startswith("examples_"):
+        return {}
+    meta = examples_ckpt_meta(path, eff_batch) or {}
+    return {k: v for k, v in meta.items() if k != "ckpt_step"}
+
+
+def list_only(a, log=print):
+    """--list-only: the discovery + state-file view, nothing loaded."""
+    avail = _scan(a.ckpt_dir, a.final_step, a.min_ckpt_mtime, full_model=a.full_model, eff_batch=a.eff_batch, log=log)
+    try:
+        done = set(json.load(open(a.state))["done"])
+    except Exception:  # noqa
+        done = set()
+    if a.only_step is not None:
+        avail = {k: v for k, v in avail.items() if k == a.only_step}
+    log(f"[eval-ckpt] --list-only {a.ckpt_dir} ({'full-model' if a.full_model else 'LoRA'} layout, final -> ckpt_step {a.final_step}) "
+        f"| state {a.state} | previously evaled {sorted(done) or 'none'}")
+    for k in sorted(avail):
+        x = _ckpt_extras(avail[k], a.eff_batch)
+        note = (f"  <- --save-examples point {x['examples']:,} (actual {x.get('examples_actual', '?')}, {x['optimizer_updates']} optimizer "
+                f"updates -> ckpt_step {k})") if x else ""
+        log(f"  ckpt_step {k:>6}  {'DONE   ' if k in done else 'pending'}  {avail[k]}{note}")
+    pending = sorted(k for k in avail if k not in done)
+    log(f"[eval-ckpt] would evaluate (latest first): {pending[::-1] or 'nothing'}")
+    return {"avail": {k: avail[k] for k in sorted(avail)}, "done": sorted(done), "pending_latest_first": pending[::-1]}
+
+
 def main():
     a = parse_args()
+    if a.list_only:
+        list_only(a)
+        return
     import torch
     import wandb
     from peft import PeftModel
@@ -253,7 +345,7 @@ def main():
         f"| extra evals {'ON' if EX is not None else 'OFF'} | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB")
     # ---- engine (rl_disagg: fast steering hook + CUDA graphs), then the one-time numeric injection proof ----
     if a.full_model:
-        avail0 = _scan(a.ckpt_dir, a.final_step, a.min_ckpt_mtime, full_model=True)
+        avail0 = _scan(a.ckpt_dir, a.final_step, a.min_ckpt_mtime, full_model=True, eff_batch=a.eff_batch)
         assert a.only_step in avail0, f"--full-model: step {a.only_step} has no complete checkpoint (SAVE_DONE) under {a.ckpt_dir}: {sorted(avail0)}"
         a.engine_model, a.engine_lora = avail0[a.only_step], False
         log(f"full-model mode: engine serves {a.engine_model} (no LoRA); HF side = clean base for scoring")
@@ -296,6 +388,7 @@ def main():
         wandb.define_metric("ckpt_step")
         wandb.define_metric("eval/*", step_metric="ckpt_step")
         wandb.define_metric("extra/*", step_metric="ckpt_step")
+        wandb.define_metric("examples", step_metric="ckpt_step")            # --save-examples points: examples seen at that ckpt_step
     os.makedirs(a.out_dir, exist_ok=True)
 
     def load_state():
@@ -331,7 +424,7 @@ def main():
     log(f"previously evaled: {sorted(done) or 'none'} | ckpt_dir {a.ckpt_dir} | state {a.state}")
     while True:
         vol_reload()
-        avail = _scan(a.ckpt_dir, a.final_step, a.min_ckpt_mtime, full_model=a.full_model)
+        avail = _scan(a.ckpt_dir, a.final_step, a.min_ckpt_mtime, full_model=a.full_model, eff_batch=a.eff_batch)
         if a.only_step is not None:
             avail = {k: v for k, v in avail.items() if k == a.only_step}
         todo = sorted(k for k in avail if k not in done)
@@ -348,7 +441,10 @@ def main():
             log(f"pending {todo} -> evaluating LATEST step {s} first")
         t1 = time.time()
         name = f"ck{s}"
-        log(f"evaluating step {s} ({ck})")   # the launcher pauses volume reloads while an eval is in progress
+        extras = _ckpt_extras(ck, a.eff_batch)   # examples_<M> dirs: {"examples": M, "optimizer_updates", "examples_actual"}
+        log(f"evaluating step {s} ({ck})" + (f" = --save-examples point {extras['examples']:,} (actual {extras.get('examples_actual', '?')}, "
+                                             f"{extras['optimizer_updates']} optimizer updates -> ckpt_step {s})" if extras else ""))
+        # (the launcher pauses volume reloads while an eval is in progress)
         lora_dir = f"/tmp/rl_lora/rank0/step{s}"        # the path rl.py inline_eval / run_extra_evals_gpu read the LoRA from
         hnorm_on = None
         if a.full_model:
@@ -398,12 +494,12 @@ def main():
         if "error" in ex:
             log(f"step {s}: extra evals FAILED: {ex['error']}")
             ex = {}
-        row = {**ev, **ex, "ckpt_step": s, "time/ckpt_eval_s": secs, "time/adapter_load_publish_s": t_load}
+        row = {**ev, **ex, **extras, "ckpt_step": s, "time/ckpt_eval_s": secs, "time/adapter_load_publish_s": t_load}
         if hnorm_on is not None:
             row["eval/marker_hnorm_adapter_on"] = hnorm_on
         if not a.no_wandb:
             wandb.log(row, commit=True)
-        json.dump({"ckpt_step": s, "ckpt": ck, "metrics": row, "n_lora_tensors": n_t, "protocol": {
+        json.dump({"ckpt_step": s, "ckpt": ck, **extras, "metrics": row, "n_lora_tensors": n_t, "protocol": {
             "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]), "bo": a.eval_bo, "temp": a.eval_temp,
             "min_new": a.eval_min_new, "max_new": a.eval_max_new, "eval_cache": a.eval_cache,
             "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "full_model": a.full_model,

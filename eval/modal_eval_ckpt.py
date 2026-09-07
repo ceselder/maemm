@@ -1,6 +1,7 @@
 """Modal app `maemm-eval-ckpt`: ONE-GPU checkpoint eval daemon for the RL runs (eval/eval_ckpt_daemon.py).
 
-Evaluates every <ckpt_dir>/step_* (+ final) the trainer saves -- rl.py's full inline_eval protocol
+Evaluates every <ckpt_dir>/step_* (+ final, + the SFT trainer's --save-examples points examples_<M>, logged at their
+optimizer step with an extra `examples` field; see eval_ckpt_daemon.examples_ckpt_meta) -- rl.py's full inline_eval protocol
 (512/family, Bo4, T=1, 16-64 tokens, SAE norm_act + rank) and the inline_extra_evals suite (locality, autointerp
 AUC, WildChat AUC, adversarial holds; Sonnet 5 judge via Anthropic native with OpenRouter fallback) -- on one
 B200 (or H200) hosting the HF base for scoring and a vLLM engine (fast steering hook + CUDA graphs) for generation.
@@ -15,6 +16,9 @@ ONE GPU container at a time: the daemon holds its GPU while polling, so launch i
 One-off (the step_90 protocol check):
     ... .spawn(ckpt_dir='/data/ckpts_last5_v15_g8', tag='last5_v15_g8', once=True, only_step=90)
 Set EVAL_GPU (default B200:1; e.g. H200:1) at deploy time.
+Dry run (CPU, no GPU) -- what a daemon would evaluate under a ckpt_dir right now (state file applied):
+    ... modal.Function.from_name('maemm-eval-ckpt-fullft', 'list_pending').remote(ckpt_dir='/data/sft_mix/<run>', tag='sft_<run>',
+        final_step=25391, full_model=True)      # or: modal run eval/modal_eval_ckpt.py --list-only --full-model --ckpt-dir ... --tag ...
 RL adapters trained on a full-FT policy base (rl_disagg --policy-base): the SAME `daemon` -- eval_ckpt_daemon reads
 <ckpt_dir>/run_meta.json's policy_base and serves base+adapter in vLLM while scoring on the clean MODEL (or pass policy_base=).
     EVAL_APP=maemm-eval-ckpt-fftbase modal deploy eval/modal_eval_ckpt.py
@@ -60,6 +64,28 @@ image = (
 
 vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
 
+# CPU-only image for the discovery dry run: eval_ckpt_daemon.py imports nothing but the stdlib at module level
+list_image = modal.Image.debian_slim(python_version="3.12").add_local_file(REPO / "eval" / "eval_ckpt_daemon.py", "/pmx/eval/eval_ckpt_daemon.py")
+
+_DAEMON_MOD = []
+
+
+def _daemon_mod():
+    """eval/eval_ckpt_daemon.py as a module (container: /pmx/eval; local: the repo) -- the launcher and the child share ONE
+    checkpoint discovery (_scan / examples_ckpt_meta), so `--only-step k` always resolves to the dir the launcher meant."""
+    if not _DAEMON_MOD:
+        import importlib.util
+        for cand in ("/pmx/eval/eval_ckpt_daemon.py", str(REPO / "eval" / "eval_ckpt_daemon.py")):
+            if os.path.exists(cand):
+                spec = importlib.util.spec_from_file_location("eval_ckpt_daemon", cand)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _DAEMON_MOD.append(mod)
+                break
+        else:
+            raise FileNotFoundError("eval_ckpt_daemon.py not found next to the launcher nor under /pmx/eval")
+    return _DAEMON_MOD[0]
+
 
 @app.function(image=image, gpu=GPU, volumes={"/data": vol},
               secrets=[modal.Secret.from_name("maemm-hf"), modal.Secret.from_name("maemm-wandb"),
@@ -67,7 +93,8 @@ vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
               timeout=24 * 3600)
 def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once: bool = False, only_step: int = -1,
            final_step: int = 1000, vllm_gpu_mem: float = 0.5, wandb_name: str = "", extra_args: str = "", policy_base: str = ""):
-    """policy_base: the full-FT base the RL adapters under ckpt_dir were trained on (rl_disagg --policy-base). Default '' = auto:
+    """LoRA checkpoints (one long-lived eval_ckpt_daemon.py process; it discovers step_*, examples_* and final itself, see _scan there).
+    policy_base: the full-FT base the RL adapters under ckpt_dir were trained on (rl_disagg --policy-base). Default '' = auto:
     eval_ckpt_daemon reads <ckpt_dir>/run_meta.json (absent / MODEL -> the plain LoRA-on-MODEL protocol)."""
     import subprocess
     env = os.environ.copy()
@@ -126,18 +153,41 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
 
 
 def _scan_full(ckpt_dir, final_step):
-    import glob
-    avail = {}
-    for p in glob.glob(f"{ckpt_dir}/step_*"):
-        try:
-            s = int(p.rsplit("_", 1)[-1])
-        except ValueError:
-            continue
-        if os.path.exists(f"{p}/SAVE_DONE"):
-            avail[s] = p
-    if os.path.exists(f"{ckpt_dir}/final/SAVE_DONE"):
-        avail[final_step] = f"{ckpt_dir}/final"
-    return avail
+    """Complete full-model checkpoints under ckpt_dir -> {ckpt_step: dir}: step_<k>, examples_<M> (pretrain.py --save-examples; ckpt_step =
+    its recorded optimizer step - 1, i.e. on the step_* axis -- eval_ckpt_daemon.examples_ckpt_meta) and final (final_step). The child's
+    own discovery, imported, so `--only-step k` resolves to the same dir."""
+    return _daemon_mod()._scan(ckpt_dir, final_step, 0.0, full_model=True)
+
+
+def _pending_listing(ckpt_dir, tag, final_step, full_model):
+    """The discovery + state-file view every daemon here works from (list_pending / --list-only)."""
+    import json
+    D = _daemon_mod()
+    avail = D._scan(ckpt_dir, final_step, 0.0, full_model=full_model)
+    state = f"/data/eval_state/evaled_ckpt_{tag}.json"
+    try:
+        done = set(json.load(open(state))["done"])
+    except Exception:  # noqa
+        done = set()
+    rows = []
+    for k in sorted(avail):
+        x = D._ckpt_extras(avail[k])
+        rows.append({"ckpt_step": k, "dir": avail[k], "done": k in done, **x})
+        note = f"  <- --save-examples point {x['examples']:,} ({x['optimizer_updates']} optimizer updates -> ckpt_step {k})" if x else ""
+        print(f"[list] ckpt_step {k:>6}  {'DONE   ' if k in done else 'pending'}  {avail[k]}{note}", flush=True)
+    pending = sorted(k for k in avail if k not in done)
+    print(f"[list] {tag}: {'full-model' if full_model else 'LoRA'} layout under {ckpt_dir} | state {state} | previously evaled {sorted(done)} "
+          f"| would evaluate (latest first): {pending[::-1] or 'nothing'}", flush=True)
+    return {"tag": tag, "ckpt_dir": ckpt_dir, "full_model": full_model, "state": state, "done": sorted(done),
+            "pending_latest_first": pending[::-1], "ckpts": rows}
+
+
+@app.function(image=list_image, volumes={"/data": vol}, timeout=600)
+def list_pending(ckpt_dir: str, tag: str, final_step: int = 1000, full_model: bool = True):
+    """DRY RUN, CPU only: what fullmodel_daemon (full_model=True) / daemon (LoRA layout) would evaluate under ckpt_dir right now --
+    every complete checkpoint by ckpt_step (step_*, examples_* with the derived step and their `examples`, final) minus the state file."""
+    vol.reload()
+    return _pending_listing(ckpt_dir, tag, final_step, full_model)
 
 
 @app.function(image=image, gpu=GPU, volumes={"/data": vol},
@@ -147,8 +197,9 @@ def _scan_full(ckpt_dir, final_step):
 def fullmodel_daemon(ckpt_dir: str, tag: str, wandb_name: str = "", final_step: int = 1000, poll_s: int = 120,
                      vllm_gpu_mem: float = 0.5, extra_args: str = "", idle_exit_s: int = 6 * 3600, once_all: bool = False):
     """FULL-model checkpoints (sft/fullft.py layout): one eval_ckpt_daemon.py PROCESS per checkpoint (`--full-model --once
-    --only-step k`, its vLLM engine loads that checkpoint), looping latest-first over every <ckpt_dir>/step_* + final that
-    carries SAVE_DONE, until `final` (logged as final_step) is evaluated (or nothing new for idle_exit_s). State:
+    --only-step k`, its vLLM engine loads that checkpoint), looping latest-first over every <ckpt_dir>/step_* + examples_<M>
+    (--save-examples points, ckpt_step = recorded optimizer step - 1, logged with `examples` = M) + final that carries SAVE_DONE,
+    until `final` (logged as final_step) is evaluated (or nothing new for idle_exit_s). State (a set of ckpt_steps, examples_* included):
     /data/eval_state/evaled_ckpt_<tag>.json. Same wandb run (<wandb_name>, id == name) across processes."""
     import json
     import subprocess
@@ -193,7 +244,7 @@ def fullmodel_daemon(ckpt_dir: str, tag: str, wandb_name: str = "", final_step: 
             cmd += ["--wandb-name", wandb_name]
         if extra_args:
             cmd += extra_args.split()
-        print(f"[modal-full] pending {todo} -> step {s}: {' '.join(cmd)}", flush=True)
+        print(f"[modal-full] pending {todo} -> step {s} = {avail[s]}: {' '.join(cmd)}", flush=True)
         t0 = time.time()
         p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in p.stdout:
@@ -212,6 +263,10 @@ def fullmodel_daemon(ckpt_dir: str, tag: str, wandb_name: str = "", final_step: 
 
 @app.local_entrypoint()
 def main(ckpt_dir: str = "/data/ckpts_last5_v15_g8", tag: str = "last5_v15_g8", rl_run_id: str = "", once: bool = False,
-         only_step: int = -1, final_step: int = 1000, extra_args: str = ""):
+         only_step: int = -1, final_step: int = 1000, extra_args: str = "", list_only: bool = False, full_model: bool = False):
+    if list_only:   # dry run of the discovery (CPU container): what would be evaluated under ckpt_dir for this tag
+        import json
+        print(json.dumps(list_pending.remote(ckpt_dir=ckpt_dir, tag=tag, final_step=final_step, full_model=full_model), indent=1))
+        return
     daemon.remote(ckpt_dir=ckpt_dir, tag=tag, rl_run_id=rl_run_id, once=once, only_step=only_step, final_step=final_step,
                   extra_args=extra_args)
