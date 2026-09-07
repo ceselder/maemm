@@ -83,6 +83,7 @@ image = (
     .add_local_file(REPO / "sft" / "pretrain.py", "/pmx/SL/pretrain.py")
     .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/SL/prefix_cache.py")   # --prefix-cache sibling import
     .add_local_file(REPO / "sft" / "fullft.py", "/pmx/SL/fullft.py")               # --full-ft (FSDP2) sibling import
+    .add_local_file(REPO / "sft" / "fullft_smoke.py", "/pmx/SL/fullft_smoke.py")   # 2-rank exactness smoke of the full-ft knobs
     .add_local_file(REPO / "sft" / "fp8.py", "/pmx/SL/fp8.py")            # --fp8-base (imported by pretrain.py)
     .add_local_file(REPO / "sft" / "fp8_eval.py", "/pmx/SL/fp8_eval.py")  # fp8 speed/fidelity harness (fp8_eval fn)
     .add_local_file(REPO / "sft" / "fp8_microbench.py", "/pmx/SL/fp8_microbench.py")  # fp8 GEMM/layer/profile bench
@@ -674,13 +675,14 @@ def fullft_bench(data_dir: str, configs: str = "32x64;64x32;128x16", n_records: 
             if "CUDA out of memory" in line or "OutOfMemoryError" in line:
                 oom = True
             if (line.startswith("[fullft]") or line.startswith("[pretrain]") or line.startswith("steps_total")
+                    or line.startswith("[prof]") or line.startswith("[mem]") or line.startswith("[optim]")
                     or "records," in line[:40]):
                 notes.append(line.rstrip())
             m = step_re.search(line)
             if m:
                 steps.append(dict(step=int(m[2]), steps_total=int(m[3]), loss=float(m[4]), tflops=float(m[5]),
                                   mfu=int(m[6]), ex_s=float(m[7]), tok_s=float(m[8]), pad_frac=float(m[9]) / 100,
-                                  dt=float(m[10]), micro=int(m[11]), peak_gb=float(m[12])))
+                                  dt=float(m[10]), micro=int(m[11]), peak_gb=float(m[12]), profiled="PROFILED" in line))
                 if int(m[2]) >= stop_after_step:
                     stopped = True
                     print(f"[bench {tag}] {len(steps)} steps logged -> SIGTERM torchrun (skip the final save)", flush=True)
@@ -697,7 +699,7 @@ def fullft_bench(data_dir: str, configs: str = "32x64;64x32;128x16", n_records: 
         kill_stragglers()
         used = wait_gpus_free()
         shutil.rmtree(save_dir, ignore_errors=True)
-        meas = [s for s in steps if s["step"] >= 2] or steps[1:] or steps
+        meas = [s for s in steps if s["step"] >= 2 and not s.get("profiled")] or steps[1:] or steps
         summ = {}
         if meas:
             ex_per_step = 8 * B * GA
@@ -733,6 +735,31 @@ def fullft_bench(data_dir: str, configs: str = "32x64;64x32;128x16", n_records: 
     results["wall_min"] = (time.time() - t_start) / 60
     print("FULLFT_BENCH_JSON_BEGIN"); print(json.dumps(results)); print("FULLFT_BENCH_JSON_END", flush=True)
     return results
+
+
+@app.function(
+    image=image,
+    gpu=os.environ.get("SFT_FFT_SMOKE_GPU", "L4:2"),
+    volumes={"/data": vol},
+    timeout=int(os.environ.get("SFT_FFT_SMOKE_TIMEOUT_S", str(30 * 60))),
+    memory=32 * 1024,
+)
+def fullft_smoke(args: str = "") -> int:
+    """2-rank FSDP2 exactness smoke of the --full-ft speed knobs on a TINY random Qwen3.5 (sft/fullft_smoke.py): shared
+    prefix accumulator, suffix checkpointing, label head, persistent unshard, prefetch, low-bit optimizers -- gradients
+    and multi-step params compared against the per-micro-batch reference. Cheap GPUs (L4:2 default); no model download."""
+    import subprocess
+
+    env = _train_env("nccl")
+    cmd = ["torchrun", "--standalone", "--nproc_per_node=2", "SL/fullft_smoke.py"] + args.split()
+    rc = _stream(cmd, env, "fft-smoke")
+    print(f"[fft-smoke] rc={rc}", flush=True)
+    return rc
+
+
+@app.local_entrypoint()
+def run_fullft_smoke(args: str = ""):
+    print(fullft_smoke.remote(args))
 
 
 @app.function(image=image, timeout=600, cpu=2)

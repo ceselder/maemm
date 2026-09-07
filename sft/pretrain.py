@@ -557,6 +557,29 @@ def main():
                     help="FULL fine-tuning (no LoRA): every weight trainable, FSDP2-sharded across the ranks with fp32 sharded "
                          "masters + AdamW states and bf16 compute (sft/fullft.py). --init-adapter then names a FULL model dir "
                          "(the base by default); checkpoints are full HF models in the base repo layout (bf16, ~54 GB each).")
+    ap.add_argument("--optim", default="adamw",
+                    help="--full-ft optimizer: adamw (torch, fp32 moments) | adamw8bit / adamw4bit / adamwfp8 (torchao block-quantized "
+                         "moments, FSDP2-aware) | adamw-bf16 (bf16 moments) | adamw-mbf16 (bf16 exp_avg, fp32 exp_avg_sq) | "
+                         "adamw-fp32states (sanity: == adamw). Only adamw / adamw-fp32states are exact AdamW.")
+    ap.add_argument("--fsdp-keep-unsharded", type=int, default=0,
+                    help="--full-ft: keep the gathered bf16 params of the root group + the first N decoder layers resident for "
+                         "the whole optimizer step (one all-gather per step instead of one per micro-batch forward AND "
+                         "backward); -1 = all 64 layers (+54 GB/rank), N = +0.84 GB/rank per layer. Exact (comm only).")
+    ap.add_argument("--fsdp-prefetch", type=int, default=0,
+                    help="--full-ft: explicit FSDP2 all-gather prefetch depth (0 = implicit one-ahead)")
+    ap.add_argument("--suffix-ckpt", action="store_true",
+                    help="--prefix-cache: EXACT per-decoder-layer activation checkpointing of the SUFFIX forward (the cache "
+                         "slots are snapshotted and restored for the recompute, which HF's own checkpointing cannot do); the "
+                         "batch-1 prefix forward is not recomputed. Costs one extra suffix forward per micro-batch.")
+    ap.add_argument("--prefix-head-on-labels", action="store_true",
+                    help="--prefix-cache: lm_head + fp32 CE only at label positions (HF: [B,L,248k] bf16 logits + fp32 copy + "
+                         "softmax); with --ce-chunk N the head is recomputed in chunks of N rows. Same loss as HF (LabelHeadLM math).")
+    ap.add_argument("--compile-blocks", default="", choices=["", "mlp"],
+                    help="--prefix-cache: regional torch.compile of every decoder layer's MLP (dynamic shapes; the cache never "
+                         "crosses the compiled boundary). Pair with --pad-multiple 8 to bound the distinct suffix lengths.")
+    ap.add_argument("--profile-step", type=int, default=-1,
+                    help="rank 0: torch.profiler one optimizer step (counted from --skip-steps) + memory attribution at the "
+                         "activation peak; prints [prof]/[mem] lines after that step's log line (marked PROFILED).")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--n-ckpts", type=int, default=0,
                     help=">0: save this many evenly-spaced checkpoints (every 100/N %% of training); else every 2000 steps")
@@ -567,8 +590,10 @@ def main():
     ap.add_argument("--wandb-id", default="", help="crash-resume: continue this wandb run id (resume='allow')")
     a = ap.parse_args()
     assert a.grad_accum >= 1, "--grad-accum must be >= 1"
-    assert not a.prefix_share_step or (a.prefix_cache and not a.full_ft), \
-        "--prefix-share-step requires --prefix-cache and LoRA (FSDP2/full-ft is not supported)"
+    assert not a.prefix_share_step or a.prefix_cache, "--prefix-share-step requires --prefix-cache"
+    assert a.full_ft or a.optim == "adamw", "--optim is a --full-ft knob (LoRA keeps torch AdamW)"
+    assert not a.suffix_ckpt or a.prefix_cache, "--suffix-ckpt is a --prefix-cache knob"
+    assert not a.prefix_head_on_labels or a.prefix_cache, "--prefix-head-on-labels is a --prefix-cache knob"
     assert a.pad_multiple >= 1, "--pad-multiple must be >= 1"
     assert not (a.length_bucket and a.pack_len), "--length-bucket is for the per-example path (no --pack-len)"
 
@@ -619,7 +644,11 @@ def main():
         src = a.init_adapter or MODEL   # a full model dir (our own checkpoints load like the base repo) or the base
         model = AutoModelForCausalLM.from_pretrained(src, dtype=torch.bfloat16, attn_implementation="sdpa",
                                                      device_map={"": device})
-        model = FT.shard_full_model(model, world, device, log=print if is_main else (lambda *x, **k: None))
+        model = FT.shard_full_model(model, world, device, log=print if is_main else (lambda *x, **k: None),
+                                    keep_unsharded_layers=a.fsdp_keep_unsharded, prefetch=a.fsdp_prefetch)
+        if is_main:
+            print(f"[fullft] kernel backends: {FT.kernel_backends(model)} | optim {a.optim} | suffix_ckpt {a.suffix_ckpt} | "
+                  f"prefix_head_on_labels {a.prefix_head_on_labels} ce_chunk {a.ce_chunk} | prefix_share_step {a.prefix_share_step}", flush=True)
         nontext_shard = "/tmp/base_nontext.safetensors"
         if is_main:
             FT.prepare_nontext_shard(MODEL, nontext_shard)
@@ -682,15 +711,20 @@ def main():
         ddp = model                                          # FSDP2 IS the parallelism (fully_shard in place; no wrapper)
     else:
         ddp = DDP(train_mod, device_ids=[local]) if world > 1 else train_mod
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
+    if a.full_ft:
+        opt = FT.make_optimizer(a.optim, model.parameters(), a.lr)
+    else:
+        opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
     prefix_cache = None
     if a.prefix_cache:
         try:
-            from sft.prefix_cache import PrefixCache, PrefixGradientAccumulator, sync_accumulated_gradients
+            from sft.prefix_cache import (PrefixCache, PrefixGradientAccumulator, SuffixCheckpointer,
+                                          install_prefix_label_head, sync_accumulated_gradients)
         except ImportError:  # mounted next to this file (modal_sft.py puts both under /pmx/SL/)
             import sys
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from prefix_cache import PrefixCache, PrefixGradientAccumulator, sync_accumulated_gradients
+            from prefix_cache import (PrefixCache, PrefixGradientAccumulator, SuffixCheckpointer,
+                                      install_prefix_label_head, sync_accumulated_gradients)
         assert not a.pack_len, "--prefix-cache is the per-example path (no --pack-len)"
         assert not a.head_on_labels, "--prefix-cache uses HF's loss on the short suffix (its head cost is already ~all labels); not combinable with --head-on-labels"
         assert not a.grad_ckpt, "--prefix-cache needs --grad-ckpt 0 (GradientCheckpointingLayer drops past_key_values)"
@@ -702,6 +736,17 @@ def main():
                                    # and its pre-backward unshard hangs on module outputs -> the prefix output needs a grad path
                                    inject_mode="add_clone" if a.full_ft else "add", keep_prefix_grad_path=a.full_ft)
         assert a.prefix_accum >= 1 and a.batch_size % a.prefix_accum == 0, "--prefix-accum must divide --batch-size"
+        assert not (a.full_ft and a.prefix_accum > 1), \
+            "--prefix-accum > 1 retains the prefix graph across backwards, which FSDP2's one-shot unshard hooks cannot do; use --prefix-share-step"
+        if a.suffix_ckpt:
+            prefix_cache.suffix_ckpt = SuffixCheckpointer(model)
+        if a.compile_blocks == "mlp":
+            from prefix_cache import compile_mlp_blocks
+            compile_mlp_blocks(model, dynamic=True)
+            if is_main:
+                print("[pretrain] compile-blocks: every decoder layer's MLP is torch.compiled (dynamic=True)", flush=True)
+        if a.prefix_head_on_labels:
+            install_prefix_label_head(model, a.ce_chunk)
         if a.prefix_share_step:
             # Sharing stochastic prefix computations changes the objective. This trainer creates
             # zero-dropout LoRAs, but reject a resumed adapter/base with active dropout as well.
@@ -789,10 +834,18 @@ def main():
             probe_ctx = (FT.injection_probe(model, INJECT_LAYER, log=print) if (a.full_ft and step == a.skip_steps and is_main)
                          else contextlib.nullcontext())
             probe_ctx.__enter__()
+            profiling = a.full_ft and is_main and step == a.skip_steps + a.profile_step and a.profile_step >= 0
+            prof = FT.StepProfiler(profiling) if a.full_ft else contextlib.nullcontext()
+            prof.__enter__()
+            if a.full_ft:
+                FT.set_persistent_unshard(model, True)        # no-op unless --fsdp-keep-unsharded
             shared_prefix = None
             if a.prefix_share_step:
                 ac = lambda: autocast_region(model, a.autocast_bf16)
-                shared_prefix = PrefixGradientAccumulator(prefix_cache.run_prefix(ac))
+                # FSDP2: the prefix graph must be walked by ONE backward (the final one), so the zero-weight logits path
+                # (keep_prefix_grad_path) is handed to the accumulator instead of the first suffix loss
+                shared_prefix = PrefixGradientAccumulator(prefix_cache.run_prefix(ac),
+                                                          extra_outputs=[prefix_cache.pop_prefix_logits()])
                 n_real_step += prefix_cache.prefix_len
             for mi, batch in enumerate(group):
                 last_in_group = mi == len(group) - 1
@@ -822,6 +875,8 @@ def main():
                                 out = prefix_cache.forward(vmat[sl], targets[sl], autocast=ac,
                                                            prefix_cache=shared_prefix.cache)
                                 weight = out.n_target_tokens / n_tot
+                                if profiling and mi == 0 and start == 0:
+                                    prof.mem_probe()
                                 (out.loss * weight / len(group)).backward()
                             shared_prefix.accumulate()
                             loss += out.loss.detach() * weight
@@ -834,6 +889,10 @@ def main():
                         with sync_ctx:
                             out = prefix_cache.forward(vmat, targets, autocast=ac)
                             loss = out.loss
+                            if profiling and mi == 0:
+                                prof.mem_probe()
+                            if a.full_ft and last_in_group:
+                                FT.set_persistent_unshard(model, False)   # this backward reshards; optimizer runs on sharded masters
                             (loss / len(group)).backward()
                         n_suf = int(out.suffix_mask.sum())
                         n_pad_real += n_suf; n_pad_slots += out.suffix_len * len(batch)
@@ -912,19 +971,28 @@ def main():
                         parity_check(model, label_head, kw, compiled); parity_done = True
                     out = ddp(**kw)
                     loss = out if a.head_on_labels else out.loss
+                    if a.full_ft and mi == len(group) - 1:
+                        FT.set_persistent_unshard(model, False)
                     (loss / len(group)).backward()
                 loss_step += loss.detach() / len(group)
             if shared_prefix is not None:
                 ctx = ddp.no_sync() if world > 1 else contextlib.nullcontext()
+                if a.full_ft:
+                    FT.set_persistent_unshard(model, False)      # the prefix backward is the step's last: reshard in it
                 with ctx:
                     shared_prefix.backward()
-                sync_accumulated_gradients(model.parameters())
+                if not a.full_ft:
+                    sync_accumulated_gradients(model.parameters())   # FSDP2 reduce-scattered every backward already
             probe_ctx.__exit__(None, None, None)
             if a.full_ft:
                 FT.clip_grad_norm([p for p in model.parameters() if p.requires_grad], 1.0)
             else:
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step(); sched.step(); opt.zero_grad()
+            prof.__exit__(None, None, None)
+            if a.full_ft and is_main and step == a.skip_steps:
+                print(f"[optim] {a.optim}: state {FT.optimizer_state_gb(opt):.1f} GB on rank 0 after the first step | "
+                      f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB", flush=True)
             if log_now:
                 torch.cuda.synchronize()
                 dt = time.time() - t0
@@ -936,7 +1004,10 @@ def main():
                 pad_frac = 1.0 - n_pad_real / max(n_pad_slots, 1)   # fraction of padded-tensor slots that were padding
                 print(f"ep{ep} step {step}/{steps_total} loss {loss_step.item():.4f} | "
                       f"{tfl:.0f} TFLOP/s MFU {m:.0%} | {n_ex_step / dt:.2f} ex/s {n_real_step / dt:.0f} tok/s "
-                      f"pad {pad_frac:.1%} ({dt:.3f} s/step, {len(group)} micro) | peak {peak_gb:.1f} GB", flush=True)
+                      f"pad {pad_frac:.1%} ({dt:.3f} s/step, {len(group)} micro) | peak {peak_gb:.1f} GB"
+                      + (" | PROFILED" if profiling else ""), flush=True)
+                if profiling:
+                    print(prof.report(), flush=True)
                 if not a.no_wandb:
                     wandb.log({"loss": loss_step.item(), "lr": sched.get_last_lr()[0], "mfu": m, "tflops": tfl,
                                "ex_per_s": n_ex_step / dt, "tok_per_s": n_real_step / dt, "pad_frac": pad_frac,
