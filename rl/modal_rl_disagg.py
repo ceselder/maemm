@@ -18,6 +18,9 @@ Launch (MODAL_PROFILE=safety-sahan):
 Resume from a checkpoint: --extra-args "... --init-adapter <ckpt>/step_N --ref-adapter /data/sft_mix/last5_rp/final --step-offset N+1 --wandb-id <id>"
 Set DISAGG_GPU (e.g. H200:4) at `modal run` time to pick the GPU request; the container's real GPU count
 is what the launcher uses.
+Trainer speed knobs (rl_disagg --prefix-cache / --score-length-bucket): the prefix cache needs the transformers fork in the image --
+    DISAGG_TRANSFORMERS="transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3" \
+    DISAGG_APP=maemm-rl-disagg-fast-x4 DISAGG_GPU=B200:4 modal run ... --extra-args "--prefix-cache --score-length-bucket ..."
 """
 import os
 from pathlib import Path
@@ -28,12 +31,23 @@ REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives
 app = modal.App(os.environ.get("DISAGG_APP", "maemm-rl-disagg"))   # DISAGG_APP=maemm-rl-disagg-x4 + DISAGG_GPU=B200:4 = parallel 4-GPU deployment
 GPU = os.environ.get("DISAGG_GPU", "B200:4")
 
+# --prefix-cache (rl_disagg PrefixRunner / sft/prefix_cache.py) needs the transformers fork = v5.15.0 + ONE commit touching only
+# cache_utils.py (autograd-safe linear-attention state writes + batch expansion). vLLM never imports HF cache_utils, and the
+# production image already runs transformers 5.15.0 on top of vllm 0.19's declared `transformers<5` pin, so the fork is the
+# identical compatibility situation for the rollout engines (verified: rl/test_rl_disagg_prefix.py + the 1R+3T smoke). Opt-in
+# at deploy time so existing deployments rebuild nothing:
+#   DISAGG_TRANSFORMERS="transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
+PREFIX_CACHE_TRANSFORMERS = "transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3"
+_TRANSFORMERS = os.environ.get("DISAGG_TRANSFORMERS", "transformers==5.15.0")
+image = modal.Image.debian_slim(python_version="3.12")
+if "git+" in _TRANSFORMERS:
+    image = image.apt_install("git")
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    image
     .pip_install("torch==2.10.0", index_url="https://download.pytorch.org/whl/cu128")
     .pip_install("vllm==0.19.0", "vllm-lens==1.1.0")
     .pip_install(
-        "transformers==5.15.0",
+        _TRANSFORMERS,
         "peft==0.20.0",
         "accelerate==1.14.0",
         "wandb==0.28.2",
@@ -61,6 +75,7 @@ image = (
     .add_local_file(REPO / "rl" / "rl_disagg.py", "/pmx/RL/rl_disagg.py")
     .add_local_file(REPO / "rl" / "fast_lens_ext.py", "/pmx/helpers/fast_lens_ext.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
+    .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/helpers/prefix_cache.py")           # --prefix-cache (expand_cache_copy, fork check)
     .add_local_file(REPO / "eval" / "eval_universal.py", "/pmx/eval/eval_universal.py")            # inline eval scoring
     .add_local_file(REPO / "eval" / "inline_extra_evals.py", "/pmx/RL/inline_extra_evals.py")          # autointerp/locality/WildChat/adversarial
     .add_local_file(REPO / "eval" / "snippet_locality.py", "/pmx/eval/snippet_locality.py")
