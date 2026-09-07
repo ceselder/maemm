@@ -241,7 +241,10 @@ def _alloc(counts, total, floor=0):
 def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512, n_eval_pair=256, k_single=8, k_pair=4,
               w_lo=16, w_hi=32, min_tok=8, min_c=10, min_lift=10.0, max_p=1e-10, check_mix=True,
               scan_file=None, bank_out=BANK_OUT, write_eval_cache=True, selection_file=None):
-    """write_eval_cache=True (today's bank): the hold-out split is DRAWN here (seed / heldout_frac, per frequency band) and the
+    """min_c is an ABSOLUTE joint-firing count on the scan tokens: the original rule (C >= 10 at T = 409,600) is a joint-firing
+    RATE floor of 2.4e-5, so an expanded scan with T tokens keeps the same semantics with min_c = round(10 * T / 409600)
+    (500 at 20.48M tokens); lift and the Poisson p are scale-free.
+    write_eval_cache=True (today's bank): the hold-out split is DRAWN here (seed / heldout_frac, per frequency band) and the
     v2 eval cache is written. write_eval_cache=False (expanded banks from a bigger scan): NOTHING under /data/eval_universal_ho
     is written (asserted on every path + size/mtime of the v2 cache re-checked at the end); the held-out neurons and the eval
     directions are READ from the existing v2 cache and excluded exactly as before — held-out neurons and every pair touching
@@ -447,9 +450,7 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
         torch.save(v2, tmp); os.replace(tmp, wpath(EVAL_CACHE_V2))
         log(f"eval cache v2 written -> {EVAL_CACHE_V2}: mlp {len(eval_single)} dirs, mlp_pair {len(eval_pairs)} dirs; cos_families unchanged "
             f"{meta2['cos_families']}; extra_families {meta2['extra_families']}")
-        pair_rule = meta2["mlp42"]["mlp_pair"]["pair_rule"]
-    else:
-        pair_rule = v2["meta"]["mlp42"]["mlp_pair"]["pair_rule"]
+    pair_rule = f"both in the sparse set (<{SPARSE_MAX:.1%} & write >= p25), C >= {min_c}, lift >= {min_lift}, Poisson p < {max_p}, on the scan tokens"
 
     # ---- bank rows (train neurons / both-train pairs); vectors are materialized lazily from (kind, n1, n2, a1, a2) ----
     def window(g):

@@ -14,9 +14,10 @@ meta.json}, /data/eval_universal_ho/eval_sets_heldout_v2.pt (the v1 cache is nev
 EXPANDED bank (>= 250k rows for a bigger SFT mix; same split, nothing existing overwritten, eval cache read-only):
     f = modal.Function.from_name('maemm-mlp42-bank', 'scan'); f.spawn(n_windows=80000, batch=32, topk=40, sample_seed=2027,
         sel_file='/data/mlp42/sel_windows_big.npz', scan_file='/data/mlp42/bank_scan_big.npz')          # 1 GPU, ~1 h
-    f = modal.Function.from_name('maemm-mlp42-bank', 'build'); f.spawn(k_single=32, k_pair=8, check_mix=False,
+    f = modal.Function.from_name('maemm-mlp42-bank', 'build'); f.spawn(k_single=32, k_pair=8, check_mix=False, min_c=500,
         scan_file='/data/mlp42/bank_scan_big.npz', bank_out='/data/banks/mlp42_big', write_eval_cache=False,
-        selection_file='/data/mlp42/bank_selection_big.json')
+        selection_file='/data/mlp42/bank_selection_big.json')     # min_c 500 = 10 * 20.48M/409.6k: same joint-firing RATE floor
+    modal.Function.from_name('maemm-mlp42-bank', 'verify').remote(bank='/data/banks/mlp42_big')
 """
 from pathlib import Path
 
@@ -81,10 +82,12 @@ def scan(n_windows: int = 1600, win_len: int = 256, batch: int = 16, topk: int =
               secrets=[modal.Secret.from_name("maemm-hf")], timeout=2 * 3600)
 def build(seed: int = 2026, heldout_frac: float = 0.10, n_eval_single: int = 512, n_eval_pair: int = 256, k_single: int = 8,
           k_pair: int = 4, w_lo: int = 16, w_hi: int = 32, min_tok: int = 8, check_mix: bool = True, scan_file: str | None = None,
-          bank_out: str | None = None, write_eval_cache: bool = True, selection_file: str | None = None):
+          bank_out: str | None = None, write_eval_cache: bool = True, selection_file: str | None = None, min_c: int = 10,
+          min_lift: float = 10.0, max_p: float = 1e-10):
     """Defaults == today's bank (draws the hold-out split, writes eval cache v2 -> /data/banks/mlp42). For an EXPANDED bank pass
     scan_file (a bank_scan_big.npz), bank_out (new dir), write_eval_cache=False (hold-out + eval dirs READ from the existing v2
-    cache, nothing under /data/eval_universal_ho is written), selection_file (new path), k_single/k_pair."""
+    cache, nothing under /data/eval_universal_ho is written), selection_file (new path), k_single/k_pair, and min_c scaled with the
+    scan's token count (min_c = round(10 * T / 409600), i.e. 500 at 20.48M tokens) so the pair rule keeps its semantics."""
     _env()
     from transformers import AutoTokenizer
     import mlp42_bank_worker as BW
@@ -93,7 +96,8 @@ def build(seed: int = 2026, heldout_frac: float = 0.10, n_eval_single: int = 512
     tok = AutoTokenizer.from_pretrained(MODEL)
     res = BW.run_build(tok, dev="cuda:0", seed=seed, heldout_frac=heldout_frac, n_eval_single=n_eval_single, n_eval_pair=n_eval_pair,
                        k_single=k_single, k_pair=k_pair, w_lo=w_lo, w_hi=w_hi, min_tok=min_tok, check_mix=check_mix,
-                       scan_file=scan_file, bank_out=bank_out or BW.BANK_OUT, write_eval_cache=write_eval_cache, selection_file=selection_file)
+                       scan_file=scan_file, bank_out=bank_out or BW.BANK_OUT, write_eval_cache=write_eval_cache, selection_file=selection_file,
+                       min_c=min_c, min_lift=min_lift, max_p=max_p)
     vol.commit()
     return res
 
