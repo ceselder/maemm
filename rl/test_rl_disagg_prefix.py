@@ -35,6 +35,8 @@ if M._TRANSFORMERS != os.environ["DISAGG_TRANSFORMERS"]:   # module was imported
 
 app = modal.App("maemm-rl-prefix-test")
 GPU = os.environ.get("PFX_GPU", "B200:1")
+# this module is re-imported inside the container (Modal ships only the entrypoint file): mount its sibling import next to it
+image = M.image.add_local_file(HERE / "modal_rl_disagg.py", "/root/modal_rl_disagg.py")
 
 ARGS = ["--role", "trainer", "--n-rollout", "1", "--n-trainer", "1", "--data-dir", M.POOL_DIR, "--bank-file", "vecs.f32",
         "--init-adapter", M.SFT_INIT, "--lr", "1e-5", "--reward-metric", "cosine", "--reward-scale", "1", "--len-penalty-start", "8",
@@ -67,7 +69,7 @@ class _GradRecorder:
         self.grads = torch.cat([p.grad.detach().flatten().float() for p in self.params if p.grad is not None])
 
 
-@app.function(image=M.image, gpu=GPU, volumes={"/data": M.vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=3 * 3600)
+@app.function(image=image, gpu=GPU, volumes={"/data": M.vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=3 * 3600)
 def parity_remote(n_groups: int = 8, group_size: int = 8, seed: int = 0, micro_batch: int = 16, n_time: int = 1024,
                   extra_args: str = ""):
     import time
@@ -214,6 +216,7 @@ def parity_remote(n_groups: int = 8, group_size: int = 8, seed: int = 0, micro_b
                 "cosine": float(F.cosine_similarity(g_ref[None], g[None])), "norm_ref": float(g_ref.norm()), "norm_other": float(g.norm())}
 
     # ---- parity on ONE batch ----
+    from mxf.config import STEER_COEFF
     batch, sc = prep(texts, gen_ids, old_lps, dirs, n_groups)
     res["score_parity"] = sc
     print(f"[score] plain {sc['score_plain_s']:.2f}s bucketed {sc['score_bucketed_s']:.2f}s | max|d r| {sc['reward_max_abs_diff']:.2e} "
@@ -221,27 +224,77 @@ def parity_remote(n_groups: int = 8, group_size: int = 8, seed: int = 0, micro_b
           f"bucketed {sc['score_pad_frac_bucketed']:.1%}", flush=True)
     gen_mask = batch["attn"][:, p_len:].bool()
     w1, sw1 = D.loss_weights(gen_mask, a.loss_agg, G, batch["keep"])
-    w2, sw2 = D.loss_weights(gen_mask, a.loss_agg, G, batch["keep"])
-    assert torch.equal(w1, w2) and sw1 == sw2
-    res["loss_weights"] = {"sync_w": sw1, "sum": float(w1.sum()), "n_dropped_rows": int((w1.sum(1) == 0).sum() - (gen_mask.sum(1) == 0).sum()),
+    res["loss_weights"] = {"sync_w": sw1, "sum": float(w1.sum()), "n_rows_weight0": int((w1.sum(1) == 0).sum()),
                            "note": "computed once from gen_mask before chunking and indexed per micro-batch (w_all[ix]); micro-batch composition cannot change them"}
     pfx = D.PrefixRunner(actor, prompt_ids, marker, device)
-    rows = {}
-    rows["full"], g_full = run_update(batch, micro_batch, None, "full")
-    rows["full_again"], g_full2 = run_update(batch, micro_batch, None, "full_again")
-    rows["prefix"], g_pfx = run_update(batch, micro_batch, pfx, "prefix")
-    rows["prefix_mb64"], g_pfx64 = run_update(batch, 64, pfx, "prefix_mb64")
-    par = {"runs": rows,
-           "loss_abs_diff": {"prefix_vs_full": abs(rows["prefix"]["loss"] - rows["full"]["loss"]),
-                             "prefix_mb64_vs_full": abs(rows["prefix_mb64"]["loss"] - rows["full"]["loss"]),
-                             "full_again_vs_full (noise floor)": abs(rows["full_again"]["loss"] - rows["full"]["loss"])},
-           "grad": {"prefix_vs_full": cmp(g_full, g_pfx), "prefix_mb64_vs_full": cmp(g_full, g_pfx64),
-                    "full_again_vs_full (noise floor)": cmp(g_full, g_full2)}}
+
+    # (a) per-token completion logprobs, no grad: the full-sequence path at two micro-batch sizes (= two paddings/shapes ->
+    # the bf16 noise floor between two batchings of the SAME computation) vs the prefix-cached path
+    def token_logps(mb, use_pfx):
+        n, L = batch["ids"].shape
+        lens_ = gen_mask.sum(1); order = torch.argsort(lens_)
+        out = torch.zeros(n, L - p_len)
+        with torch.no_grad():
+            cache = None
+            if use_pfx:
+                with D._policy_precision(actor, a.autocast_bf16):
+                    cache = pfx.run_prefix()
+            for s0 in range(0, n, mb):
+                ix = order[s0 : s0 + mb]
+                Lc = p_len + min(L - p_len, -(-int(lens_[ix].max()) // 16) * 16); Tc = Lc - p_len
+                hook = D._hook_outside_autocast(R.make_inject_hook([batch["dirs_rep"][i : i + 1] for i in ix.tolist()], [[0 if use_pfx else marker]] * len(ix),
+                                                                   STEER_COEFF, device, torch.bfloat16), a.autocast_bf16)
+                with R.hooked(submodule, hook), D._policy_precision(actor, a.autocast_bf16):
+                    if use_pfx:
+                        lg = pfx.suffix_logits(cache, batch["ids"][ix, marker:Lc].to(device), batch["attn"][ix, marker:Lc].to(device))[:, :-1]
+                    else:
+                        lg = actor(input_ids=batch["ids"][ix, :Lc].to(device), attention_mask=batch["attn"][ix, :Lc].to(device), use_cache=False,
+                                   logits_to_keep=Tc + 1).logits[:, :-1]
+                lp, _ = D._chunked_logp(lg, batch["ids"][ix, p_len:Lc].to(device), a.vocab_chunk, False)
+                out[ix, :Tc] = lp.float().cpu()
+                del lg, lp
+            del cache
+        return out
+
+    def lp_cmp(ref, other):
+        d = (ref - other).abs()[gen_mask]
+        seq = ((ref - other) * gen_mask).sum(1).abs()
+        return {"token_mean_abs": float(d.mean()), "token_max_abs": float(d.max()), "token_p99_abs": float(d.quantile(0.99)),
+                "seq_logp_mean_abs": float(seq.mean()), "seq_logp_max_abs": float(seq.max()), "n_tokens": int(gen_mask.sum()),
+                "ref_mean_logp": float(ref[gen_mask].mean())}
+    lp_full = token_logps(micro_batch, False)
+    lp_full8 = token_logps(max(1, micro_batch // 2), False)
+    lp_pfx = token_logps(micro_batch, True)
+    res["token_logp"] = {"prefix_vs_full": lp_cmp(lp_full, lp_pfx), "full_mb_half_vs_full (noise floor)": lp_cmp(lp_full, lp_full8),
+                         "old_lp_vs_full (rollout-time HF logp)": lp_cmp(lp_full, batch["old_lp"])}
+    for k, v in res["token_logp"].items():
+        print(f"[logp] {k}: " + json.dumps({kk: round(vv, 6) for kk, vv in v.items()}), flush=True)
+    del lp_full, lp_full8, lp_pfx
+
+    # (b) the real update: loss + flat LoRA gradient
+    rows, grads = {}, {}
+
+    def try_run(label, mb, use_pfx):
+        try:
+            rows[label], grads[label] = run_update(batch, mb, pfx if use_pfx else None, label)
+        except torch.OutOfMemoryError as e:  # noqa
+            rows[label] = {"error": "OOM: " + str(e)[:160], "micro_batch": mb}
+            opt.zero_grad(); import gc; gc.collect(); torch.cuda.empty_cache()
+            print(f"[{label}] OOM at mb {mb}", flush=True)
+    try_run("full", micro_batch, False)
+    try_run("full_again", micro_batch, False)
+    try_run("full_mb_half", max(1, micro_batch // 2), False)
+    try_run("prefix", micro_batch, True)
+    try_run("prefix_mb_2x", 2 * micro_batch, True)
+    par = {"runs": rows, "loss_abs_diff": {}, "grad": {}}
+    for k in ("prefix", "prefix_mb_2x", "full_again", "full_mb_half"):
+        if k in grads and "full" in grads:
+            tagk = k + (" (noise floor)" if k.startswith("full") else "") + "_vs_full"
+            par["loss_abs_diff"][tagk] = abs(rows[k]["loss"] - rows["full"]["loss"])
+            par["grad"][tagk] = cmp(grads["full"], grads[k])
+            print(f"[parity] {tagk}: loss |d| {par['loss_abs_diff'][tagk]:.3e} | grad " + json.dumps({kk: round(vv, 6) for kk, vv in par["grad"][tagk].items()}), flush=True)
     res["parity"] = par
-    print("[parity] loss |d|:", json.dumps({k: f"{v:.3e}" for k, v in par["loss_abs_diff"].items()}), flush=True)
-    for k, v in par["grad"].items():
-        print(f"[parity] grad {k}: " + json.dumps({kk: round(vv, 6) for kk, vv in v.items()}), flush=True)
-    del g_full, g_full2, g_pfx, g_pfx64
+    grads.clear(); import gc; gc.collect(); torch.cuda.empty_cache()
 
     # ---- timing on --n-time rollouts (the parity batch tiled: realistic length distribution) ----
     if n_time > 0:
