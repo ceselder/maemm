@@ -574,6 +574,9 @@ def main():
     ap.add_argument("--prefix-head-on-labels", action="store_true",
                     help="--prefix-cache: lm_head + fp32 CE only at label positions (HF: [B,L,248k] bf16 logits + fp32 copy + "
                          "softmax); with --ce-chunk N the head is recomputed in chunks of N rows. Same loss as HF (LabelHeadLM math).")
+    ap.add_argument("--compile-blocks", default="", choices=["", "mlp"],
+                    help="--prefix-cache: regional torch.compile of every decoder layer's MLP (dynamic shapes; the cache never "
+                         "crosses the compiled boundary). Pair with --pad-multiple 8 to bound the distinct suffix lengths.")
     ap.add_argument("--profile-step", type=int, default=-1,
                     help="rank 0: torch.profiler one optimizer step (counted from --skip-steps) + memory attribution at the "
                          "activation peak; prints [prof]/[mem] lines after that step's log line (marked PROFILED).")
@@ -737,6 +740,11 @@ def main():
             "--prefix-accum > 1 retains the prefix graph across backwards, which FSDP2's one-shot unshard hooks cannot do; use --prefix-share-step"
         if a.suffix_ckpt:
             prefix_cache.suffix_ckpt = SuffixCheckpointer(model)
+        if a.compile_blocks == "mlp":
+            from prefix_cache import compile_mlp_blocks
+            compile_mlp_blocks(model, dynamic=True)
+            if is_main:
+                print("[pretrain] compile-blocks: every decoder layer's MLP is torch.compiled (dynamic=True)", flush=True)
         if a.prefix_head_on_labels:
             install_prefix_label_head(model, a.ce_chunk)
         if a.prefix_share_step:
