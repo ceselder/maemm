@@ -5,6 +5,7 @@ Writes ~/shared/reports/maemm-sft-fullft-104m/loss_vs_prev.{png,pdf} + data/loss
 import json, os
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.ticker
 import matplotlib.pyplot as plt
 import numpy as np
 import wandb
@@ -46,8 +47,9 @@ for k, cfg in RUNS.items():
     d = data["runs"][k]; st = np.array(d["loss_steps"]); lo = np.array(d["loss"]); ex = st * cfg["eff"] / 1e6
     ax.plot(ex, lo, color=cfg["color"], lw=0.5, alpha=0.25)
     xs, ys = smooth(ex, lo, eff=cfg["eff"]); ax.plot(xs, ys, color=cfg["color"], lw=2, label=cfg["label"] + f" — smoothed over 0.5M examples")
-ax.set_xscale("log"); ax.set_xlabel("examples seen (millions, log)"); ax.set_ylabel("training loss (mean CE over target tokens)"); ax.set_ylim(1.7, 3.6); ax.grid(alpha=0.25)
-ax.set_title("Training loss vs examples seen", fontsize=10.5); ax.legend(fontsize=8, loc="upper right")
+ax.set_xscale("log"); ax.set_yscale("log"); ax.set_xlabel("examples seen (millions, log)"); ax.set_ylabel("training loss (mean CE over target tokens, log)"); ax.set_ylim(1.7, 3.6)
+ax.set_yticks([1.75, 2.0, 2.25, 2.5, 3.0, 3.5]); ax.get_yaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter()); ax.get_yaxis().set_minor_formatter(matplotlib.ticker.NullFormatter()); ax.grid(alpha=0.25, which="both")
+ax.set_title("Training loss vs examples seen (log-log)", fontsize=10.5); ax.legend(fontsize=8, loc="upper right")
 ax = axes[1]
 for k, cfg in RUNS.items():
     ev = data["runs"][k]["evals"]
