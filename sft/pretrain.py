@@ -485,6 +485,8 @@ def main():
                     help="bank dir, or a comma-separated list of PART bank dirs consumed as one virtual bank (records and "
                          "vector rows concatenated in the listed order; sharding/batching/resume identical to the merged bank)")
     ap.add_argument("--init-adapter", default=cfg.init_adapter)
+    ap.add_argument("--policy-base", default="", help="LoRA path only: load the frozen base from this full-model dir (e.g. one of our full "
+                    "fine-tune checkpoints) instead of the base repo; the adapter is then trained on top of those weights (RL: --policy-base)")
     ap.add_argument("--save-dir", default=cfg.save_dir)
     ap.add_argument("--lr", type=float, default=cfg.lr)
     ap.add_argument("--batch-size", type=int, default=cfg.batch_size)
@@ -653,7 +655,10 @@ def main():
         if is_main:
             FT.prepare_nontext_shard(MODEL, nontext_shard)
     else:
-        model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16,
+        base_src = a.policy_base or MODEL
+        if a.policy_base and is_main:
+            print(f"[lora] frozen base = policy base {a.policy_base} (not {MODEL})", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(base_src, dtype=torch.bfloat16,
                                                      attn_implementation="sdpa",  # flash-attn has no sm_103 build
                                                      device_map={"": device})
         model.enable_input_require_grads()
