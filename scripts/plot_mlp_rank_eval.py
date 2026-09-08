@@ -58,6 +58,9 @@ SANITY_KEYS = ["eval/mean_all", "eval/sae/norm_act", "eval/sae/rank1_frac", "eva
                "eval/mlp/cos", "eval/mlp/norm_act", "eval/mlp/fired10", "eval/mlp/fired25", "eval/mlp/fired50",
                "eval/mlp_pair/cos", "eval/mlp_pair/norm_act", "eval/mlp_pair/fired10", "eval/mlp_pair/any_norm_act"]
 SANITY_TOL = 0.01
+# a SECOND run of the same checkpoint with the OLD evaluator code (eval-perdir branch, 2026-09-07: perdir_rl_I_8x4096_nowarm) -- shows the
+# run-to-run generation-sampling spread of the old keys independently of this branch's code
+OLD_RERUN = {"rl_I_8x4096_nowarm": ("perdir_rl_I_8x4096_nowarm", 150)}
 
 
 def vget(remote, local):
@@ -148,9 +151,12 @@ def fig_metric_bars(res, chance):
     fig.legend(handles + [plt.Line2D([0], [0], color=C_CHANCE, lw=1.2, ls=(0, (4, 3)))],
                [GROUP_LABEL[g] for g in ("sft", "rl", "prod")] + ["chance: random held-out corpus text, same protocol"],
                loc="lower center", ncol=4, frameon=False, fontsize=8.5, bbox_to_anchor=(0.5, -0.01))
-    fig.suptitle("The old fire-back metric saturates near or above 1.0 for every RL checkpoint; the cross-neuron rank still separates them\n"
-                 "512 held-out layer-42 MLP neurons, Qwen3.6-27B activation→text inverter, best-of-4 generations, last-5-token window",
-                 fontsize=11, x=0.01, ha="left", color=C_INK)
+    na_max = max(float(np.max(res[n]["perdir"]["extra"]["mlp"]["norm_act"])) for n in names if res[n]["perdir"])
+    fig.suptitle(f"Cross-neuron rank orders the checkpoints like the old fire-back mean, but as a bounded share with an explicit chance level "
+                 f"({100 * chance.get('eval/mlp/chance_rank_le10', 0):.1f}% top-10 on random text)\n"
+                 f"vs. an unbounded heavy-tailed mean (single generations reach {na_max:.1f}x the neuron's corpus max) — "
+                 "512 held-out layer-42 MLP neurons, Qwen3.6-27B activation→text inverter, best of 4",
+                 fontsize=10.5, x=0.01, ha="left", color=C_INK)
     fig.tight_layout(rect=(0, 0.05, 1, 0.93))
     save(fig, "metric_bars")
     json.dump(data, open(OUT / "data" / "metric_bars.json", "w"), indent=1)
@@ -185,9 +191,18 @@ def fig_rank_ecdf(res, chance_pd):
         style(ax)
     if axes[0].get_legend_handles_labels()[0]:
         axes[0].legend(frameon=False, fontsize=8, loc="lower right")
-    fig.suptitle("RL moves most held-out neurons into the top-10 of all 17,408 neurons; SFT alone barely beats random corpus text\n"
-                 "Cumulative distribution of the target neuron's rank on the best-of-4 generation (normalized rank; right: raw-magnitude rank for contrast)",
-                 fontsize=11, x=0.01, ha="left", color=C_INK)
+    def le10(fam, key, name):
+        return data["series"].get(f"{fam}/{key}/{name}", {}).get("le10")
+    rl_le10 = [le10("mlp", "rank", n) for n, _ in ECDF_SERIES if n.startswith("rl") and le10("mlp", "rank", n) is not None]
+    sft_le10 = le10("mlp", "rank", "sft_realact23m"); ch_le10 = le10("mlp", "rank", "chance")
+    raw_rl = le10("mlp", "raw_rank", "rl_abl_init23m"); norm_rl = le10("mlp", "rank", "rl_abl_init23m")
+    t1 = (f"After RL, {min(rl_le10):.0%}-{max(rl_le10):.0%} of held-out neurons rank in the top-10 of all 17,408 layer-42 neurons"
+          if rl_le10 else "Rank of the target neuron among all 17,408 layer-42 neurons")
+    t1 += (f"; SFT alone {sft_le10:.0%}" if sft_le10 is not None else "") + (f"; random corpus text {ch_le10:.1%}" if ch_le10 is not None else "")
+    t2 = "Cumulative distribution of the target's rank on the best-of-4 generation (normalized); right: the unnormalized (raw |a|) rank"
+    if raw_rl is not None and norm_rl is not None:
+        t2 += f" gives nearly the same picture ({raw_rl:.0%} vs {norm_rl:.0%} top-10 for RL from 23M pretrain): these sparse neurons are also large in absolute terms when they fire"
+    fig.suptitle(t1 + "\n" + t2, fontsize=10.5, x=0.01, ha="left", color=C_INK)
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     save(fig, "rank_ecdf")
     json.dump(data, open(OUT / "data" / "rank_ecdf.json", "w"), indent=1)
@@ -209,9 +224,13 @@ def fig_scatter(res, chance_pd):
         na = np.asarray(chance_pd["mlp"]["norm_act"], np.float64); rk = np.asarray(chance_pd["mlp"]["rank"], np.float64)[:, 0]
         _scatter_panel(axes[-1], na, rk, C_CHANCE, "chance: random held-out corpus text", data, "chance")
     axes[0].set_ylabel("NEW: cross-neuron rank at the best token (log; 1 = top)", fontsize=9)
-    fig.suptitle("Where the old metric is uninformative: many neurons count as 'fired' (norm_act ≥ 0.1) while dozens of other neurons out-fire them,\n"
-                 "and rank-1 inversions exist at every norm_act level — per-neuron old metric vs new rank, 512 held-out layer-42 MLP neurons",
-                 fontsize=10.5, x=0.01, ha="left", color=C_INK)
+    qs = [data["quadrants"][n] for n in names if n in data["quadrants"]]
+    fnt = [q["fired_not_top10"] / max(q["fired10"], 1e-9) for q in qs]
+    sp = [q["spearman_normact_rank"] for q in qs]
+    fig.suptitle(f"The two metrics agree on the ordering of neurons (Spearman {min(sp):+.2f} to {max(sp):+.2f}), but 'fired' by the old threshold (norm_act ≥ 0.1) "
+                 f"is out-fired by ≥ 10 other neurons for {min(fnt):.0%}-{max(fnt):.0%} of the fired neurons\n"
+                 "per-neuron old metric vs new normalized rank on the best-of-4 generation, 512 held-out layer-42 MLP neurons (right: random corpus text)",
+                 fontsize=10.2, x=0.01, ha="left", color=C_INK)
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     save(fig, "normact_vs_rank")
     json.dump(data, open(OUT / "data" / "normact_vs_rank.json", "w"), indent=1)
@@ -245,6 +264,30 @@ def _spearman(a, b):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+def _se_of(key, m, pd):
+    """Standard error (generation-sampling noise) of aggregate `key` from the per-direction arrays of THIS run: std/sqrt(n) for means
+    of per-direction values, sqrt(p(1-p)/n) for shares. None when no per-direction array backs the key."""
+    if pd is None:
+        return None
+    parts = key.split("/")
+    fam, met = parts[1], parts[-1]
+    arr = None
+    if fam in pd["cos"] and met == "cos":
+        arr = pd["cos"][fam]
+    elif fam == "sae" and met in ("norm_act", "cos"):
+        arr = pd["sae"].get(met)
+    elif fam in pd["extra"] and met in ("cos", "norm_act", "any_norm_act"):
+        arr = pd["extra"][fam][met]
+    if arr is not None:
+        a = np.asarray(arr, np.float64)
+        return float(a.std(ddof=1) / np.sqrt(len(a)))
+    n = {"sae": 512, "mlp": 512, "mlp_pair": 256}.get(fam)
+    if n and (met.startswith("fired") or met.startswith("rank") or met.startswith("any_fired")):
+        pv = min(max(m[key], 1e-6), 1 - 1e-6)
+        return float(np.sqrt(pv * (1 - pv) / n))
+    return None
+
+
 def summary(res):
     rows, sanity = {}, {}
     chance = {}
@@ -261,9 +304,29 @@ def summary(res):
             cmp = {}
             for k in SANITY_KEYS:
                 if k in m and k in r["ref"]:
-                    cmp[k] = {"new": m[k], "ref": r["ref"][k], "delta": m[k] - r["ref"][k], "ok": abs(m[k] - r["ref"][k]) <= SANITY_TOL}
+                    se = _se_of(k, m, r["perdir"])
+                    d = m[k] - r["ref"][k]
+                    cmp[k] = {"new": m[k], "ref": r["ref"][k], "delta": d, "ok": abs(d) <= SANITY_TOL, "se": se,
+                              "within_2se": (abs(d) <= 2 * se) if se is not None else None, "mlp_family": k.split("/")[1].startswith("mlp")}
+            old = None
+            if name in OLD_RERUN:
+                tag, k0 = OLD_RERUN[name]
+                op = RAW / "ref" / tag / f"ckpt_{k0}.json"
+                if not op.exists():
+                    vget(f"/eval_ckpt/{tag}/ckpt_{k0}.json", op)
+                if op.exists():
+                    om = json.load(open(op))["metrics"]
+                    old = {"json": f"/data/eval_ckpt/{tag}/ckpt_{k0}.json", "keys": {k: {"old_rerun": om[k], "ref": r["ref"][k], "delta": om[k] - r["ref"][k]}
+                                                                                 for k in SANITY_KEYS if k in om and k in r["ref"]}}
             sanity[name] = {"ref": f"/data/eval_ckpt/{CKPTS[name]['ref'][0]}/ckpt_{CKPTS[name]['ref'][1]}.json", "keys": cmp,
-                            "all_ok": all(c["ok"] for c in cmp.values()), "max_abs_delta": max(abs(c["delta"]) for c in cmp.values()) if cmp else None}
+                            "all_ok": all(c["ok"] for c in cmp.values()), "max_abs_delta": max(abs(c["delta"]) for c in cmp.values()) if cmp else None,
+                            "non_mlp_ok": all(c["ok"] for c in cmp.values() if not c["mlp_family"]),
+                            "max_abs_delta_non_mlp": max([abs(c["delta"]) for c in cmp.values() if not c["mlp_family"]] or [0.0]),
+                            "max_abs_delta_mlp": max([abs(c["delta"]) for c in cmp.values() if c["mlp_family"]] or [0.0]),
+                            "all_within_2se": all(c["within_2se"] for c in cmp.values() if c["within_2se"] is not None),
+                            "old_code_rerun": old}
+        rows[name]["norm_act_max"] = float(np.max(r["perdir"]["extra"]["mlp"]["norm_act"])) if r["perdir"] else None
+        rows[name]["norm_act_std"] = float(np.std(r["perdir"]["extra"]["mlp"]["norm_act"])) if r["perdir"] else None
     # the chance level depends on the base model only -> identical across checkpoints (assert, then keep one number)
     chance_one = {}
     for k, vs in chance.items():
