@@ -18,13 +18,22 @@ EXPANDED bank (>= 250k rows for a bigger SFT mix; same split, nothing existing o
         scan_file='/data/mlp42/bank_scan_big.npz', bank_out='/data/banks/mlp42_big', write_eval_cache=False,
         selection_file='/data/mlp42/bank_selection_big.json')     # min_c 500 = 10 * 20.48M/409.6k: same joint-firing RATE floor
     modal.Function.from_name('maemm-mlp42-bank', 'verify').remote(bank='/data/banks/mlp42_big')
+
+FRESH bank for the 5M midtrain mix (bank-5m; deploy under a NEW app name so the running apps are untouched):
+    MAEMM_MLP42_APP=maemm-mlp42-bank-5m modal deploy data/modal_mlp42_bank.py
+    scan.spawn(n_windows=160000, win_len=256, batch=32, topk=160, sample_seed=5001, acts_dir='/data/acts27b_fresh', train_frac=1.0,
+               sel_file='/data/mlp42/sel_windows_fresh.npz', scan_file='/data/mlp42/bank_scan_fresh.npz')   # 41M fresh tokens
+    build.spawn(k_single=64, k_pair=..., k_triple=..., distinct_windows=True, check_mix=False, min_c=1000,
+                scan_file='/data/mlp42/bank_scan_fresh.npz', bank_out='/data/banks/mlp42_5m_fresh', write_eval_cache=False,
+                selection_file='/data/mlp42/bank_selection_5m_fresh.json')
 """
+import os
 from pathlib import Path
 
 import modal
 
 REPO = Path(__file__).resolve().parent.parent
-APP_NAME = "maemm-mlp42-bank"
+APP_NAME = os.environ.get("MAEMM_MLP42_APP", "maemm-mlp42-bank")
 app = modal.App(APP_NAME)
 
 # same pins as data/modal_mlp42_neurons.py (one environment across the suite)
@@ -56,9 +65,10 @@ def _env():
 @app.function(image=image, gpu=SCAN_GPUS, cpu=8, memory=65536, volumes={"/data": vol},
               secrets=[modal.Secret.from_name("maemm-hf")], timeout=6 * 3600)
 def scan(n_windows: int = 1600, win_len: int = 256, batch: int = 16, topk: int = 32, sample_seed: int | None = None,
-         sel_file: str | None = None, scan_file: str | None = None):
+         sel_file: str | None = None, scan_file: str | None = None, acts_dir: str | None = None, train_frac: float = 0.95):
     """Defaults == today's bank (first n_windows of sel_windows.npz -> bank_scan.npz). For an EXPANDED scan pass sample_seed
-    (fresh windows over all acts27b TRAIN rows) + NEW sel_file/scan_file paths; nothing existing is overwritten."""
+    (fresh windows over all TRAIN rows of acts_dir; default /data/acts27b at train_frac 0.95, a fresh store at 1.0) + NEW
+    sel_file/scan_file paths; nothing existing is overwritten."""
     _env()
     import time
     import torch
@@ -73,17 +83,17 @@ def scan(n_windows: int = 1600, win_len: int = 256, batch: int = 16, topk: int =
     base.eval()
     BW.log(f"base loaded in {time.time() - t0:.0f}s")
     res = BW.run_scan(base, n_windows=n_windows, win_len=win_len, batch=batch, topk=topk, dev=dev, sample_seed=sample_seed,
-                      sel_file=sel_file, scan_file=scan_file)
+                      sel_file=sel_file, scan_file=scan_file, acts_dir=acts_dir, train_frac=train_frac)
     vol.commit()
     return res
 
 
-@app.function(image=image, gpu=SMALL_GPUS, cpu=8, memory=65536, volumes={"/data": vol},
-              secrets=[modal.Secret.from_name("maemm-hf")], timeout=2 * 3600)
+@app.function(image=image, gpu=SMALL_GPUS, cpu=8, memory=98304, volumes={"/data": vol},
+              secrets=[modal.Secret.from_name("maemm-hf")], timeout=4 * 3600)
 def build(seed: int = 2026, heldout_frac: float = 0.10, n_eval_single: int = 512, n_eval_pair: int = 256, k_single: int = 8,
           k_pair: int = 4, w_lo: int = 16, w_hi: int = 32, min_tok: int = 8, check_mix: bool = True, scan_file: str | None = None,
           bank_out: str | None = None, write_eval_cache: bool = True, selection_file: str | None = None, min_c: int = 10,
-          min_lift: float = 10.0, max_p: float = 1e-10):
+          min_lift: float = 10.0, max_p: float = 1e-10, distinct_windows: bool = False, k_triple: int = 0, min_c3: int | None = None):
     """Defaults == today's bank (draws the hold-out split, writes eval cache v2 -> /data/banks/mlp42). For an EXPANDED bank pass
     scan_file (a bank_scan_big.npz), bank_out (new dir), write_eval_cache=False (hold-out + eval dirs READ from the existing v2
     cache, nothing under /data/eval_universal_ho is written), selection_file (new path), k_single/k_pair, and min_c scaled with the
@@ -97,7 +107,7 @@ def build(seed: int = 2026, heldout_frac: float = 0.10, n_eval_single: int = 512
     res = BW.run_build(tok, dev="cuda:0", seed=seed, heldout_frac=heldout_frac, n_eval_single=n_eval_single, n_eval_pair=n_eval_pair,
                        k_single=k_single, k_pair=k_pair, w_lo=w_lo, w_hi=w_hi, min_tok=min_tok, check_mix=check_mix,
                        scan_file=scan_file, bank_out=bank_out or BW.BANK_OUT, write_eval_cache=write_eval_cache, selection_file=selection_file,
-                       min_c=min_c, min_lift=min_lift, max_p=max_p)
+                       min_c=min_c, min_lift=min_lift, max_p=max_p, distinct_windows=distinct_windows, k_triple=k_triple, min_c3=min_c3)
     vol.commit()
     return res
 
