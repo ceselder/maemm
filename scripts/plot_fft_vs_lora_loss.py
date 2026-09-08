@@ -14,6 +14,8 @@ OUT = os.path.expanduser("~/shared/reports/maemm-sft-fullft-104m"); os.makedirs(
 RUNS = {
     "fft104m": {"path": "celestedeschamphelaere-personal/maxact-fast/jp82mr9a", "eff": 4096, "eval": ("celestedeschamphelaere-personal/maxact-fast", "realact104m_fullft_b4096_lr1e-5_eval"),
                 "label": "full fine-tune, 104M corpus, eff batch 4,096, lr 1e-5 (running)", "color": "#2a7f62"},
+    "fft104m_b8k": {"path": "celestedeschamphelaere-personal/maxact-fast/6o76ie7z", "eff": 8192, "eval": ("celestedeschamphelaere-personal/maxact-fast", "realact104m_fullft_b8192_lr3e-5_eval"),
+                    "label": "full fine-tune, 104M corpus, eff batch 8,192, lr 3e-5 (running, comparison arm)", "color": "#9a7fc4"},
     "lora23m": {"path": "octahedral-systems/maxact-fast/da7cxuz3", "eff": 512, "eval": ("octahedral-systems/maxact-fast", "realact20m_prefix_lr1e-4_eval"),
                 "label": "previous best: LoRA r64, 23M corpus, eff batch 512, lr 1e-4", "color": "#b5542b"},
     "fft2m": {"path": "octahedral-systems/maxact-fast/9ce7q1n2", "eff": 512, "eval": None,
@@ -62,7 +64,7 @@ fl = np.array(f["loss"]); ll = np.array(l["loss"]); f_ex = f["last_step"] * 4096
 # loss at matched examples: LoRA loss around the FFT's current example count
 li = np.argmin(np.abs(np.array(l["loss_steps"]) * 512 - f_ex)); lo_match = float(np.mean(ll[max(0, li - 20): li + 20])); fo = float(np.mean(fl[-50:]))
 fig.suptitle(f"Full fine-tune at 8x the batch tracks the LoRA pretrain's training loss at matched examples ({fo:.3f} vs {lo_match:.3f} at {f_ex / 1e6:.1f}M)\n"
-             f"and its held-out fidelity (.367-.370 so far vs the LoRA run's flat .364-.375): the eval is not moving with the loss yet", fontsize=10.5, y=1.0)
+             f"and its held-out fidelity (.367-.370 so far vs the LoRA run's flat .364-.375): the eval is not moving with the loss; purple = the lr 3e-5 / batch 8,192 comparison arm", fontsize=10.5, y=1.0)
 fig.tight_layout(rect=(0, 0, 1, 0.94))
 for ext in ("png", "pdf"): fig.savefig(f"{OUT}/loss_vs_prev.{ext}", dpi=160)
 print("wrote", {k: (data["runs"][k]["n_rows"], data["runs"][k]["last_step"], [(e["ckpt_step"], round(e["mean_all"], 3)) for e in data["runs"][k]["evals"]][:8]) for k in RUNS}, "| fft last50 loss", round(fo, 3), "lora at matched examples", round(lo_match, 3))
