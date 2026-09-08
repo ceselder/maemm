@@ -100,7 +100,7 @@ for j, (run, S) in enumerate(summary.items()):
         if j == 0:
             ax.set_ylabel(lab, fontsize=9)
         if i == 2:
-            ax.set_xlabel("RL step (dashed = runaway onset; shaded = before / during / after windows sampled below)", fontsize=8.5)
+            ax.set_xlabel("RL step" + ("  (dashed = runaway onset; shaded = the before / during / after windows sampled below)" if j == 1 else ""), fontsize=8.5)
 fig.suptitle("Constant-lr RL collapse in the transcripts: reward holds or climbs through the onset, generated text gets shorter and degenerate afterwards\n"
              "(sampled rollouts logged every 5 steps by three runs of the Qwen3.6-27B activation→text inverter)", fontsize=11.5)
 fig.tight_layout(rect=(0, 0, 1, 0.94))
