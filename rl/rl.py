@@ -500,11 +500,21 @@ def load_eval_assets(a, device, is_main):
             es["sae_dirs"], es["sae_feats"] = es["sae_dirs"][:n], list(es["sae_feats"])[:n]
             es["corpus_peak"] = es["corpus_peak"][:n]
         ev = {"EU": EU, "es": es, "sae": sae, "fams": fams, "xfams": xfams, "feats": list(es["sae_feats"]),
-              "cp": es["corpus_peak"].numpy().astype(np.float64)}
+              "cp": es["corpus_peak"].numpy().astype(np.float64), "mlp_stats": None, "mlp_chance_acts": None}
+        # cross-neuron RANK metrics of the extra (mlp) families (eval_universal.score_mlp_rank): need the corpus stats of EVERY
+        # layer-42 neuron (--mlp-stats; the trainer leaves it '' = off, eval_ckpt_daemon defaults it on when the file exists)
+        mlp_stats = getattr(a, "mlp_stats", "") or ""
+        if xfams and mlp_stats and os.path.exists(mlp_stats):
+            ev["mlp_stats"] = EU.load_mlp_neuron_stats(mlp_stats)
+            ca = getattr(a, "mlp_chance_acts", "") or ""
+            ev["mlp_chance_acts"] = ca if (ca and os.path.exists(os.path.join(ca, "toks.i32"))) else None
+        elif xfams and mlp_stats and is_main:
+            print(f"[inline-eval] --mlp-stats {mlp_stats} not found -> MLP rank metrics OFF", flush=True)
         if is_main:
             print(f"[inline-eval] ready: families {fams} n={len(es[fams[0] + '_dirs'])} (cache n={es['meta'].get('n')}) | sae feats {len(ev['feats'])} "
                   f"| extra families {xfams} n={[len(es[f + '_dirs']) for f in xfams]} (cache {a.eval_cache}) "
-                  f"| bo={a.eval_bo} temp={a.eval_temp} tokens {a.eval_min_new}-{a.eval_max_new} | every {a.inline_eval_every} steps",
+                  f"| bo={a.eval_bo} temp={a.eval_temp} tokens {a.eval_min_new}-{a.eval_max_new} | every {a.inline_eval_every} steps"
+                  + (f" | MLP rank metrics ON ({mlp_stats}; chance windows {ev['mlp_chance_acts'] or 'OFF'})" if ev["mlp_stats"] else ""),
                   flush=True)
         return ev
     except Exception as e:  # noqa
@@ -581,8 +591,10 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
                 local["sae_text"] = {int(i): texts[j * bo + int(arg[j])] for j, i in enumerate(rows)}
         else:
             local["sae"], local["sae_peak"] = {}, {}
-        # extra families (cache v2: layer-42 MLP neurons / co-firing pairs): cosine + clean-base fire-back
-        for fam in EV.get("xfams", []):
+        # extra families (cache v2: layer-42 MLP neurons / co-firing pairs): cosine + clean-base fire-back (+ cross-neuron RANK
+        # of the best-of-bo sample and its chance level on random corpus windows when the per-neuron stats are loaded)
+        stats = EV.get("mlp_stats")
+        for fi, fam in enumerate(EV.get("xfams", [])):
             du = es[f"{fam}_dirs"]
             rows, texts = gen(du)
             local[fam], local[f"{fam}_na"], local[f"{fam}_na_any"] = {}, {}, {}
@@ -592,10 +604,23 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
                 cos = EU.score_probe_cos(texts, rd, actor, tok, device).view(len(rows), bo).max(1).values
                 na_min, na_max = EU.score_mlp_fireback(texts, es[f"{fam}_neuron"][rr], es[f"{fam}_polarity"][rr],
                                                        es[f"{fam}_corpus_max"][rr], actor, tok, device)
-                na_min = na_min.view(len(rows), bo).max(1).values; na_max = na_max.view(len(rows), bo).max(1).values
+                na_min, arg = na_min.view(len(rows), bo).max(1); na_max = na_max.view(len(rows), bo).max(1).values
                 local[fam] = {int(i): float(c) for i, c in zip(rows, cos.tolist())}
                 local[f"{fam}_na"] = {int(i): float(v) for i, v in zip(rows, na_min.tolist())}
                 local[f"{fam}_na_any"] = {int(i): float(v) for i, v in zip(rows, na_max.tolist())}
+                if stats is not None:   # rank metrics of the SAME sample that defines norm_act (the best-of-bo by the weakest member)
+                    rk = EU.score_mlp_rank(texts, es[f"{fam}_neuron"][rr], stats, actor, tok, device)
+                    sel = torch.arange(len(rows)) * bo + arg.cpu()
+                    for key in ("rank", "rank_best5", "raw_rank", "pct", "av"):
+                        local[f"{fam}_{key}"] = {int(i): rk[key][sel[j]].tolist() for j, i in enumerate(rows)}
+            if stats is not None and EV.get("mlp_chance_acts"):
+                # chance level: random held-out corpus windows scored exactly like the generations; depends on the base model only,
+                # so it is computed once per process (per rank, its own rows) and re-sent with every eval
+                key = f"{fam}_chance"
+                if key not in EV.setdefault("_mlp_chance_local", {}):
+                    EV["_mlp_chance_local"][key] = EU.mlp_chance_rows(fam, fi, es, stats, actor, tok, device, EV["mlp_chance_acts"],
+                                                                      range(rank, len(du), world), bo, a.eval_min_new, a.eval_max_new)
+                local[key] = EV["_mlp_chance_local"][key]
     except Exception as e:  # noqa
         local = {"error": f"rank{rank}: {type(e).__name__}: {str(e)[:300]}"}
     gathered = [None] * world
@@ -638,6 +663,7 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
     # mean_all over the cos families only (no control, no sae/cos diagnostic, no cache-v2 extra families)
     cos_keys = [k for k in out if k.startswith("eval/") and k.endswith("/cos") and k.split("/")[1] not in EU.CONTROL_FAMS and k.split("/")[1] != "sae"]   # sae/cos is a diagnostic, not a mean_all family
     out["eval/mean_all"] = float(np.mean([out[k] for k in cos_keys]))
+    chance_pd = {}
     for fam in EV.get("xfams", []):
         idx = sorted(merged[fam])
         out[f"eval/{fam}/cos"] = float(np.mean([merged[fam][i] for i in idx]))
@@ -647,21 +673,32 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
         out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
         out[f"eval/all/{fam}_norm_act"] = out[f"eval/{fam}/norm_act"]
         out[f"eval/all/{fam}_fired10"] = out[f"eval/{fam}/fired10"]
+        if merged.get(f"{fam}_rank"):   # cross-neuron RANK metrics (eval_universal.mlp_rank_metrics) + chance level
+            R = lambda key: np.asarray([merged[f"{fam}_{key}"][i] for i in idx], np.float64)
+            out.update(EU.mlp_rank_metrics(fam, R("rank"), R("rank_best5"), R("raw_rank"), R("pct")))
+            out[f"eval/all/{fam}_rank_le{EU.MLP_RANK_LE}"] = out[f"eval/{fam}/rank_le{EU.MLP_RANK_LE}"]
+            out[f"eval/all/{fam}_mrr"] = out[f"eval/{fam}/mrr"]
+            if merged.get(f"{fam}_chance"):
+                cm, chance_pd[fam] = EU.mlp_chance_metrics(fam, merged[f"{fam}_chance"], k)
+                out.update(cm)
     for fam in EV["fams"]:
         out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
     out["eval/all/sae_norm_act"] = out["eval/sae/norm_act"]
     out["eval/all/sae_unverbalized"] = out["eval/sae/unverbalized_frac"]
     if per_dir:   # NOT a wandb scalar: the caller pops it (eval_ckpt_daemon -> perdir_ckpt_<step>.json)
-        out["_perdir"] = per_dir_dump(EV, merged, ranks)
+        out["_perdir"] = per_dir_dump(EV, merged, ranks, chance_pd)
     out["time/inline_eval_s"] = time.time() - t0
     return out
 
 
-def per_dir_dump(EV, merged, ranks):
+def per_dir_dump(EV, merged, ranks, chance_pd=None):
     """--dump-per-dir: the per-direction best-of-bo scores behind every inline_eval aggregate, in eval-cache row order
     (list position == cache row 0..n-1). cos families: best-of-bo max-token cosine per direction. sae: feature id, best
     sample's raw act, corpus peak, norm_act = best/peak, fired (> SAE_FIRE), beat_corpus, cosine view, full-SAE rank + rank1
     flag, every sample's act and the best sample's text. Extra (cache v2 mlp) families: cosine + fire-back per direction.
+    With the per-neuron stats loaded (--mlp-stats) the extra families also carry, per direction, the best-of-bo sample's
+    cross-neuron ranks (rank / rank_best5 / raw_rank, [n, k] lists), its corpus percentile, the polarity-signed value behind
+    norm_act, the neuron ids, and "chance" = the same arrays for random held-out corpus windows (+ the windows' (seq, off, len)).
     Small (11 families x 512 floats + the sae arrays, ~250 KB with texts). Never logged to wandb -- the caller pops it."""
     EU, es = EV["EU"], EV["es"]
     d = {"row_order": "list position == eval-cache row index", "cos": {}, "sae": {}, "extra": {}}
@@ -691,6 +728,16 @@ def per_dir_dump(EV, merged, ranks):
         xi = sorted(merged[fam])
         d["extra"][fam] = {"row": [int(i) for i in xi], "cos": [merged[fam][i] for i in xi],
                            "norm_act": [merged[f"{fam}_na"][i] for i in xi], "any_norm_act": [merged[f"{fam}_na_any"][i] for i in xi]}
+        if merged.get(f"{fam}_rank"):
+            d["extra"][fam].update({"neuron": es[f"{fam}_neuron"][xi].tolist(),
+                                    "rank": [[int(x) for x in merged[f"{fam}_rank"][i]] for i in xi],
+                                    "rank_best5": [[int(x) for x in merged[f"{fam}_rank_best5"][i]] for i in xi],
+                                    "raw_rank": [[int(x) for x in merged[f"{fam}_raw_rank"][i]] for i in xi],
+                                    "corpus_pct": [merged[f"{fam}_pct"][i] for i in xi], "best_signed_act": [merged[f"{fam}_av"][i] for i in xi],
+                                    "rank_note": "rank among all d_ff layer-42 neurons by polarity*a/corpus_max at the best-of-bo sample's "
+                                                 "best last-5 token (rank_best5: min over the window; raw_rank: by polarity*a, unnormalized)"})
+            if chance_pd and fam in chance_pd:
+                d["extra"][fam]["chance"] = chance_pd[fam]
     return d
 
 
@@ -905,6 +952,11 @@ def parse_args():
     ap.add_argument("--eval-temp", type=float, default=1.0)
     ap.add_argument("--eval-max-new", type=int, default=64)
     ap.add_argument("--eval-min-new", type=int, default=16)
+    ap.add_argument("--mlp-stats", default="",
+                    help="per-neuron corpus stats of ALL layer-42 neurons (/data/mlp42/neuron_stats.npz) -> cross-neuron RANK metrics of the "
+                         "cache-v2 mlp families in the inline eval (eval_universal.score_mlp_rank). '' (default) = off; eval_ckpt_daemon turns it on")
+    ap.add_argument("--mlp-chance-acts", default="/data/acts27b",
+                    help="acts27b dump for the random-corpus-window CHANCE level of the MLP metrics (needs --mlp-stats); '' = off")
     ap.add_argument("--no-extra-evals", action="store_true", help="skip the autointerp/locality/WildChat/adversarial inline evals")
     ap.add_argument("--eval-n-per-family", type=int, default=0,
                     help="inline eval: use only the first N directions of each family (0 = the whole cache). "

@@ -27,6 +27,13 @@ safetensors file, no PEFT actor) while the HF side is the clean ORIGINAL base fo
 eval cache). The adapter-on marker norm the steering scale needs is captured from the engine itself (vllm_lens residual
 capture with the LoRA request; the LoRA protocol's HF _marker_norm agrees within the injection check's 3%).
 
+MLP RANK metrics (cache v2 mlp / mlp_pair families, 2026-09-08): with --mlp-stats (default /data/mlp42/neuron_stats.npz, the
+per-neuron corpus stats of ALL layer-42 neurons) each direction's best-of-bo sample is also ranked among all 17,408 neurons
+(eval/<fam>/rank1_frac, rank_le10, mean_rank, median_rank, mrr; best5_* over the whole last-5 window; raw_* unnormalized;
+corpus_pct_mean / top1pct_frac = within-neuron corpus percentile) and the chance level of every such number on random
+held-out corpus windows is logged as eval/<fam>/chance_* (eval_universal.score_mlp_rank / mlp_chance_rows). The old
+norm_act / fired* keys are byte-identical to a run without the stats.
+
     python eval/eval_ckpt_daemon.py --ckpt-dir /data/ckpts_last5_v15_g8 --tag last5_v15_g8 --once --only-step 90
 """
 import argparse
@@ -83,6 +90,13 @@ def parse_args(argv=None):
                     help="frozen eval-set cache (env MAEMM_EVAL_CACHE). eval_sets_heldout_v2.pt = the same 11 cos families + sae PLUS the "
                          "extra mlp / mlp_pair families (layer-42 MLP neuron cosine + fire-back; not in mean_all)")
     ap.add_argument("--eval-sae", default="/data/sae/ae.pt")
+    ap.add_argument("--mlp-stats", default="/data/mlp42/neuron_stats.npz",
+                    help="per-neuron corpus stats of ALL 17,408 layer-42 neurons (data/mlp42_neurons_worker.py) -> the cache-v2 mlp / mlp_pair "
+                         "families ALSO get cross-neuron RANK metrics (eval/<fam>/{rank1_frac, rank_le10, mean_rank, median_rank, mrr, best5_*, "
+                         "raw_*, corpus_pct_mean, top1pct_frac}, eval_universal.score_mlp_rank) + their chance level on random corpus windows "
+                         "(eval/<fam>/chance_*). Missing file or '' = rank metrics off; every pre-existing key is unchanged either way")
+    ap.add_argument("--mlp-chance-acts", default="/data/acts27b",
+                    help="acts27b dump (toks.i32 + meta.json) whose HELD-OUT tail rows supply the random windows for the chance level ('' = off)")
     ap.add_argument("--eval-n-per-family", type=int, default=0, help="0 = the whole cache (512/family)")
     ap.add_argument("--eval-bo", type=int, default=4)
     ap.add_argument("--eval-temp", type=float, default=1.0)
@@ -515,13 +529,15 @@ def main():
             "min_new": a.eval_min_new, "max_new": a.eval_max_new, "eval_cache": a.eval_cache,
             "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "full_model": a.full_model,
             "policy_base": policy_base or MODEL, "hnorm_adapter_on": hnorm_on,
+            "mlp_stats": a.mlp_stats if EV.get("mlp_stats") else None, "mlp_chance_acts": EV.get("mlp_chance_acts"),
             "injection_check": chk}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
         if perdir is not None:
             json.dump({"ckpt_step": s, "ckpt": ck, "tag": a.tag, **extras, "protocol": {
                 "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]), "bo": a.eval_bo, "temp": a.eval_temp,
                 "min_new": a.eval_min_new, "max_new": a.eval_max_new, "eval_cache": a.eval_cache, "sae_fire": EV["EU"].SAE_FIRE,
                 "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "full_model": a.full_model,
-                "policy_base": policy_base or MODEL}, "aggregates": {k: v for k, v in ev.items() if k.startswith("eval/")},
+                "policy_base": policy_base or MODEL, "mlp_stats": a.mlp_stats if EV.get("mlp_stats") else None,
+                "mlp_chance_acts": EV.get("mlp_chance_acts")}, "aggregates": {k: v for k, v in ev.items() if k.startswith("eval/")},
                 "perdir": perdir}, open(f"{a.out_dir}/perdir_ckpt_{s}.json", "w"))
             log(f"step {s}: per-direction dump -> {a.out_dir}/perdir_ckpt_{s}.json ({len(perdir['cos'])} cos families + sae {len(perdir['sae'].get('row', []))}"
                 f" + extra {list(perdir['extra'])})")
@@ -539,6 +555,9 @@ def main():
             f"rank1 {ev.get('eval/sae/rank1_frac', float('nan')):.3f} unverb {ev['eval/sae/unverbalized_frac']:.3f} "
             f"| realact {ev.get('eval/realact/cos', float('nan')):.4f} random {ev.get('eval/random/cos', float('nan')):.4f}"
             + "".join(f" | {f} cos {ev[f'eval/{f}/cos']:.4f} fireback {ev[f'eval/{f}/norm_act']:.3f} fired10 {ev[f'eval/{f}/fired10']:.3f}"
+                      + (f" rank1 {ev[f'eval/{f}/rank1_frac']:.3f} le10 {ev[f'eval/{f}/rank_le10']:.3f} mrr {ev[f'eval/{f}/mrr']:.3f}"
+                         + (f" (chance le10 {ev[f'eval/{f}/chance_rank_le10']:.3f})" if f"eval/{f}/chance_rank_le10" in ev else "")
+                         if f"eval/{f}/rank1_frac" in ev else "")
                       for f in EV.get("xfams", []) if f"eval/{f}/cos" in ev)
             + (f" | locality win5 {ex.get('extra/locality/win5_share', float('nan')):.3f} fire {ex.get('extra/locality/fire_frac', float('nan')):.3f}" if ex else ""))
         flush_judge()
