@@ -8,6 +8,7 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import wandb
 
 OUT = os.path.expanduser("~/shared/reports/maemm-rl-batch-scaling")
