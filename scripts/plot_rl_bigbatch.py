@@ -91,8 +91,9 @@ for col, (key, title, logy) in enumerate((("reward", "training reward (mean cos,
         ax.set_title(title, fontsize=9.5); ax.set_xlabel("RL step" if xmode == "step" else "rollouts consumed (millions)", fontsize=9); ax.grid(alpha=0.25); ax.tick_params(labelsize=8)
 h_, l_ = axes[0][0].get_legend_handles_labels(); fig.legend(h_, l_, loc="lower center", ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.5, 0.0))
 I_on = 178
-fig.suptitle("Reward dynamics at three rollout batch sizes, constant lr 1e-5: the 8x batch (8 x 4096) reaches the same reward plateau (~.31) but its entropy falls fastest per step and it breaks EARLIEST in steps\n"
-             "(grad-norm onset 178 vs 246 / 268) while lasting far longer in rollouts (5.8M vs 1-2M); per rollout it is the least sample-efficient. Thin = raw, thick = 9-step moving average; RL-I resumed at steps 25 and 50 (trainer changes, same math)", fontsize=10, y=0.995)
-fig.tight_layout(rect=(0, 0.06, 1, 0.93))
+fig.suptitle("Reward dynamics at three rollout batch sizes, constant lr 1e-5: the 8x batch (8 x 4096) reaches the same reward plateau (~.31)\n"
+             "but its entropy falls fastest per step, so it breaks EARLIEST in steps (grad-norm onset 178 vs 246 / 268) and LATEST in rollouts (5.8M vs 1-2M);\n"
+             "per rollout it is the least sample-efficient. Thin = raw, thick = 9-step moving average; RL-I resumed at steps 25 and 50 (trainer changes, same math)", fontsize=10, y=0.995)
+fig.tight_layout(rect=(0, 0.06, 1, 0.91))
 for ext in ("png", "pdf"): fig.savefig(f"{OUT}/bigbatch_reward.{ext}", dpi=160)
 print("wrote reward dynamics:", {k: (len(v), v[-1][0], round(v[-1][1], 3)) for k, v in dyn.items()})
