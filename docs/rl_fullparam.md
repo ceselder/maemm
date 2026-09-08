@@ -20,7 +20,7 @@ filled from that report; `[measured]` marks values that come from the 8xB200 run
 | publish | PEFT adapter → `lora/step_k/` files, engines swap LoRARequest per block | bf16 weights into the engines in place (§2) |
 | checkpoints | PEFT adapter dirs + `optim.pt` | full HF model dirs (`sft/fullft.py save_full_ckpt` layout, SAVE_DONE last) at `--save-steps`/`--save-every` + `final`; `--save-optim` adds `optim_dcp/` (torch.distributed.checkpoint, fp32 AdamW state); `--load-optim` restores it |
 | eval | `eval_ckpt_daemon.py` (LoRA) | `eval/modal_eval_ckpt.py::fullmodel_daemon` (`--full-model`, one engine per checkpoint) |
-| micro-batch probe | linear fit from mb 1,2 → predict at 85 % → verify, step down on OOM | same fit at 80 % (`--mb-target-frac`), prediction min-reduced over ranks (every backward is a collective), an OOM in the verification is fatal (an FSDP2 forward cannot be resumed after an exception) |
+| micro-batch probe | linear fit from mb 1,2 → predict at 85 % → verify, step down on OOM | measured ascending walk (`plan_probe_step`: never more than a doubling, linear extrapolation from the two largest measured points) against `--mb-target-frac` × GPU minus a reserve for the AdamW moments that appear at step 1 (2 × the fp32 master shard); peaks max-reduced over ranks (every backward is a collective); an OOM is fatal (an FSDP2 forward cannot be resumed after an exception) |
 
 Flags: `--full-param`, `--publish-mode {nccl,fs}`, `--wu-port`, `--fs-keep-steps`, `--fsdp-prefetch`, `--no-scorer-shard`,
 `--mb-target-frac`, `--save-optim`, `--load-optim`. `--autocast-bf16` is ignored (FSDP2 already computes in bf16). Inline

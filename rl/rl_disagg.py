@@ -314,8 +314,9 @@ def parse_args(argv=None):
     ap.add_argument("--no-scorer-shard", dest="scorer_shard", action="store_false", default=True,
                     help="--full-param: keep the frozen scorer copy of MODEL UNsharded on every rank (~35 GB/rank instead of ~7) -- debug only")
     ap.add_argument("--mb-target-frac", type=float, default=0.0,
-                    help="micro-batch probe: largest candidate predicted under this fraction of GPU memory (0 = 0.85 as before; "
-                         "--full-param 0.80: an OOM inside an FSDP2 forward is not recoverable, so the probe never risks one)")
+                    help="micro-batch probe: largest candidate predicted under this fraction of GPU memory (0 = 0.85). --full-param: the "
+                         "budget also reserves the not-yet-allocated AdamW moments (2 x the fp32 master shard) and the probe walks the "
+                         "candidates upwards, measuring each (an OOM inside an FSDP2 forward is not recoverable)")
     ap.add_argument("--save-optim", action="store_true", help="--full-param: also write the sharded AdamW state (torch.distributed.checkpoint, fp32, ~2x the model) next to each checkpoint")
     ap.add_argument("--load-optim", default=None, help="--full-param: <ckpt>/optim_dcp dir to restore the AdamW state from (same world size)")
     a = ap.parse_args(argv)
@@ -333,7 +334,7 @@ def parse_args(argv=None):
     if a.wu_port <= 0:
         a.wu_port = a.master_port + 111
     if a.mb_target_frac <= 0:
-        a.mb_target_frac = 0.80 if a.full_param else 0.85
+        a.mb_target_frac = 0.85
     if a.full_param:
         assert a.init_adapter is None and a.ref_adapter is None, "--full-param: the policy init is --policy-base (a full model dir) or MODEL; no LoRA adapters (--init-adapter/--ref-adapter must be unset or 'none')"
         assert a.inline_eval_every == 0, "--full-param: inline eval is not supported (checkpoints are full-model dirs: eval/eval_ckpt_daemon.py --full-model)"
@@ -2052,6 +2053,114 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
     return chosen, res
 
 
+
+def plan_probe_step(measured, cands, budget_bytes, max_growth=2.0, per_seq_floor=0.0):
+    """--full-param micro-batch probe planning (pure; unit-tested). measured: {mb: peak_bytes} of the attempts so far (all fit),
+    cands: the candidate list. Returns the next mb to try or None when done. Rule: walk the candidates upwards; the next one must
+    be <= max_growth x the largest measured mb and its peak, extrapolated linearly from the two largest measured points (slope
+    floored at per_seq_floor), must stay under the budget. The first two attempts (the two smallest candidates >= 4) are free:
+    at tiny micro-batches the peak is the mb-independent fp32-grad allocation, so a slope from mb 1/2 says nothing."""
+    ok = sorted(measured)
+    todo = [c for c in sorted(set(cands)) if c not in measured and (not ok or c > ok[-1])]
+    if not todo:
+        return None
+    if len(ok) < 2:
+        return todo[0]
+    a, b = ok[-2], ok[-1]
+    per = max((measured[b] - measured[a]) / max(b - a, 1), per_seq_floor)
+    for c in todo:
+        if c > max_growth * b:
+            return None
+        pred = measured[b] + per * (c - b)
+        return c if pred <= budget_bytes else None
+    return None
+
+
+def find_micro_batch_fullparam(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx, fp):
+    """--full-param: the largest micro-batch whose MEASURED forward+backward peak at max length, plus the AdamW moments that
+    torch.optim.AdamW allocates at the first step (2 x the fp32 master shard; not present during the probe), stays under
+    --mb-target-frac of the GPU. Walks the candidates upwards (plan_probe_step) so no attempt can OOM by more than one
+    doubling's worth of extrapolation error; every rank runs the same attempts (each backward is an FSDP2 collective) and
+    uses the MAX peak over ranks. An OOM is fatal (FSDP2 cannot resume after an exception inside a forward)."""
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+    import rl_hf as R
+    from mxf.config import D_MODEL, STEER_COEFF
+    L = len(prompt_ids) + a.max_new_tokens
+    p_len = len(prompt_ids)
+    total = torch.cuda.get_device_properties(0).total_memory
+    GB = 2**30
+    frac = float(a.mb_target_frac)
+    gc.collect(); torch.cuda.empty_cache()
+    base = torch.cuda.memory_allocated()
+    reserve = 0 if len(opt.state) else 2 * sum(fp.FP.is_dtensor(p) and p.to_local().numel() * 4 or p.numel() * 4 for p in actor.parameters())
+    budget = frac * total - reserve
+    world = fp.world
+    _log(tag, f"micro-batch probe (full-param) @ L={L}: resident {base / GB:.1f} GB, AdamW reserve {reserve / GB:.1f} GB, budget for the measured "
+              f"fwd/bwd peak {budget / GB:.1f} GB ({frac:.0%} of {total / GB:.0f} GB minus the reserve)")
+
+    def attempt(mb):
+        peak, err = None, None
+        try:
+            torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+            ids = torch.randint(1000, 100000, (mb, L), device=device)
+            ids[:, :p_len] = torch.tensor(prompt_ids, device=device)
+            attn = torch.ones_like(ids)
+            dirs = F.normalize(torch.randn(mb, D_MODEL, device=device), dim=-1)
+            hook = R.make_inject_hook([dirs[i : i + 1] for i in range(mb)], [[0 if pfx is not None else marker]] * mb,
+                                      STEER_COEFF, device, torch.bfloat16, mode=fp.inject_mode)
+            acc = None
+            if pfx is not None:
+                c0, l0 = pfx.run_prefix(return_logits=True)
+                acc = _PrefixGradAccumulator(c0, extra_outputs=[l0]); del c0, l0
+            with R.hooked(submodule, hook):
+                if pfx is not None:
+                    logits = pfx.suffix_logits(acc.cache, ids[:, marker:], attn[:, marker:])[:, :-1]
+                else:
+                    logits = actor(input_ids=ids, attention_mask=attn, use_cache=False, logits_to_keep=L - p_len + 1).logits[:, :-1]
+                new_lp, ent = _chunked_logp(logits, ids[:, p_len:], a.vocab_chunk, False)
+                del logits
+                loss = new_lp.mean() * 0.0
+                loss.backward()
+            if acc is not None:
+                acc.backward()
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated()
+        except torch.cuda.OutOfMemoryError as e:
+            err = re.sub(r"\s+", " ", str(e))[:300]
+        finally:
+            opt.zero_grad(set_to_none=True)
+            gc.collect(); torch.cuda.empty_cache()
+        return peak, err
+
+    def sync_max(x):
+        t = torch.tensor([float(x)], dtype=torch.float64, device=device)
+        if world > 1:
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return float(t.item())
+
+    measured, res = {}, {}
+    cands = sorted({c for c in cands if c >= 4})
+    while True:
+        mb = plan_probe_step(measured, cands, budget)
+        if mb is None:
+            break
+        peak, err = attempt(mb)
+        peak_all = sync_max(peak if peak is not None else float("inf"))
+        if peak is None or peak_all == float("inf"):
+            raise RuntimeError(f"--full-param micro-batch probe: mb={mb} ran out of memory ({err}); measured so far "
+                               f"{ {k: round(v / GB, 1) for k, v in measured.items()} } GB; relaunch with --micro-batch <= {max(measured) if measured else 4}")
+        res[mb] = {"ok": peak_all <= budget, "peak_gb": peak_all / GB, "peak_plus_reserve_gb": (peak_all + reserve) / GB}
+        _log(tag, f"mb {mb}: peak {peak_all / GB:.1f} GB (max over ranks; + AdamW reserve = {(peak_all + reserve) / GB:.1f} of {total / GB:.0f} GB) -> "
+                  f"{'fits' if peak_all <= budget else 'over budget'}")
+        if peak_all > budget:
+            break
+        measured[mb] = peak_all
+    chosen = max(measured) if measured else None
+    return chosen, res
+
+
 def _save_adapter_for_vllm(actor, lora_dir, dtype):
     """rl.py's _save_adapter_for_vllm (module names renamed to the Qwen3_5ForConditionalGeneration layout vLLM
     serves) with a configurable dtype. bf16 halves the write; vLLM casts LoRA weights to the model dtype on
@@ -2395,7 +2504,10 @@ def run_trainer(a):
     mb_res = {}
     if mb <= 0:
         cands = _mb_candidates(a)
-        mb, mb_res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx=pfx, fp=fp)
+        if fp is not None:
+            mb, mb_res = find_micro_batch_fullparam(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx, fp)
+        else:
+            mb, mb_res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx=pfx, fp=fp)
         assert mb is not None, f"no micro-batch candidate fits: {mb_res}"
         if world > 1:
             t = torch.tensor([mb], dtype=torch.int64, device=device if a.backend == "nccl" else "cpu")

@@ -65,7 +65,7 @@ def _fsdp_policy(seed=0):
 def test_full_param_flags_and_asserts():
     a = D.parse_args(_BASE + ["--full-param", "--init-adapter", "none", "--autocast-bf16"])
     assert a.full_param and a.init_adapter is None and a.publish_mode == "nccl" and a.wu_port == a.master_port + 111
-    assert a.mb_target_frac == 0.80 and a.autocast_bf16 is False and a.scorer_shard is True and a.fs_keep_steps == 2
+    assert a.mb_target_frac == 0.85 and a.autocast_bf16 is False and a.scorer_shard is True and a.fs_keep_steps == 2
     b = D.parse_args(_BASE)
     assert not b.full_param and b.mb_target_frac == 0.85 and b.autocast_bf16 is False
     for bad in (["--full-param", "--init-adapter", "/x"], ["--full-param", "--inline-eval-every", "5"],
@@ -312,6 +312,28 @@ def test_prefix_grad_accumulator_extra_outputs_get_zero_grad():
     (leaf * 0.5).sum().backward(); acc.backward()
     assert torch.allclose(x.grad, torch.full((4,), 4.0, dtype=torch.float64))   # 2 * (1.5 + 0.5); the extra path contributed 0
     assert acc._finished and acc.cache is None
+
+
+# ------------------------------------------------------------------ full-param micro-batch probe planning
+def test_plan_probe_step_walks_up_within_budget():
+    GB = 2**30
+    cands = [4, 6, 8, 12, 16, 24, 32, 40, 48, 64, 96, 128]
+    budget = 108 * GB
+    m = {}
+    assert D.plan_probe_step(m, cands, budget) == 4                       # first two attempts are free
+    m[4] = 67 * GB
+    assert D.plan_probe_step(m, cands, budget) == 6
+    m[6] = 67 * GB                                                         # fixed-dominated: slope 0 -> next candidate, growth-capped at 2x
+    assert D.plan_probe_step(m, cands, budget) == 8
+    m[8] = 67 * GB
+    assert D.plan_probe_step(m, cands, budget) == 12
+    m[12] = 80 * GB                                                        # slope 3.25 GB/seq from (8, 12): 16 -> 93 fits, 24 -> 119 does not
+    assert D.plan_probe_step(m, cands, budget) == 16
+    m[16] = 105 * GB
+    assert D.plan_probe_step(m, cands, budget) is None                     # 24 -> 105 + 6.25 * 8 = 155 > budget
+    assert D.plan_probe_step({4: 1, 8: 2}, [4, 8], budget) is None         # nothing left to try
+    assert D.plan_probe_step({4: 60 * GB, 8: 60 * GB}, cands, budget) == 12
+    assert D.plan_probe_step({4: 60 * GB, 8: 60 * GB}, [4, 8, 32], budget) is None   # 32 > 2 x 8: never jump more than a doubling
 
 
 if __name__ == "__main__":

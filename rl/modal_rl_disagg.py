@@ -185,6 +185,10 @@ def _work_dir():
     return d
 
 
+LIVE_LOG = None   # /data/disagg_runs/live_<ts>.log: the launcher's full stdout, committed to the volume every 60 s (Modal's log CLI
+                  # truncates / rate-limits long runs); _collect moves it next to the run's json artefacts at the end.
+
+
 def _run(cmd, env):
     """Run torchrun as its own process group and KILL it if this function is cancelled or errors —
     otherwise a Modal cancel only interrupts this Python thread and the trainer keeps running as a
@@ -192,14 +196,35 @@ def _run(cmd, env):
     import os
     import signal
     import subprocess
+    import time
+    global LIVE_LOG
     print("[modal] launching:", " ".join(cmd), flush=True)
+    os.makedirs("/data/disagg_runs", exist_ok=True)
+    LIVE_LOG = f"/data/disagg_runs/live_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    lf = open(LIVE_LOG, "a")
+    lf.write("[modal] launching: " + " ".join(cmd) + "\n"); lf.flush()
+    print(f"[modal] live log -> {LIVE_LOG} (volume commit every 60 s)", flush=True)
     p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          start_new_session=True)
+    t_commit = time.time()
     try:
         for line in p.stdout:
             print(line, end="", flush=True)
+            lf.write(line)
+            if time.time() - t_commit > 60:
+                lf.flush()
+                try:
+                    vol.commit()
+                except Exception:  # noqa
+                    pass
+                t_commit = time.time()
         return p.wait()
     finally:
+        lf.flush(); lf.close()
+        try:
+            vol.commit()
+        except Exception:  # noqa
+            pass
         if p.poll() is None:
             print("[modal] terminating trainer process group (cancel/error)", flush=True)
             try:
@@ -221,6 +246,8 @@ def _collect(work="/tmp/disagg"):
     os.makedirs(out, exist_ok=True)
     for f in glob.glob(f"{work}/*.json"):
         shutil.copy(f, out)
+    if LIVE_LOG and os.path.exists(LIVE_LOG):
+        shutil.move(LIVE_LOG, f"{out}/launch.log")
     vol.commit()
     print(f"[modal] artefacts -> {out}: {sorted(os.listdir(out))}", flush=True)
     return out
