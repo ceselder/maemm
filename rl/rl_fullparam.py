@@ -548,3 +548,72 @@ def timed(d, key):
         yield
     finally:
         d[key] = d.get(key, 0.0) + time.time() - t0
+
+# ----------------------------------------------------------------------------------------------
+# step-time knobs for the FSDP2 policy: exact per-layer activation checkpointing of the suffix forward (sft/prefix_cache
+# SuffixCheckpointer -- FSDP2-tested in sft/fullft_smoke.py) and a chunked, recomputed lm_head so no micro-batch ever
+# materializes [tokens x 248k] logits. Both let the micro-batch grow from 8 to 32-64, i.e. 4-8x fewer per-micro-batch
+# FSDP all-gathers / reduce-scatters (the whole cost of the update at mb 8: ~22 TB of NVLink traffic per step).
+# ----------------------------------------------------------------------------------------------
+def prefix_cache_module():
+    try:
+        from sft import prefix_cache as pc
+    except ImportError:
+        import prefix_cache as pc
+    return pc
+
+
+def suffix_checkpointer(model):
+    """sft/prefix_cache.SuffixCheckpointer on the (FSDP2) policy: every decoder layer's forward is recomputed in the backward
+    when `enabled` and a past_key_values cache is passed (the suffix forward); the prefix / marker-norm / no-grad forwards are
+    untouched. Toggle .enabled around the suffix passes (FullParamCtx.suffix_ctx)."""
+    return prefix_cache_module().SuffixCheckpointer(model)
+
+
+class ChunkedHead:
+    """Replaces lm_head.forward while `active`: the head input (final normed hidden states, [B, S, d]) is stashed and a [B, S, 1]
+    dummy that still depends on it is returned, so HF's forward never builds [B, S, 248k] logits. `logp()` then computes, per
+    chunk of `vocab_chunk` positions and under torch.utils.checkpoint (recomputed in the backward, nothing saved but the
+    hidden chunk): fp32 logits = F.linear(h.float(), W.float()) -> log_softmax -> gather(target) and the entropy. The head
+    weight is the FSDP2 root group's gathered parameter (the root is not resharded after forward), so gradients reach it
+    exactly as through the original forward. Same math as rl_disagg._chunked_logp with --fp32-head."""
+
+    def __init__(self, model):
+        self.head = model.lm_head
+        self._orig = self.head.forward
+        self.active = False
+        self.hidden = None
+        self.head.forward = self._forward
+
+    def undo(self):
+        self.head.forward = self._orig
+
+    def _forward(self, x, *args, **kw):
+        if not self.active:
+            return self._orig(x, *args, **kw)
+        self.hidden = x
+        return x[..., :1]
+
+    def logp(self, hidden, targets, vocab_chunk, need_entropy_grad=False, fp32=True):
+        """hidden [B, T, d] (positions predicting targets [B, T]) -> (new_lp [B, T] with grad, entropy [B, T])."""
+        import torch.nn.functional as F
+        from torch.utils.checkpoint import checkpoint
+        W, b = self.head.weight, self.head.bias
+
+        def fn(h, tgt, W, b):
+            with torch.autocast(h.device.type, enabled=False):
+                if fp32:
+                    logits = F.linear(h.float(), W.float(), None if b is None else b.float())
+                else:
+                    logits = F.linear(h, W, b).float()
+                lpf = torch.log_softmax(logits, -1)
+                lp = lpf.gather(-1, tgt[..., None]).squeeze(-1)
+                ent = -(lpf.exp() * lpf).sum(-1)
+            return lp, ent
+        T = hidden.shape[1]
+        lps, ents = [], []
+        for c0 in range(0, T, vocab_chunk):
+            c1 = min(c0 + vocab_chunk, T)
+            lp, ent = checkpoint(fn, hidden[:, c0:c1], targets[:, c0:c1], W, b, use_reentrant=False, preserve_rng_state=False)
+            lps.append(lp); ents.append(ent if need_entropy_grad else ent.detach())
+        return torch.cat(lps, 1), torch.cat(ents, 1)

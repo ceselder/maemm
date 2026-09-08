@@ -317,6 +317,13 @@ def parse_args(argv=None):
                     help="micro-batch probe: largest candidate predicted under this fraction of GPU memory (0 = 0.85). --full-param: the "
                          "budget also reserves the not-yet-allocated AdamW moments (2 x the fp32 master shard) and the probe walks the "
                          "candidates upwards, measuring each (an OOM inside an FSDP2 forward is not recoverable)")
+    ap.add_argument("--suffix-ckpt", action="store_true",
+                    help="--full-param: exact per-layer activation checkpointing of the SUFFIX forward (sft/prefix_cache.SuffixCheckpointer; "
+                         "needs --prefix-cache): recompute in the backward -> the micro-batch can grow 4-8x, i.e. that many fewer per-micro-batch "
+                         "FSDP2 all-gathers/reduce-scatters (the entire update cost at mb 8)")
+    ap.add_argument("--chunked-head", action="store_true",
+                    help="--full-param: never materialize [tokens x 248k] logits -- lm_head + fp32 log-softmax + gather/entropy per --vocab-chunk "
+                         "positions under torch.utils.checkpoint (rl_fullparam.ChunkedHead; same math as --fp32-head + _chunked_logp)")
     ap.add_argument("--save-optim", action="store_true", help="--full-param: also write the sharded AdamW state (torch.distributed.checkpoint, fp32, ~2x the model) next to each checkpoint")
     ap.add_argument("--load-optim", default=None, help="--full-param: <ckpt>/optim_dcp dir to restore the AdamW state from (same world size)")
     a = ap.parse_args(argv)
@@ -345,6 +352,9 @@ def parse_args(argv=None):
             assert a.n_trainer >= 2, "--full-param needs >= 2 trainer ranks (fp32 masters + AdamW of the 27B do not fit one GPU)"
         if a.autocast_bf16:   # FSDP2 MixedPrecisionPolicy(param_dtype=bf16) already runs the compute in bf16 (sft/pretrain.py does the same)
             a.autocast_bf16 = False
+        assert not a.suffix_ckpt or a.prefix_cache, "--suffix-ckpt is a --prefix-cache knob"
+    else:
+        assert not (a.suffix_ckpt or a.chunked_head), "--suffix-ckpt / --chunked-head are --full-param knobs"
     if a.rollout_block_groups <= 0:
         a.rollout_block_groups = max(1, a.groups_per_step // max(a.n_rollout, 1))
     assert a.groups_per_step % a.rollout_block_groups == 0, "groups_per_step must be a multiple of rollout_block_groups"
@@ -1066,6 +1076,29 @@ class FullParamCtx:
         self.last_pub = {}
         self.pub_hist = []
         self.mem = {}
+        self.ckpt = None                      # --suffix-ckpt: rl_fullparam.suffix_checkpointer(actor)
+        self.head = None                      # --chunked-head: rl_fullparam.ChunkedHead(actor)
+
+    @contextlib.contextmanager
+    def suffix_ctx(self):
+        """Around every suffix forward/backward of the policy: checkpointing on, chunked head capturing."""
+        if self.ckpt is not None:
+            self.ckpt.enabled = True
+        if self.head is not None:
+            self.head.active = True
+        try:
+            yield
+        finally:
+            if self.ckpt is not None:
+                self.ckpt.enabled = False
+            if self.head is not None:
+                self.head.active, self.head.hidden = False, None
+
+    def logp_from(self, logits, tgt, vocab_chunk, need_entropy_grad, fp32_head):
+        """new_lp / entropy for a micro-batch: from the stashed head input (--chunked-head) or from the logits (_chunked_logp)."""
+        if self.head is not None:
+            return self.head.logp(self.head.hidden[:, :-1], tgt, vocab_chunk, need_entropy_grad, fp32=fp32_head)
+        return _chunked_logp(logits, tgt, vocab_chunk, need_entropy_grad)
 
 
 def load_scorer_fullparam(a, device, world, tag, use_gates, need_logits=False):
@@ -1855,10 +1888,13 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         olp = old_lp[ix, :Tc].to(device); kn = known[ix, :Tc].to(device)
         hook = _hook_outside_autocast(R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[inj_pos]] * len(ix), STEER_COEFF, device, torch.bfloat16, mode=inj_mode),
                                       a.autocast_bf16)
-        with R.hooked(submodule, hook):
+        with R.hooked(submodule, hook), (fp.suffix_ctx() if fp is not None else contextlib.nullcontext()):
             with _policy_precision(actor, a.autocast_bf16):   # --autocast-bf16: bf16 LoRA matmuls/activations; fp32 vocab math below is outside
                 logits = policy_logits(ix, Lc, acc.cache if acc is not None else None)
-            new_lp, ent = _chunked_logp(logits, tgt, a.vocab_chunk, a.entropy_coef > 0)
+            if fp is not None:
+                new_lp, ent = fp.logp_from(logits, tgt, a.vocab_chunk, a.entropy_coef > 0, a.fp32_head)
+            else:
+                new_lp, ent = _chunked_logp(logits, tgt, a.vocab_chunk, a.entropy_coef > 0)
             del logits
             olp_eff = torch.where(kn, olp, new_lp.detach())
             loss_tok, ratio, rho = pg_token_loss(new_lp, olp_eff, A, a.loss, a.clip_eps, a.tis_cap, a.cispo_eps_max)
@@ -1891,7 +1927,7 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     for _ in range(n_mb_max - (-(-n // mb))):   # FSDP2: zero-weight dummy micro-batches so every rank issues the same collectives
         ix1, Lc1 = order[:1], p_len + min(T, 16)
         hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix1.tolist()], [[inj_pos]], STEER_COEFF, device, torch.bfloat16, mode=inj_mode)
-        with R.hooked(submodule, hook):
+        with R.hooked(submodule, hook), fp.suffix_ctx():
             lg = policy_logits(ix1, Lc1, acc.cache if acc is not None else None)
             (lg[..., :1].float().sum() * 0.0).backward()
         del lg
@@ -2136,12 +2172,12 @@ def find_micro_batch_fullparam(actor, opt, submodule, prompt_ids, marker, a, dev
             if pfx is not None:
                 c0, l0 = pfx.run_prefix(return_logits=True)
                 acc = _PrefixGradAccumulator(c0, extra_outputs=[l0]); del c0, l0
-            with R.hooked(submodule, hook):
+            with R.hooked(submodule, hook), fp.suffix_ctx():
                 if pfx is not None:
                     logits = pfx.suffix_logits(acc.cache, ids[:, marker:], attn[:, marker:])[:, :-1]
                 else:
                     logits = actor(input_ids=ids, attention_mask=attn, use_cache=False, logits_to_keep=L - p_len + 1).logits[:, :-1]
-                new_lp, ent = _chunked_logp(logits, ids[:, p_len:], a.vocab_chunk, False)
+                new_lp, ent = fp.logp_from(logits, ids[:, p_len:], a.vocab_chunk, False, a.fp32_head)
                 del logits
                 loss = new_lp.mean() * 0.0
                 loss.backward()
@@ -2440,9 +2476,15 @@ def run_trainer(a):
                                     prefetch=a.fsdp_prefetch)
         actor.train()
         fp.mem["after_shard_gb"] = torch.cuda.memory_allocated() / 2**30
-        if a.fp32_head:   # trainable head: fp32 logits + grad path through the gathered bf16 weight (rl_fullparam)
+        if a.chunked_head:   # lm_head + fp32 log-softmax per position chunk, recomputed in the backward: no [tokens x 248k] logits ever
+            fp.head = FP.ChunkedHead(actor)
+            _log(tag, f"lm_head chunked + recomputed ({'fp32' if a.fp32_head else 'bf16'} logits, {a.vocab_chunk} positions per chunk; rl_fullparam.ChunkedHead)")
+        elif a.fp32_head:   # trainable head: fp32 logits + grad path through the gathered bf16 weight (rl_fullparam)
             FP.install_fp32_head_trainable(actor)
             _log(tag, "lm_head recomputed in fp32 (trainable FSDP2 head: F.linear(x.float(), W_bf16.float()) per micro-batch)")
+        if a.suffix_ckpt:
+            fp.ckpt = FP.suffix_checkpointer(actor)
+            _log(tag, "suffix activation checkpointing ON (per decoder layer, exact with the prefix cache; sft/prefix_cache.SuffixCheckpointer)")
         opt = torch.optim.AdamW(list(actor.parameters()), lr=a.lr, weight_decay=0.0, eps=a.adam_eps, betas=tuple(a.adam_betas))
         if a.load_optim:
             FP.load_optim_dcp(actor, opt, a.load_optim, log=lambda m: _log(tag, m))

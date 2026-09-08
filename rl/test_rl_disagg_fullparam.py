@@ -314,6 +314,54 @@ def test_prefix_grad_accumulator_extra_outputs_get_zero_grad():
     assert acc._finished and acc.cache is None
 
 
+# ------------------------------------------------------------------ chunked recomputed head == plain fp32 head path (same grads)
+def test_chunked_head_matches_plain_fp32_head_gradients():
+    sp = importlib.util.spec_from_file_location("rl_hf", os.path.join(_HERE, "rl.py"))
+    R = importlib.util.module_from_spec(sp); sys.modules["rl_hf"] = R; sp.loader.exec_module(R)
+    base_args = _BASE + ["--full-param", "--init-adapter", "none", "--loss", "cispo", "--cispo-eps-max", "5", "--loss-agg", "prompt",
+                         "--group-size", "2", "--groups-per-step", "2", "--kl-coef", "0", "--vocab-chunk", "3", "--max-grad-norm", "1e9",
+                         "--lr", "1e-3", "--fp32-head", "--entropy-coef", "0.01"]
+    p_len, T, n = len(PROMPT), 5, 4
+    torch.manual_seed(7)
+    ids = torch.zeros((n, p_len + T), dtype=torch.long); attn = torch.zeros_like(ids)
+    for i, L in enumerate([5, 3, 4, 2]):
+        ids[i, :p_len] = torch.tensor(PROMPT); ids[i, p_len:p_len + L] = torch.randint(5, 500, (L,)); attn[i, :p_len + L] = 1
+    old_lp = torch.full((n, T), -3.0); known = attn[:, p_len:].bool()
+    adv = torch.tensor([1.0, -1.0, 0.5, -0.5]); dirs_rep = torch.nn.functional.normalize(torch.randn(n, 64), dim=-1)
+
+    class _Rec:   # AdamW stand-in that snapshots the flat grad and never updates
+        def __init__(self, params): self.params, self.grads, self.param_groups = list(params), None, [{"lr": 0.0}]
+        def zero_grad(self, set_to_none=True):
+            for p in self.params: p.grad = None
+        def step(self): self.grads = torch.cat([(p.grad.to_local() if FP.is_dtensor(p.grad) else p.grad).detach().flatten().float() for p in self.params if p.grad is not None])
+
+    def run(chunked):
+        m = _fsdp_policy(11)
+        fp = D.FullParamCtx(FP, FP.fullft_module(), 1, 0)
+        a = D.parse_args(base_args + (["--chunked-head"] if chunked else []))
+        if chunked:
+            fp.head = FP.ChunkedHead(m)
+        else:
+            FP.install_fp32_head_trainable(m)
+        opt = _Rec(m.parameters())
+        st = D.update_disagg(m, opt, get_layer(m, 1), ids, attn, p_len, MARKER, old_lp, known, adv, dirs_rep, a, "cpu", mb=2, keep=None, pfx=None, fp=fp)
+        return st, opt.grads
+    st_a, g_a = run(False)
+    st_b, g_b = run(True)
+    rel = float((g_a - g_b).norm() / g_a.norm().clamp_min(1e-12))
+    cos = float(torch.nn.functional.cosine_similarity(g_a, g_b, dim=0))
+    assert g_a.shape == g_b.shape and rel < 1e-2 and cos > 0.9999, (rel, cos, float((g_a - g_b).abs().max()))   # bf16 kernel noise only
+    for k in ("loss", "entropy", "grad_norm", "sampler_abs_dlogp"):
+        assert abs(st_a[k] - st_b[k]) <= 1e-3 * max(1.0, abs(st_a[k])), (k, st_a[k], st_b[k])
+    m = _fsdp_policy(11); fp = D.FullParamCtx(FP, FP.fullft_module(), 1, 0); fp.head = FP.ChunkedHead(m)
+    out = m(input_ids=ids[:1], attention_mask=attn[:1], use_cache=False).logits
+    assert out.shape[-1] == 512, "inactive chunked head must return the real logits"
+    with fp.suffix_ctx():
+        out = m(input_ids=ids[:1], attention_mask=attn[:1], use_cache=False).logits
+        assert out.shape[-1] == 1 and fp.head.hidden.shape == (1, ids.shape[1], 64)
+    assert not fp.head.active and fp.head.hidden is None
+
+
 # ------------------------------------------------------------------ full-param micro-batch probe planning
 def test_plan_probe_step_walks_up_within_budget():
     GB = 2**30
