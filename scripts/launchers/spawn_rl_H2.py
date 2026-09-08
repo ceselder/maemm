@@ -1,0 +1,12 @@
+"""RL-H: identical to RL-F (16x512, init mix1m_from_realact23m/final, bank mix_1m_mlp, ScaleRL/CISPO, 2 rollout + 6 trainer on 8xB200) except CONSTANT lr 5e-6
+(half of E's 1e-5) and 600 steps, to test whether the lr level alone is the stability lever. Drift-budget prediction (lr x steps ~ 2.7e-3): onset ~ step 540."""
+import json, modal
+saves = "25,50,100,160,200,250,300,350,400,450,500,550,600"
+extra = (f"--recipe scalerl --loss cispo --cispo-eps-max 5 --loss-agg prompt --adv-mode batch --zero-var-filter --npr-threshold 0.9 --npr-pass-cos 0.7 --max-lag 2 --fp32-head --autocast-bf16 --length-control penalty "
+         f"--kl-coef 0 --entropy-coef 0 --entropy-target 0 --groups-per-step 512 --group-size 16 --lr 5e-6 --warmup-steps 25 --len-penalty-start 8 --len-penalty-per-tok 0.00025 --max-new-tokens 192 --reward-window-last 5 "
+         f"--init-adapter /data/sft_mix/mix1m_from_realact23m/final --cuda-graphs --max-num-seqs 512 --rollout-block-groups 32 --save-every 0 --save-steps {saves} --transcript-every 5 "
+         f"--run-name rl_H_mixmlp_16x512_lr5e-6 --save-dir /data/ckpts_rl_H_16x512_lr5e-6")
+t = modal.Function.from_name("maemm-rl-disagg", "train").spawn(n_rollout=3, n_trainer=5, total_steps=600, extra_args=extra, pool_dir="/data/banks/mix_1m_mlp")
+e = modal.Function.from_name("maemm-eval-ckpt-mlp", "daemon").spawn(ckpt_dir="/data/ckpts_rl_H_16x512_lr5e-6", tag="rl_H_16x512_lr5e-6", rl_run_id="", wandb_name="rl_H_mixmlp_16x512_lr5e-6_eval", final_step=600, extra_args="--eval-cache /data/eval_universal_ho/eval_sets_heldout_v2.pt")
+json.dump({"H_16x512_lr5e-6": {"train": t.object_id, "eval": e.object_id, "run": "rl_H_mixmlp_16x512_lr5e-6", "save": "/data/ckpts_rl_H_16x512_lr5e-6", "lr": "5e-6", "steps": 600}}, open("/home/celeste/shared/overnight/rl_H_ids.json", "w"), indent=1)
+print("H train", t.object_id, "eval", e.object_id)

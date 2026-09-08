@@ -532,6 +532,7 @@ def main():
             "uplift_rl_vs_control_heatmap", ref_row=0)
     if os.path.exists(f"{OUT}/data/budget.json"):
         heatmap_clean(table, "uplift_rl_delta_clean", json.load(open(f"{OUT}/data/budget.json")))
+        heatmap_clean(table, "uplift_rl_delta_clean_matched", {**json.load(open(f"{OUT}/data/budget.json")), "reference_all_families": None})   # act-matched rows only, no 1.1M reference row
         trajectories(table, "uplift_trajectories", json.load(open(f"{OUT}/data/budget.json")))
     family_bars(table, "sft", "Absolute held-out scores after the 200k midtrain, per eval family: the control (orange) vs each 50/50 arm (blue) vs the init (dashed)",
                 "uplift_family_bars_sft")
