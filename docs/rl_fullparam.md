@@ -22,8 +22,10 @@ filled from that report; `[measured]` marks values that come from the 8xB200 run
 | eval | `eval_ckpt_daemon.py` (LoRA) | `eval/modal_eval_ckpt.py::fullmodel_daemon` (`--full-model`, one engine per checkpoint) |
 | micro-batch probe | linear fit from mb 1,2 → predict at 85 % → verify, step down on OOM | measured ascending walk (`plan_probe_step`: never more than a doubling, linear extrapolation from the two largest measured points) against `--mb-target-frac` × GPU minus a reserve for the AdamW moments that appear at step 1 (2 × the fp32 master shard); peaks max-reduced over ranks (every backward is a collective); an OOM is fatal (an FSDP2 forward cannot be resumed after an exception) |
 
+| step-time knobs | — | `--suffix-ckpt`: exact per-layer activation checkpointing of the suffix forward (`sft/prefix_cache.SuffixCheckpointer`, FSDP2-tested in `sft/fullft_smoke.py`; the prefix / no-grad forwards stay un-checkpointed). `--chunked-head`: `rl_fullparam.ChunkedHead` swaps `lm_head.forward` for a capture of the final hidden states and computes fp32 logits → log-softmax → gather/entropy per `--vocab-chunk` positions under `torch.utils.checkpoint`, so no micro-batch ever holds `[tokens × 248 320]` logits (grad-identical to the fp32-head hook + `_chunked_logp`: unit test). `--fsdp-prefetch 2`: explicit next-layer all-gather prefetch. Together they lift the micro-batch from 8 to 32–64 and cut the per-micro-batch FSDP traffic (2 × 54 GB all-gather + 108 GB fp32 reduce-scatter per micro-batch) 4–8× |
+
 Flags: `--full-param`, `--publish-mode {nccl,fs}`, `--wu-port`, `--fs-keep-steps`, `--fsdp-prefetch`, `--no-scorer-shard`,
-`--mb-target-frac`, `--save-optim`, `--load-optim`. `--autocast-bf16` is ignored (FSDP2 already computes in bf16). Inline
+`--mb-target-frac`, `--suffix-ckpt`, `--chunked-head`, `--save-optim`, `--load-optim`. `--autocast-bf16` is ignored (FSDP2 already computes in bf16). Inline
 eval (`--inline-eval-every > 0`) is refused. With the flag off no code path changes (all `fp is None` branches are the
 previous code; `rl/test_rl_disagg_{queue,scalerl,policy_base}.py` still pass).
 
@@ -91,6 +93,17 @@ Measured on the 8xB200 runs (`[T*]` log lines; policy = the 26.90 B-parameter FF
 Why the first probe failed: the LoRA path's linear fit from mb 1 and 2 predicted 0.06 GB/seq (both peaked at 66.6 GB — at tiny
 micro-batches the peak is the mb-independent fp32-grad allocation during the prefix backward), verified mb 128 and OOM'd.
 The full-param probe now walks the candidates upwards from mb 4, measuring each (`plan_probe_step`), and reserves the AdamW state.
+
+### Why the first configuration ran at 68 s/step (and the fix)
+
+At micro-batch 8 the update processes ~42 k completion tokens per rank per step in ~103 micro-batches of ~400 tokens. Every
+micro-batch all-gathers the 54 GB of bf16 parameters for the forward, again for the backward (`reshard_after_forward=True`) and
+reduce-scatters 108 GB of fp32 gradients — ~22 TB of NVLink traffic per rank per step, i.e. the whole 64 s of `time/fwd_bwd_s`
+(compute for 400 tokens is negligible; `time/grad_sync_s` = 0 because FSDP2's reduce-scatter *is* the sync; the prefix is run
+once per step — `trainer/body_tokens_per_rollout` ≈ suffix tokens only). The only lever is fewer micro-batches, i.e. a larger
+micro-batch, which the 5.2 GB/seq activation footprint forbids without recompute: `--suffix-ckpt` (per-layer recompute; the
+saved state drops to the layer inputs + the expanded prefix cache, ~0.3 GB/seq) and `--chunked-head` (the fp32 logits and their
+saved log-softmax were ~0.4 GB/seq). Measured numbers: report §2 (bench table).
 
 ## 4. Parity / exactness
 
