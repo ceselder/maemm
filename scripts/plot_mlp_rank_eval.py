@@ -293,7 +293,7 @@ def summary(res):
     chance = {}
     for name, r in res.items():
         m = r["metrics"]
-        rows[name] = {"label": CKPTS[name]["label"], "group": CKPTS[name]["group"], "ckpt": r["ckpt"], "ckpt_step": CKPTS[name]["step"],
+        rows[name] = {"label": CKPTS[name]["label"], "short": CKPTS[name]["short"], "group": CKPTS[name]["group"], "ckpt": r["ckpt"], "ckpt_step": CKPTS[name]["step"],
                       "metrics": {k: v for k, v in m.items() if k.startswith("eval/mlp") or k in ("eval/mean_all", "eval/sae/norm_act", "eval/sae/rank1_frac",
                                                                                                     "eval/sae/mrr", "eval/sae/mean_rank", "time/inline_eval_s", "time/ckpt_eval_s")},
                       "protocol": r["protocol"]}
