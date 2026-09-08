@@ -507,7 +507,7 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
         Wn = int(wrng.integers(w_lo, w_hi + 1)); start = max(0, p - Wn + 1)
         ids = ids_np[w, start:p + 1].tolist()
         return {"seq": int(sel[w]), "seq_off": int(off[w]), "window": w, "pos": p, "start": start, "n_tok": len(ids), "fire_from_end": 0,
-                "target_text": tok.decode(ids)}
+                "peak_pos": len(ids) - 1, "target_text": tok.decode(ids)}
     recs, kind, n1, n2, n3, a1, a2, a3 = [], [], [], [], [], [], [], []
     n_short_txt = 0
     dup_win = {"mlp": 0, "mlp_pair": 0, "mlp_triple": 0}

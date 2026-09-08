@@ -377,8 +377,19 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     ma_tok = ma["max_tokens"][feats].numpy(); ma_act = ma["max_acts"][feats].numpy()          # [n_feat, N, 32]
     ma_peak = ma_act.max(2)                                                                   # [n_feat, N]
     ma_src = ma["max_src"][feats].numpy() if "max_src" in ma else None
+    # END-ANCHORED targets (user rule: every target ends AT the token where the direction fires — the RL reward / evaluator take the
+    # max over the LAST 5 generated tokens): the window's peak token becomes the LAST target token; left context comes from the
+    # activation store row the window was cut from (max_src = (row, slot); slot*L .. slot*L+L-1 is the standalone window),
+    # W ~ U[w_lo, w_hi] tokens when available, >= SAE_MIN_TOK tokens else the window is dropped (never padded with a
+    # peak-in-the-middle window). Requires max_src (fresh max-acts); the legacy whole-window target is kept only for max-acts
+    # files without positions and is flagged in the stats.
+    SAE_MIN_TOK = 8
+    L_win = int(ma_tok.shape[2])
+    end_anchored = ma_src is not None
+    if end_anchored:
+        assert L_win * (T // L_win) == T, (L_win, T)
     rec_sae, rows_sae = [], []
-    n_dup = n_nofire = 0
+    n_dup = n_nofire = n_short = n_mismatch = 0
     per_feat = np.zeros(n_sae_feat, np.int32)
     for i, f in enumerate(feats.tolist()):
         seen = set()
@@ -387,17 +398,34 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
                 break
             if ma_peak[i, k] <= 0:
                 n_nofire += N_stored - k; break                          # stored windows are sorted by peak: nothing below fires
-            ids = ma_tok[i, k].tolist()
+            pk = int(ma_act[i, k].argmax())
+            if end_anchored:
+                row, slot = int(ma_src[i, k, 0]), int(ma_src[i, k, 1])
+                w0 = slot * L_win
+                if not np.array_equal(toks[row, w0:w0 + L_win], ma_tok[i, k]):
+                    n_mismatch += 1; continue                            # store / max-acts disagreement: never emit
+                pos = w0 + pk                                            # absolute position of the peak token in the store row
+                Wt = min(wrng.randint(w_lo, w_hi), pos + 1)
+                if Wt < SAE_MIN_TOK:
+                    n_short += 1; continue                               # peak too close to the row start for >= 8 tokens of context
+                start = pos - Wt + 1
+                ids = toks[row, start:pos + 1].tolist()
+            else:
+                row = slot = -1; w0 = 0; pos = pk; start = 0
+                ids = ma_tok[i, k].tolist()
             if sae_dedupe:
                 key = tuple(ids)
                 if key in seen:
                     n_dup += 1; continue
                 seen.add(key)
+            txt = tok.decode(ids)
+            if len(txt.strip()) < 3:
+                n_short += 1; continue
             rows_sae.append(i); per_feat[i] += 1
-            rec = {"family": "sae", "feature": f, "window_rank": k, "target_text": tok.decode(ids), "n_tok": len(ids),
-                   "peak_idx": int(ma_act[i, k].argmax()), "corpus_peak": float(peak[f]), "window_peak": float(ma_peak[i, k])}
-            if ma_src is not None:
-                rec["src_row"], rec["src_win"] = int(ma_src[i, k, 0]), int(ma_src[i, k, 1])
+            rec = {"family": "sae", "feature": f, "window_rank": k, "target_text": txt, "n_tok": len(ids), "peak_pos": len(ids) - 1,
+                   "fire_from_end": 0, "peak_idx_in_window": pk, "corpus_peak": float(peak[f]), "window_peak": float(ma_peak[i, k]),
+                   "src_row": row, "src_win": slot, "window_bounds": [w0, w0 + L_win - 1], "start": start, "pos": pos,
+                   "end_anchored": end_anchored}
             rec_sae.append(rec)
     vec_sae = np.memmap("/root/bank/stage_sae.f32", np.float32, "w+", shape=(len(rows_sae), D_MODEL))
     rows_sae = np.asarray(rows_sae, np.int64)
@@ -438,7 +466,10 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
                         "windows_per_feature": K, "windows_per_feature_mean": float(per_feat.mean()),
                         "windows_per_feature_hist": np.bincount(per_feat, minlength=K + 1).tolist(),
                         "features_with_K_windows": int((per_feat == K).sum()), "dedupe": bool(sae_dedupe), "dropped_duplicate_windows": n_dup,
-                        "skipped_nonfiring_windows": n_nofire}
+                        "skipped_nonfiring_windows": n_nofire, "dropped_short_context_windows": n_short, "store_maxacts_token_mismatch": n_mismatch,
+                        "end_anchored": end_anchored, "min_tok": SAE_MIN_TOK,
+                        "target_rule": (f"W~U[{w_lo},{w_hi}]-token window of the store row ENDING at the max-acts window's peak token (peak = last token); "
+                                        f">= {SAE_MIN_TOK} tokens else dropped" if end_anchored else "legacy whole 32-token window (peak mid-window)")}
     del sae, ma, ma0
     torch.cuda.empty_cache()
     log(f"sae: {n_sae_rows} rows from {n_sae_feat}/{n_fam['sae']} features (alive {int(alive.sum())}, excluded {len(excl_sae)}, cand {len(cand)}, "
@@ -502,7 +533,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
                     drop_txt += 1; continue
                 vec[kept] = d[k] / norms[k]
                 recs.append({"family": fam, "target_text": txt, "harvest": mode, "seq": s, "pos": p, "start": start,
-                             "extra": extra, "n_tok": len(ids), "fire_from_end": end - 1 - p, "ctx_tokens": p + 1,
+                             "extra": extra, "n_tok": len(ids), "fire_from_end": end - 1 - p, "peak_pos": p - start, "ctx_tokens": p + 1,
                              "act_norm": round(float(norms[k]), 2)})
                 per_doc[s] += 1; kept += 1
             log(f"{fam}/{mode} {kept}/{n_target} (cands {c1}/{n_cand}, {kept / max(time.time() - t0, 1):.0f}/s, "
@@ -681,7 +712,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
         rec_bsf[j] = {"family": "bsf", "target_text": txt, "block": int(sel_blk[j]), "rank": int(sel_rank[j]),
                       "gnorm": round(float(gn_all[j]), 4), "cos_x": round(float(cos_x_all[j]), 4),
                       "whiten_frac": round(float(whiten_frac[j]), 4), "seq": s, "pos": p, "start": start,
-                      "n_tok": len(ids), "fire_from_end": 0, "ctx_tokens": p + 1}
+                      "n_tok": len(ids), "fire_from_end": 0, "peak_pos": len(ids) - 1, "ctx_tokens": p + 1}
     if n_bsf_target > 0:
         stage["bsf"] = (vec_bsf, rec_bsf)
     rows_per_block = np.bincount(block_cnt[block_cnt > 0]) if n_bsf else np.zeros(1)
