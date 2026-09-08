@@ -79,8 +79,14 @@ def sm(y, w=9):
     if len(y) < w: return y
     pad = w // 2; yp = np.concatenate([np.full(pad, y[0]), y, np.full(pad, y[-1])])   # edge-padded so the ends are not dragged to zero
     return np.convolve(yp, np.ones(w) / w, mode="valid")[: len(y)]
-fig, axes = plt.subplots(2, 3, figsize=(16, 8.2))
-for col, (key, title, logy) in enumerate((("reward", "training reward (mean cos, last-5 window)", False), ("entropy", "policy entropy (nats/token)", False), ("grad_norm", "gradient norm (log; dotted = clip 1.0)", True))):
+fig, axes = plt.subplots(2, 4, figsize=(20, 8.2))
+for row, xmode in enumerate(("step", "rollouts")):   # column 0: HELD-OUT reward (evaluator mean fidelity per checkpoint)
+    ax = axes[row][0]
+    for k, cfg in RUNS.items():
+        ev = data["runs"][k]["evals"]; xs = [e["ckpt_step"] if xmode == "step" else e["ckpt_step"] * cfg["rps"] / 1e6 for e in ev]
+        ax.plot(xs, [e["eval/mean_all"] for e in ev], "o-", color=cfg["color"], lw=1.8, ms=4, label=cfg["label"])
+    ax.set_title("HELD-OUT reward: mean fidelity over held-out families per checkpoint", fontsize=9.5); ax.set_xlabel("RL step" if xmode == "step" else "rollouts consumed (millions)", fontsize=9); ax.grid(alpha=0.25); ax.tick_params(labelsize=8)
+for col, (key, title, logy) in enumerate((("reward", "TRAINING reward (mean cos, last-5 window)", False), ("entropy", "policy entropy (nats/token)", False), ("grad_norm", "gradient norm (log; dotted = clip 1.0)", True)), start=1):
     for row, xmode in enumerate(("step", "rollouts")):
         ax = axes[row][col]
         for k, cfg in RUNS.items():
@@ -89,9 +95,9 @@ for col, (key, title, logy) in enumerate((("reward", "training reward (mean cos,
             ax.plot(xs, ys, color=cfg["color"], lw=0.6, alpha=0.3); ax.plot(xs, sm(ys), color=cfg["color"], lw=1.8, label=cfg["label"])
         if logy: ax.set_yscale("log"); ax.axhline(1.0, color="#333", ls=":", lw=1)
         ax.set_title(title, fontsize=9.5); ax.set_xlabel("RL step" if xmode == "step" else "rollouts consumed (millions)", fontsize=9); ax.grid(alpha=0.25); ax.tick_params(labelsize=8)
-h_, l_ = axes[0][0].get_legend_handles_labels(); fig.legend(h_, l_, loc="lower center", ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.5, 0.0))
+h_, l_ = axes[0][1].get_legend_handles_labels(); fig.legend(h_, l_, loc="lower center", ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.5, 0.0))
 I_on = 178
-fig.suptitle("Reward dynamics at three rollout batch sizes, constant lr 1e-5: the 8x batch (8 x 4096) reaches the same reward plateau (~.31)\n"
+fig.suptitle("Held-out and training reward at three rollout batch sizes, constant lr 1e-5: the 8x batch (8 x 4096) reaches the same training-reward plateau (~.31) and the best held-out (.425 @150)\n"
              "but its entropy falls fastest per step, so it breaks EARLIEST in steps (grad-norm onset 178 vs 246 / 268) and LATEST in rollouts (5.8M vs 1-2M);\n"
              "per rollout it is the least sample-efficient. Thin = raw, thick = 9-step moving average; RL-I resumed at steps 25 and 50 (trainer changes, same math)", fontsize=10, y=0.995)
 fig.tight_layout(rect=(0, 0.06, 1, 0.91))
