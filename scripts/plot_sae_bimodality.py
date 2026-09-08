@@ -312,14 +312,18 @@ def main():
 
     # ---- best / worst features with their best generated text ----
     mean_na = np.mean([D[k]["norm_act"] for k in ORDER], axis=0)
-    order = np.argsort(mean_na)
+    max_na = np.max([D[k]["norm_act"] for k in ORDER], axis=0)   # worst = lowest best-case over the three checkpoints
+    min_na = np.min([D[k]["norm_act"] for k in ORDER], axis=0)   # best = highest worst-case (nailed by every checkpoint; immune to one run's outlier)
+    order_worst = np.argsort(max_na, kind="stable")
+    order_best = np.argsort(-min_na, kind="stable")
     def rowinfo(i):
         return {"feature": int(feats[i]), "corpus_peak": float(D["sft"]["corpus_peak"][i]), "mean_norm_act": float(mean_na[i]),
+                "max_norm_act": float(max_na[i]), "min_norm_act": float(min_na[i]),
                 **{f"norm_act_{k}": float(D[k]["norm_act"][i]) for k in ORDER},
                 **{f"rank_{k}": (None if np.isnan(D[k]["rank"][i]) else int(D[k]["rank"][i])) for k in ORDER},
                 **{f"best_text_{k}": D[k]["best_text"][i] for k in ORDER}}
-    tb = {"ranking": "mean per-feature norm_act over the three checkpoints", "worst_20": [rowinfo(i) for i in order[:20]],
-          "best_20": [rowinfo(i) for i in order[::-1][:20]]}
+    tb = {"ranking": "worst_20 = lowest MAX norm_act over the three checkpoints (no checkpoint inverts them); best_20 = highest MIN over the three (every checkpoint nails them)",
+          "worst_20": [rowinfo(i) for i in order_worst[:20]], "best_20": [rowinfo(i) for i in order_best[:20]]}
     json.dump(tb, open(os.path.join(out, "data", "best_worst_features.json"), "w"), indent=1)
 
     print(json.dumps({k: {m: round(v, 4) if isinstance(v, float) else v for m, v in S[k].items() if m != "quantiles"} for k in ORDER}, indent=1))
