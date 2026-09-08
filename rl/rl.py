@@ -522,6 +522,7 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
     from vllm import SamplingParams
     from vllm.lora.request import LoRARequest
     EU, es, sae = EV["EU"], EV["es"], EV["sae"]
+    per_dir = bool(getattr(a, "dump_per_dir", False))   # opt-in: ship the per-direction scores (+ sae best texts) under out["_perdir"]
     t0 = time.time()
     local = {}
     try:
@@ -575,6 +576,9 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
             pk = peaks.view(len(rows), bo, -1)[torch.arange(len(rows)), arg]          # peak hidden of the best sample
             local["sae"] = {int(i): float(v) for i, v in zip(rows, best.tolist())}
             local["sae_peak"] = {int(i): pk[j].half().numpy().tobytes() for j, i in enumerate(rows)}   # fp16 bytes (≈10 KB/row)
+            if per_dir:   # --dump-per-dir: all bo sample acts + the best sample's text per feature (small; gathered like the rest)
+                local["sae_act_bo"] = {int(i): [float(v) for v in acts[j].tolist()] for j, i in enumerate(rows)}
+                local["sae_text"] = {int(i): texts[j * bo + int(arg[j])] for j, i in enumerate(rows)}
         else:
             local["sae"], local["sae_peak"] = {}, {}
         # extra families (cache v2: layer-42 MLP neurons / co-firing pairs): cosine + clean-base fire-back
@@ -619,6 +623,7 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
     out["eval/sae/norm_act"] = float(na.mean())
     if merged.get("sae_cos"):
         out["eval/sae/cos"] = float(np.mean([merged["sae_cos"][i] for i in sorted(merged["sae_cos"])]))   # best-of-bo max-token cosine to the unit encoder column
+    ranks = None
     if merged.get("sae_peak"):   # full-SAE rank of the target feature at its best sample's peak token (the ARB "rank-1 fraction")
         peak_h = torch.from_numpy(np.stack([np.frombuffer(merged["sae_peak"][i], dtype=np.float16) for i in idx]).astype(np.float32))
         ranks = EU.sae_rank_at_peaks(sae, peak_h, [EV["feats"][i] for i in idx]).astype(np.float64)
@@ -646,8 +651,47 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
         out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
     out["eval/all/sae_norm_act"] = out["eval/sae/norm_act"]
     out["eval/all/sae_unverbalized"] = out["eval/sae/unverbalized_frac"]
+    if per_dir:   # NOT a wandb scalar: the caller pops it (eval_ckpt_daemon -> perdir_ckpt_<step>.json)
+        out["_perdir"] = per_dir_dump(EV, merged, ranks)
     out["time/inline_eval_s"] = time.time() - t0
     return out
+
+
+def per_dir_dump(EV, merged, ranks):
+    """--dump-per-dir: the per-direction best-of-bo scores behind every inline_eval aggregate, in eval-cache row order
+    (list position == cache row 0..n-1). cos families: best-of-bo max-token cosine per direction. sae: feature id, best
+    sample's raw act, corpus peak, norm_act = best/peak, fired (> SAE_FIRE), beat_corpus, cosine view, full-SAE rank + rank1
+    flag, every sample's act and the best sample's text. Extra (cache v2 mlp) families: cosine + fire-back per direction.
+    Small (11 families x 512 floats + the sae arrays, ~250 KB with texts). Never logged to wandb -- the caller pops it."""
+    EU, es = EV["EU"], EV["es"]
+    d = {"row_order": "list position == eval-cache row index", "cos": {}, "sae": {}, "extra": {}}
+    for fam in EV["fams"]:
+        d["cos"][fam] = [merged[fam][i] for i in sorted(merged[fam])]
+    idx = sorted(merged["sae"])
+    best = np.array([merged["sae"][i] for i in idx], dtype=np.float64)
+    cp = EV["cp"][idx]
+    na = best / np.maximum(cp, 1e-6)
+    sd = {"row": [int(i) for i in idx], "feature": [int(EV["feats"][i]) for i in idx], "best_act": best.tolist(),
+          "corpus_peak": cp.tolist(), "norm_act": na.tolist(), "fired": (best > EU.SAE_FIRE).astype(int).tolist(),
+          "beat_corpus": (best > cp).astype(int).tolist()}
+    pool_rows = (es["meta"].get("rows") or {}).get("sae")   # held-out-pool caches: the pool vec_idx of every sae row
+    if pool_rows is not None:
+        sd["pool_vec_idx"] = [int(pool_rows[i]) for i in idx]
+    if merged.get("sae_cos"):
+        sd["cos"] = [merged["sae_cos"][i] for i in idx]
+    if ranks is not None:
+        sd["rank"] = [int(r) for r in ranks]
+        sd["rank1"] = [int(r == 1) for r in ranks]
+    if merged.get("sae_act_bo"):
+        sd["act_bo"] = [merged["sae_act_bo"][i] for i in idx]
+    if merged.get("sae_text"):
+        sd["best_text"] = [merged["sae_text"][i] for i in idx]
+    d["sae"] = sd
+    for fam in EV.get("xfams", []):
+        xi = sorted(merged[fam])
+        d["extra"][fam] = {"row": [int(i) for i in xi], "cos": [merged[fam][i] for i in xi],
+                           "norm_act": [merged[f"{fam}_na"][i] for i in xi], "any_norm_act": [merged[f"{fam}_na_any"][i] for i in xi]}
+    return d
 
 
 def compute_advantages(r, n_groups, group_size, mode="none"):

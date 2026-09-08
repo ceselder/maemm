@@ -296,12 +296,14 @@ def eval_cos_family(tag, dirs_unit, actor, tok, prompt_ids, marker, sub, dev,
 
 @torch.no_grad()
 def eval_sae_family(dirs_unit, feats, sae, actor, tok, prompt_ids, marker, sub, dev,
-                    bo, temp, max_new, min_new, gen_chunk):
+                    bo, temp, max_new, min_new, gen_chunk, keep_texts=False):
     """Best-of-bo max-token target-feature act per feature + full-SAE rank at the best gen's peak
-    token. Returns (best_act np [N], ranks np int64 [N])."""
+    token. Returns (best_act np [N], ranks np int64 [N]) -- plus the best sample's text per feature
+    (list [N]) when keep_texts (the per-direction dump)."""
     n = len(feats)
     best = np.full(n, -1e9)
     peak_h = torch.zeros(n, D_MODEL)
+    best_txt = [""] * n
     for rows, texts in _gen_batches("sae", dirs_unit, actor, tok, prompt_ids, marker, sub, dev,
                                     bo, temp, max_new, min_new, gen_chunk):
         acts, peaks = score_sae_peaks(texts, [feats[i] for i in rows], sae, actor, tok, dev)
@@ -309,8 +311,9 @@ def eval_sae_family(dirs_unit, feats, sae, actor, tok, prompt_ids, marker, sub, 
             if acts[j].item() > best[i]:
                 best[i] = acts[j].item()
                 peak_h[i] = peaks[j]
+                best_txt[i] = texts[j]
     ranks = sae_rank_at_peaks(sae, peak_h, feats)
-    return best, ranks
+    return (best, ranks, best_txt) if keep_texts else (best, ranks)
 
 
 @torch.no_grad()
@@ -522,11 +525,15 @@ def build_eval_sets(cache_path, sae, wu, j42, probe_bank_path, acts_dir, n, dev,
 
 @torch.no_grad()
 def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_new, min_new, dev,
-             gen_chunk=64, sae_fire=SAE_FIRE):
+             gen_chunk=64, sae_fire=SAE_FIRE, per_dir=False):
     """Run every family in eval_sets (meta["cos_families"] cosine families + the sae metric
     family); return a FLAT {wandb scalar name: float} dict. Generation RNG is forked + fixed
     (GEN_SEED) so repeat evals of the same checkpoint are deterministic and the trainer's RNG
-    stream is untouched."""
+    stream is untouched.
+    per_dir=True ADDS out["_perdir"] (NOT a scalar -- pop it before wandb.log): the per-direction
+    best-of-bo scores behind every aggregate in eval-cache row order -- {"cos": {fam: [n]},
+    "sae": {row, feature, best_act, corpus_peak, norm_act, fired, beat_corpus, rank, rank1,
+    best_text}, "extra": {fam: {cos, norm_act, any_norm_act}}}. Default output is unchanged."""
     was_training = actor.training
     actor.eval()
     fork_devs = [dev] if str(dev).startswith("cuda") else []
@@ -534,6 +541,7 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
     fams = list(eval_sets["meta"].get("cos_families", COS_FAMILIES))
     xfams = extra_families(eval_sets)
     out = {}
+    pd = {"row_order": "list position == eval-cache row index", "cos": {}, "sae": {}, "extra": {}}
     try:
         with torch.random.fork_rng(devices=fork_devs):
             torch.manual_seed(GEN_SEED)
@@ -541,7 +549,9 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
             for fam in fams:
                 best = eval_cos_family(fam, eval_sets[f"{fam}_dirs"], *gen_args)
                 out[f"eval/{fam}/cos"] = float(best.mean())
-            best_act, ranks = eval_sae_family(eval_sets["sae_dirs"], eval_sets["sae_feats"], sae, *gen_args)
+                pd["cos"][fam] = best.tolist()
+            sae_res = eval_sae_family(eval_sets["sae_dirs"], eval_sets["sae_feats"], sae, *gen_args, keep_texts=per_dir)
+            best_act, ranks = sae_res[0], sae_res[1]
             cp = eval_sets["corpus_peak"].numpy().astype(np.float64)
             r = ranks.astype(np.float64)
             out["eval/sae/norm_act"] = float(np.mean(best_act / np.maximum(cp, 1e-6)))
@@ -553,6 +563,14 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
             na = best_act / np.maximum(cp, 1e-6)
             out["eval/sae/unverbalized_frac"] = float(np.mean(best_act <= sae_fire))  # cannot be made to fire at all
             out["eval/sae/unverbalized_p10"] = float(np.mean(na < 0.10))  # inversion reached <10pct of corpus peak
+            if per_dir:
+                pd["sae"] = {"row": list(range(len(best_act))), "feature": [int(f) for f in eval_sets["sae_feats"]],
+                             "best_act": best_act.tolist(), "corpus_peak": cp.tolist(), "norm_act": na.tolist(),
+                             "fired": (best_act > sae_fire).astype(int).tolist(), "beat_corpus": (best_act > cp).astype(int).tolist(),
+                             "rank": [int(x) for x in ranks], "rank1": [int(x == 1) for x in ranks], "best_text": sae_res[2]}
+                pool_rows = (eval_sets["meta"].get("rows") or {}).get("sae")
+                if pool_rows is not None:
+                    pd["sae"]["pool_vec_idx"] = [int(x) for x in pool_rows]
             # extra families (cache v2: layer-42 MLP neurons / co-firing pairs): cosine + fire-back, NOT in mean_all
             for fam in xfams:
                 k = eval_sets[f"{fam}_neuron"].shape[1]
@@ -560,9 +578,12 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
                                              eval_sets[f"{fam}_polarity"], eval_sets[f"{fam}_corpus_max"], *gen_args)
                 out[f"eval/{fam}/cos"] = float(bc.mean())
                 out.update(mlp_metrics(fam, bn, ba if k > 1 else None))
+                pd["extra"][fam] = {"cos": bc.tolist(), "norm_act": bn.tolist(), "any_norm_act": ba.tolist()}
     finally:
         if was_training:
             actor.train()
+    if per_dir:
+        out["_perdir"] = pd
     # mean_all = mean over the HIGHER-IS-BETTER cos families only. `random` is the control
     # (should stay ~0.03, LOWER is better) — folding it in would drag the mean down and move
     # mean_all the WRONG way if the control ever degraded. It stays logged separately. Extra
@@ -609,6 +630,10 @@ def main():
     ap.add_argument("--gen-chunk", type=int, default=64)
     ap.add_argument("--sae-fire", type=float, default=SAE_FIRE)
     ap.add_argument("--out", default=None, help="optional JSON dump of the metric dict")
+    ap.add_argument("--dump-per-dir", action="store_true",
+                    help="ALSO write <out>.perdir.json (needs --out): per-direction best-of-bo scores behind every aggregate "
+                         "(cos per direction per family; sae feature id / best act / norm_act / fired / rank / best text); "
+                         "the --out json and the wandb row are unchanged")
     ap.add_argument("--wandb", default=None, help="optional wandb project; init + log one step")
     ap.add_argument("--run-name", default=None)
     a = ap.parse_args()
@@ -639,11 +664,17 @@ def main():
     if extra_families(es):
         print(f"[eval-universal] extra families {extra_families(es)} (cosine + MLP fire-back; not in mean_all)", flush=True)
     m = run_eval(actor, tok, prompt_ids, marker, sub, es, sae, a.bo, a.temp,
-                 a.max_new_tokens, a.min_new_tokens, dev, gen_chunk=a.gen_chunk, sae_fire=a.sae_fire)
+                 a.max_new_tokens, a.min_new_tokens, dev, gen_chunk=a.gen_chunk, sae_fire=a.sae_fire,
+                 per_dir=a.dump_per_dir)
+    perdir = m.pop("_perdir", None)
     print("=== EVAL-UNIVERSAL ===\n" + json.dumps(m, indent=1), flush=True)
     if a.out:
         json.dump({"adapter": a.adapter, "n": a.n, "bo": a.bo, "metrics": m}, open(a.out, "w"), indent=1)
         print(f"EVAL_UNIVERSAL_DONE {a.out}", flush=True)
+        if perdir is not None:
+            pp = a.out + ".perdir.json"
+            json.dump({"adapter": a.adapter, "n": a.n, "bo": a.bo, "cache": cache_path, "aggregates": m, "perdir": perdir}, open(pp, "w"))
+            print(f"EVAL_UNIVERSAL_PERDIR {pp}", flush=True)
     if a.wandb:
         import wandb
         wandb.init(project=a.wandb, name=a.run_name or os.path.basename(a.adapter.rstrip("/")),
