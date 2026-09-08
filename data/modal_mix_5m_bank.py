@@ -209,11 +209,12 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
     leak = np.full((len(fam_names), len(ref_names)), -1.0)
     maxcos = np.zeros(N, np.float32)
     with torch.no_grad():
-        for c0 in range(0, N, 65536):
-            x = torch.from_numpy(np.ascontiguousarray(vecs[c0:c0 + 65536])).to(dev)
+        LC = 16384                                              # [16384, ~98k] fp32 cos = 6.4 GB: fits every SMALL_GPUS type
+        for c0 in range(0, N, LC):
+            x = torch.from_numpy(np.ascontiguousarray(vecs[c0:c0 + LC])).to(dev)
             cos = x @ ref.T
-            maxcos[c0:c0 + 65536] = cos.max(1).values.cpu().numpy()
-            fa = fam_idx[c0:c0 + 65536]
+            maxcos[c0:c0 + LC] = cos.max(1).values.cpu().numpy()
+            fa = fam_idx[c0:c0 + LC]
             for ri in range(len(ref_names)):
                 cm = cos[:, offs[ri]:offs[ri + 1]].max(1).values.cpu().numpy()
                 for fi in range(len(fam_names)):
