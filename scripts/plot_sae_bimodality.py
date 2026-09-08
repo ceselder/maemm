@@ -291,15 +291,17 @@ def main():
         ax.add_patch(plt.Rectangle((0, 0), MISS, MISS, facecolor="#f0efec", edgecolor=INK, lw=0.9, zorder=1))
         ax.scatter(np.clip(x, 0, lim), np.clip(y, 0, lim), s=14, color=COLORS[q], alpha=0.55, edgecolor="white", linewidth=0.4, zorder=2,
                    label="one SAE feature (values > 2 drawn at 2)")
-        ax.annotate(f"missed (<0.1) by BOTH: {n_both} features\n({n_either} missed by at least one; Jaccard {jac(miss[p], miss[q]):.2f})",
-                    xy=(MISS, MISS), xytext=(0.28, 0.16), fontsize=8.5, color=INK, arrowprops=dict(arrowstyle="-", color=INK, lw=0.8))
-        ax.text(MISS + 0.02, lim - 0.05, f"missed by {SHORT[p]} only:\n{int(np.sum((x < MISS) & (y >= MISS)))}", fontsize=8.5, color=INK2, va="top")
-        ax.text(lim - 0.02, MISS + 0.02, f"missed by {SHORT[q]} only: {int(np.sum((x >= MISS) & (y < MISS)))}", fontsize=8.5, color=INK2, ha="right", va="bottom")
+        ax.annotate(f"shaded corner = missed (<0.1) by BOTH: {n_both} features\n"
+                    f"missed by {SHORT[p]} only: {int(np.sum((x < MISS) & (y >= MISS)))}   by {SHORT[q]} only: {int(np.sum((x >= MISS) & (y < MISS)))}\n"
+                    f"Jaccard of the two miss sets {jac(miss[p], miss[q]):.2f} ({n_either} missed by at least one)",
+                    xy=(MISS, MISS), xytext=(0.30, 0.30), fontsize=8.5, color=INK, va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=GRID, alpha=0.9), arrowprops=dict(arrowstyle="-", color=INK, lw=0.8))
         ax.set_xlim(-0.03, lim); ax.set_ylim(-0.03, lim)
         ax.set_xlabel(f"{SHORT[p]}: per-feature fidelity"); ax.set_ylabel(f"{SHORT[q]}: per-feature fidelity")
         rho = ov["spearman_norm_act"][f"{p}_vs_{q}"]
-        ax.text(0.55, 0.98, f"Spearman rho = {rho:.2f}\nabove the diagonal: {np.mean(y > x):.0%} of features", transform=ax.transAxes, va="top", fontsize=9, color=INK2)
-        ax.legend(frameon=False, loc="lower right", fontsize=8); ax.grid(color=GRID, lw=0.8); ax.set_axisbelow(True); ax.tick_params(length=0)
+        ax.text(0.03, 0.98, f"Spearman rho = {rho:.2f}\nabove the diagonal: {np.mean(y > x):.0%} of features", transform=ax.transAxes, va="top", fontsize=9, color=INK2,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=GRID, alpha=0.9))
+        ax.legend(frameon=True, framealpha=0.9, edgecolor=GRID, loc="lower right", fontsize=8); ax.grid(color=GRID, lw=0.8); ax.set_axisbelow(True); ax.tick_params(length=0)
     re_ = ov["rl_effect"]
     fig.suptitle("Misses belong to the feature, not the run: an independent full fine-tune misses the same features as the SFT LoRA (right);\n"
                  f"RL (left) lifts {re_['sft_missed_rl_lifted_ge_0.1'] / max(1, re_['sft_missed_n']):.0%} of the SFT misses above 0.1 and pushes the already-inverted features past the corpus max\n"
