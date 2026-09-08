@@ -468,6 +468,31 @@ def all_reduce_scalar(x, device):
     return float(t.item())
 
 
+def all_reduce_max(x, device):
+    t = torch.tensor([float(x)], dtype=torch.float64, device=device)
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.item())
+
+
+def reshard_root(model):
+    """After a no-grad forward the ROOT group's params (embed_tokens / norm / lm_head) stay unsharded until the next backward
+    (FSDP2 keeps them for the backward that never comes): model.parameters() then yields plain bf16 tensors instead of the
+    fp32 DTensor shards, which would break the shard-file publish, the checksums and the optimizer-state estimate. Reshard."""
+    if hasattr(model, "reshard"):
+        model.reshard()
+
+
+@torch.no_grad()
+def dummy_scorer_forward(scorer, tok, device):
+    """One 2-token forward of the sharded scorer: every FSDP2 forward is a collective, so ranks whose reward shard needed fewer
+    score() batches (uneven shards / empty texts) run this until every rank has issued the same number of forwards."""
+    from mxf.config import READ_LAYER
+    sink = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
+    ids = torch.tensor([[sink, sink]], dtype=torch.long, device=device)
+    read_resid_noraise(scorer, READ_LAYER, {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, pool="all")
+
+
 def loss_scale(sync_w, tot_w, world):
     return (float(sync_w) * world / tot_w) if tot_w > 0 else 0.0
 

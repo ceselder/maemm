@@ -1108,6 +1108,7 @@ def _publish_fullparam(fp, actor, submodule, prompt, marker, device, work, step,
     t0 = time.time()
     with torch.no_grad():
         hnorm = R._marker_norm(actor, submodule, prompt, marker, device, adapter=True)
+    FP.reshard_root(actor)   # the no-grad forward left embed/norm/lm_head gathered: back to the fp32 DTensor shards before iterating params
     t_norm = time.time() - t0
     d = f"{work}/lora/step_{step}"
     if is_main:
@@ -1772,9 +1773,14 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     inj_mode = fp.inject_mode if fp is not None else "add"
     scale = 1.0
     tot_w_fp = None
+    n_mb_max = n_ref_max = 0
     if fp is not None:   # weighted-mean grad over uneven shards, FSDP2 style (rl_fullparam.loss_scale; sum(sync_w) == 0 -> skipped step)
         tot_w_fp = fp.FP.all_reduce_scalar(sync_w, device)
         scale = fp.FP.loss_scale(sync_w, tot_w_fp, fp.world)
+        # every FSDP2 forward/backward is a collective: with uneven shards (512 groups over 5 ranks = 103/103/102/102/102) the ranks
+        # would otherwise run different numbers of micro-batches and deadlock -> ranks with fewer run zero-weight dummies (below)
+        n_mb_max = int(fp.FP.all_reduce_max(-(-n // mb), device))
+        n_ref_max = int(fp.FP.all_reduce_max(-(-n // a.ref_micro_batch), device)) if a.kl_coef > 0 else 0
     t_ref = time.time()
     # micro-batches of LENGTH-SORTED rollouts, each padded only to ITS longest sequence: the loss weights are
     # per-sequence and independent of batching, so this is exactly the same gradient as global padding while
@@ -1817,6 +1823,12 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
                     c1 = min(c0 + a.vocab_chunk, Tc)
                     ref_lp_all[ix, c0:c1] = torch.log_softmax(lg[:, c0:c1].float(), -1).gather(
                         -1, tgt[:, c0:c1, None]).squeeze(-1).cpu()
+                del lg
+            for _ in range(n_ref_max - (-(-n // a.ref_micro_batch))):      # FSDP2: equal forward counts on every rank
+                ix1, Lc1 = order[:1], p_len + min(T, 16)
+                hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix1.tolist()], [[inj_pos]], STEER_COEFF, device, torch.bfloat16, mode=inj_mode)
+                with R.hooked(ref_sub, hook):
+                    lg = model_logits(ref_model, ref_pfx, ix1, Lc1, cache_ref)
                 del lg
             del cache_ref
     t_ref = time.time() - t_ref
@@ -1876,6 +1888,15 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         mk = m & kn
         dlp_sum += float(((new_lp.detach() - olp).abs() * mk).sum()); dlp_n += int(mk.sum())
         del new_lp, ent, ratio, loss, olp_eff, loss_tok, rho, eff
+    for _ in range(n_mb_max - (-(-n // mb))):   # FSDP2: zero-weight dummy micro-batches so every rank issues the same collectives
+        ix1, Lc1 = order[:1], p_len + min(T, 16)
+        hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix1.tolist()], [[inj_pos]], STEER_COEFF, device, torch.bfloat16, mode=inj_mode)
+        with R.hooked(submodule, hook):
+            lg = policy_logits(ix1, Lc1, acc.cache if acc is not None else None)
+            (lg[..., :1].float().sum() * 0.0).backward()
+        del lg
+        if acc is not None:
+            acc.accumulate()
     if acc is not None:
         acc.backward()               # the summed cache gradients through the shared prefix forward, once
     t_fb = time.time() - t_fb
@@ -2092,9 +2113,10 @@ def find_micro_batch_fullparam(actor, opt, submodule, prompt_ids, marker, a, dev
     total = torch.cuda.get_device_properties(0).total_memory
     GB = 2**30
     frac = float(a.mb_target_frac)
+    fp.FP.reshard_root(actor)   # after the initial publish's no-grad forward the root params are still gathered (5 GB, plain tensors)
     gc.collect(); torch.cuda.empty_cache()
     base = torch.cuda.memory_allocated()
-    reserve = 0 if len(opt.state) else 2 * sum(fp.FP.is_dtensor(p) and p.to_local().numel() * 4 or p.numel() * 4 for p in actor.parameters())
+    reserve = 0 if len(opt.state) else 2 * sum((p.to_local().numel() if fp.FP.is_dtensor(p) else p.numel()) * 4 for p in actor.parameters())
     budget = frac * total - reserve
     world = fp.world
     _log(tag, f"micro-batch probe (full-param) @ L={L}: resident {base / GB:.1f} GB, AdamW reserve {reserve / GB:.1f} GB, budget for the measured "
@@ -2666,6 +2688,10 @@ def run_trainer(a):
             r, flu, dis = R.score(texts, dirs_rep, scorer, tok, device, a, with_fluency=True)
         else:
             r = R.score(texts, dirs_rep, scorer, tok, device, a)
+        if fp is not None:   # FSDP2 scorer: score() ran ceil(non-empty texts / score_batch) collective forwards on THIS rank -> equalize
+            n_sc = -(-sum(1 for t in texts if t.strip()) // a.score_batch)
+            for _ in range(int(FP.all_reduce_max(n_sc, device)) - n_sc):
+                FP.dummy_scorer_forward(scorer, tok, device)
         r = r * a.reward_scale
         raw_r, gate_frac = r.clone(), 1.0                      # raw_r = the TRUE cosine (logged/transcripts), before any shaping (rl.py fd2d144)
         trunc = torch.tensor([len(g) >= a.max_new_tokens and (not g or g[-1] not in eos_set) for g in gen_ids])
