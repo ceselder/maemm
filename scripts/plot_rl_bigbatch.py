@@ -57,3 +57,38 @@ fig.tight_layout(rect=(0, 0.07, 1, 0.93))
 for ext in ("png", "pdf"):
     fig.savefig(f"{OUT}/bigbatch_evals.{ext}", dpi=160)
 print("wrote", {r: [(e["ckpt_step"], round(e["eval/mean_all"], 3)) for e in data["runs"][r]["evals"]] for r in RUNS})
+
+
+# ---- reward dynamics: E / F / I vs step and vs rollouts ----
+import datetime as _dt
+TRAIN = {"E": ("octahedral-systems/maxact-fast/p57zffg6", None), "F": ("octahedral-systems/maxact-fast/pu3whp5m", ("2026-09-06T04:50:00", 161)),
+         "I": ("celestedeschamphetaere-personal/maxact-fast/t8brhw8t".replace("phetaere", "phelaere"), None)}
+def train_rows(path, resume):
+    r = api.run(path); rows = sorted([h for h in r.history(keys=["reward/mean", "policy/entropy", "grad_norm", "_timestamp"], pandas=False, samples=3000) if h.get("reward/mean") is not None], key=lambda h: h["_step"])
+    if resume:
+        cut = _dt.datetime.fromisoformat(resume[0]).replace(tzinfo=_dt.timezone.utc).timestamp()
+        old = [h for h in rows if h["_timestamp"] < cut and int(h["_step"]) < resume[1]]; new = [h for h in rows if h["_timestamp"] >= cut]
+        return [(int(h["_step"]), h["reward/mean"], h["policy/entropy"], h["grad_norm"]) for h in old] + [(resume[1] + i, h["reward/mean"], h["policy/entropy"], h["grad_norm"]) for i, h in enumerate(new)]
+    return [(int(h["_step"]), h["reward/mean"], h["policy/entropy"], h["grad_norm"]) for h in rows]
+dyn = {k: train_rows(*TRAIN[k]) for k in TRAIN}
+data["dynamics"] = {k: [{"step": s, "reward": r, "entropy": e, "grad_norm": g} for s, r, e, g in v] for k, v in dyn.items()}
+json.dump(data, open(f"{OUT}/data/bigbatch.json", "w"), indent=1)
+def sm(y, w=9):
+    y = np.asarray(y, float); return np.convolve(y, np.ones(w) / w, mode="same") if len(y) >= w else y
+fig, axes = plt.subplots(2, 3, figsize=(16, 8.2))
+for col, (key, title, logy) in enumerate((("reward", "training reward (mean cos, last-5 window)", False), ("entropy", "policy entropy (nats/token)", False), ("grad_norm", "gradient norm (log; dotted = clip 1.0)", True))):
+    for row, xmode in enumerate(("step", "rollouts")):
+        ax = axes[row][col]
+        for k, cfg in RUNS.items():
+            v = dyn[k]; xs = np.array([s for s, *_ in v], float); ys = np.array([{"reward": r, "entropy": e, "grad_norm": g}[key] for _, r, e, g in v], float)
+            if xmode == "rollouts": xs = xs * cfg["rps"] / 1e6
+            ax.plot(xs, ys, color=cfg["color"], lw=0.6, alpha=0.3); ax.plot(xs, sm(ys), color=cfg["color"], lw=1.8, label=cfg["label"])
+        if logy: ax.set_yscale("log"); ax.axhline(1.0, color="#333", ls=":", lw=1)
+        ax.set_title(title, fontsize=9.5); ax.set_xlabel("RL step" if xmode == "step" else "rollouts consumed (millions)", fontsize=9); ax.grid(alpha=0.25); ax.tick_params(labelsize=8)
+h_, l_ = axes[0][0].get_legend_handles_labels(); fig.legend(h_, l_, loc="lower center", ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.5, 0.0))
+I_on = 178
+fig.suptitle("Reward dynamics at three rollout batch sizes, constant lr 1e-5: the 8x batch (8 x 4096) climbs the same reward curve per step, breaks EARLIER in steps (grad-norm onset 178 vs 246 / 268)\n"
+             "and far later in rollouts (5.8M vs 1-2M); per rollout it is the least sample-efficient. Thin = raw, thick = 9-step moving average; RL-I resumed at steps 25 and 50 (trainer changes, same math)", fontsize=10, y=0.995)
+fig.tight_layout(rect=(0, 0.06, 1, 0.93))
+for ext in ("png", "pdf"): fig.savefig(f"{OUT}/bigbatch_reward.{ext}", dpi=160)
+print("wrote reward dynamics:", {k: (len(v), v[-1][0], round(v[-1][1], 3)) for k, v in dyn.items()})

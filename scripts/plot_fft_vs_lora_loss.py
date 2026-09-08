@@ -35,7 +35,8 @@ for k, cfg in RUNS.items():
 json.dump(data, open(f"{OUT}/data/loss_vs_prev.json", "w"))
 
 def smooth(x, y, n_ex_window=500_000, eff=1):
-    w = max(1, int(n_ex_window / eff)); 
+    stride = float(np.median(np.diff(x))) * 1e6 if len(x) > 1 else eff   # examples between logged points
+    w = max(1, int(round(n_ex_window / max(stride, 1)))); 
     if len(y) < w: return x, y
     c = np.convolve(y, np.ones(w) / w, mode="valid"); return x[w - 1:], c
 
@@ -58,8 +59,8 @@ f = data["runs"]["fft104m"]; l = data["runs"]["lora23m"]
 fl = np.array(f["loss"]); ll = np.array(l["loss"]); f_ex = f["last_step"] * 4096
 # loss at matched examples: LoRA loss around the FFT's current example count
 li = np.argmin(np.abs(np.array(l["loss_steps"]) * 512 - f_ex)); lo_match = float(np.mean(ll[max(0, li - 20): li + 20])); fo = float(np.mean(fl[-50:]))
-fig.suptitle(f"Full fine-tune at 8x the batch tracks the LoRA pretrain's loss at matched examples ({fo:.3f} vs {lo_match:.3f} at {f_ex / 1e6:.1f}M) "
-             f"and its held-out fidelity (.367 at 2M and 5M vs the LoRA run's flat .364–.375) — the eval is not moving with the loss yet", fontsize=10.5, y=1.0)
+fig.suptitle(f"Full fine-tune at 8x the batch tracks the LoRA pretrain's training loss at matched examples ({fo:.3f} vs {lo_match:.3f} at {f_ex / 1e6:.1f}M)\n"
+             f"and its held-out fidelity (.367-.370 so far vs the LoRA run's flat .364-.375): the eval is not moving with the loss yet", fontsize=10.5, y=1.0)
 fig.tight_layout(rect=(0, 0, 1, 0.94))
 for ext in ("png", "pdf"): fig.savefig(f"{OUT}/loss_vs_prev.{ext}", dpi=160)
 print("wrote", {k: (data["runs"][k]["n_rows"], data["runs"][k]["last_step"], [(e["ckpt_step"], round(e["mean_all"], 3)) for e in data["runs"][k]["evals"]][:8]) for k in RUNS}, "| fft last50 loss", round(fo, 3), "lora at matched examples", round(lo_match, 3))
