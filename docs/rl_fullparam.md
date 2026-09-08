@@ -73,19 +73,24 @@ next block boundary (`wu_load_fs`: `safe_open` the Y files, move each shard to t
 `load_weights`). No cross-process NCCL, engines never wait for each other; the trainer's main thread pays the write, the
 engines pay the load.
 
-## 3. Memory (per trainer rank, 5 ranks, B200 183 GB)
+## 3. Memory (per trainer rank, 5 trainer ranks, B200 = 178 GiB usable)
 
-| component | estimate | `[measured]` |
+Measured on the 8xB200 runs (`[T*]` log lines; policy = the 26.90 B-parameter FFT midtrain checkpoint):
+
+| component | estimate | measured |
 |---|---|---|
-| fp32 masters (26.9 B params) | 21.5 GB | |
-| fp32 sharded grads | 21.5 GB | |
-| AdamW m, v (fp32) | 43.0 GB | |
-| frozen scorer, 43 layers bf16, sharded | ~7 GB | |
-| all-gather buffers in flight | 1–2 GB | |
-| activations + fp32 logits at the chosen micro-batch | | |
-| **peak** | | |
+| bf16 policy loaded on the rank before sharding | 50 GB | 50.1 GB (transient; peak 51.1 GB while upcasting layer by layer) |
+| fp32 sharded masters (26.9 B / 5) | 20.0 GiB | resident 24.8 GB right after `shard_full_model`, 20.0 GB once the load buffers are freed |
+| frozen scorer, 43 layers bf16, FSDP2-sharded | ~7 GB | +4.2 GB (29.0 GB resident after loading it; 35 GB unsharded would be `--no-scorer-shard`) |
+| root group gathered after a no-grad forward (embed + lm_head bf16) | 5 GB | 31.4 − 26.6 = 4.8 GB (freed by `reshard_root`) |
+| fwd/bwd peak at max length (295 tokens), prefix-cached, fp32 head | | mb 4: 69.9 GB, mb 6: 80.4 GB, mb 8: 90.8 GB → **5.2 GB per sequence** on top of ~49 GB of mb-independent peak (fp32 sharded grads 20 GB + fp32 head copy 5 GB + all-gather/reduce-scatter buffers) |
+| AdamW moments (allocated at the first `opt.step`) | 2 × 20 GB = 40 GB | reserved by the probe (the probe's own estimate was 55 GB in attempt 2 because the gathered root params were counted at full size — fixed by `reshard_root`) |
+| **micro-batch chosen** | | **8** (85 % target: 90.8 + reserve ≤ 151 GB) |
+| **peak during training** | | see the report (`mem/hf_peak_gb_max_rank`) |
 
-The scorer unsharded (`--no-scorer-shard`) costs ~35 GB/rank instead.
+Why the first probe failed: the LoRA path's linear fit from mb 1 and 2 predicted 0.06 GB/seq (both peaked at 66.6 GB — at tiny
+micro-batches the peak is the mb-independent fp32-grad allocation during the prefix backward), verified mb 128 and OOM'd.
+The full-param probe now walks the candidates upwards from mb 4, measuring each (`plan_probe_step`), and reserves the AdamW state.
 
 ## 4. Parity / exactness
 
@@ -104,7 +109,19 @@ python3 scripts/launchers/spawn_rl_fullparam.py {smoke|val50|prod} [lr] [-- extr
 ```
 (`train(..., full_param=True)` adds `--full-param --init-adapter none`; the ablation recipe lives in the launcher.)
 
-## 6. Known limits
+## 6. Lessons from the first attempts (all fixed on the branch)
+
+1. **Micro-batch probe** — see §3: fit from mb 1/2 is meaningless under FSDP2; the optimizer state is not yet allocated during the probe.
+2. **Uneven shards deadlock FSDP2** — 512 groups over 5 ranks = 103/103/102/102/102 groups → 103 vs 102 micro-batches; every
+   FSDP2 forward/backward is a collective, so ranks 2–4 finished their update and entered the publish's marker-norm forward while
+   ranks 0–1 were still in their last micro-batch → NCCL watchdog abort (rc −6) after 8 min. Now every rank runs
+   `max_r ceil(n_r / mb)` micro-batches (zero-weight dummies of one short sequence), the same for the KL-reference pass and for
+   the scorer's `score()` batches (`ceil(non-empty texts / score_batch)`, equalized with 2-token dummy forwards).
+3. **Root params stay gathered after a no-grad forward** (FSDP2 keeps embed/norm/lm_head for a backward that never comes):
+   `model.parameters()` then yields plain bf16 tensors — harmless for the NCCL publish (they are the full tensors) but wrong for
+   the fs shard files, the checksums and the optimizer-state estimate. `reshard_root()` after every no-grad forward.
+
+## 7. Known limits
 
 - `--kl-coef > 0` with a non-MODEL policy base loads a second frozen sharded copy (+~11 GB/rank at Y=5); its head is bf16 (no
   fp32 head hook on the reference).
