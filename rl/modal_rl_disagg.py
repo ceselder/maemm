@@ -23,6 +23,13 @@ RL on a FULL fine-tuned policy (sft/fullft.py checkpoint dir; fresh LoRA, reward
     (adds `--policy-base <dir> --init-adapter none` to TRAIN_ARGS unless --extra-args sets --init-adapter itself; --kl-coef then anchors to the policy base)
 Set DISAGG_GPU (e.g. H200:4) at `modal run` time to pick the GPU request; the container's real GPU count
 is what the launcher uses.
+FULL-PARAMETER RL (rl_disagg --full-param, rl/rl_fullparam.py): the policy is the whole model, FSDP2-sharded over the trainer ranks;
+the vLLM engines serve the policy base without LoRA and receive bf16 weights by NCCL after every step; checkpoints are full model dirs:
+    DISAGG_APP=maemm-rl-disagg-fullparam DISAGG_GPU=B200:8 DISAGG_TRANSFORMERS="transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3" \
+        modal run --detach modal_rl_disagg.py::main --n-rollout 3 --n-trainer 5 --total-steps 50 --full-param \
+        --policy-base /data/sft_mix/mixeq_midtrain_fft_from_fft23m_v2/final --pool-dir /data/banks/mix_eq_1p45m \
+        --extra-args "--recipe scalerl ... --lr 1e-6 --prefix-cache --score-length-bucket --cuda-graphs --save-dir /data/ckpts_fullrl_x --save-steps 25"
+    (--full-param adds `--full-param --init-adapter none`; --publish-mode fs in --extra-args switches to the RAM-disk shard publish)
 Trainer speed knobs (rl_disagg --prefix-cache / --score-length-bucket): the prefix cache needs the transformers fork in the image --
     DISAGG_TRANSFORMERS="transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3" \
     DISAGG_APP=maemm-rl-disagg-fast-x4 DISAGG_GPU=B200:4 modal run ... --extra-args "--prefix-cache --score-length-bucket ..."
@@ -81,6 +88,8 @@ image = (
     .add_local_file(REPO / "rl" / "rl.py", "/pmx/RL/rl_hf.py")
     .add_local_file(REPO / "rl" / "rl_disagg.py", "/pmx/RL/rl_disagg.py")
     .add_local_file(REPO / "rl" / "fast_lens_ext.py", "/pmx/helpers/fast_lens_ext.py")
+    .add_local_file(REPO / "rl" / "rl_fullparam.py", "/pmx/RL/rl_fullparam.py")                    # --full-param (trainer glue + engine-side loaders)
+    .add_local_file(REPO / "sft" / "fullft.py", "/pmx/helpers/fullft.py")                          # FSDP2 sharding + full-model checkpoints
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
     .add_local_file(REPO / "sft" / "prefix_cache.py", "/pmx/helpers/prefix_cache.py")           # --prefix-cache (expand_cache_copy, fork check)
     .add_local_file(REPO / "eval" / "eval_universal.py", "/pmx/eval/eval_universal.py")            # inline eval scoring
@@ -223,16 +232,20 @@ def _collect(work="/tmp/disagg"):
                        modal.Secret.from_name("maemm-anthropic")],   # native Sonnet 5 judge: ANTHROPIC_API_KEY + ANTHROPIC_WORKSPACE_ID
               timeout=24 * 3600)
 def train(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_args: str = "", no_wandb: bool = False,
-          pool_dir: str = "", policy_base: str = ""):
+          pool_dir: str = "", policy_base: str = "", full_param: bool = False):
     """policy_base: a FULL fine-tuned checkpoint dir (sft/fullft.py layout, SAVE_DONE) the policy is built on; the rollout engines
-    serve it, the trainer starts a FRESH LoRA on it (unless extra_args gives --init-adapter), the reward stays the original base."""
-    local_pool = _stage(pool_dir, need_sft_init=not policy_base)   # pool_dir: a different direction bank than POOL_DIR (e.g. /data/banks/rl_randctx)
+    serve it, the trainer starts a FRESH LoRA on it (unless extra_args gives --init-adapter), the reward stays the original base.
+    full_param: rl_disagg --full-param -- EVERY weight of the policy is trained (FSDP2 over the trainer ranks), init = policy_base
+    (or the base model), bf16 weights pushed to the engines every step, full-model checkpoints (rl/rl_fullparam.py)."""
+    local_pool = _stage(pool_dir, need_sft_init=not (policy_base or full_param))   # pool_dir: a different direction bank than POOL_DIR (e.g. /data/banks/rl_randctx)
     args = list(TRAIN_ARGS)
     if policy_base:
         assert os.path.exists(f"{policy_base}/SAVE_DONE"), f"policy base {policy_base} has no SAVE_DONE (incomplete full-FT checkpoint)"
         args += ["--policy-base", policy_base]
         if "--init-adapter" not in extra_args:
             args += ["--init-adapter", "none"]   # unsets TRAIN_ARGS' SFT init -> fresh rsLoRA on the full-FT weights
+    if full_param:
+        args += ["--full-param", "--init-adapter", "none"]   # no LoRA init: the policy IS the (policy-base or base) model
     if no_wandb:
         args.append("--no-wandb")
     if extra_args:
@@ -266,9 +279,9 @@ def bench(n_rollout: int = 2, n_trainer: int = 2, extra_args: str = ""):
 
 @app.local_entrypoint()
 def main(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_args: str = "", no_wandb: bool = False,
-         policy_base: str = "", pool_dir: str = ""):
+         policy_base: str = "", pool_dir: str = "", full_param: bool = False):
     train.remote(n_rollout=n_rollout, n_trainer=n_trainer, total_steps=total_steps, extra_args=extra_args, no_wandb=no_wandb,
-                 pool_dir=pool_dir, policy_base=policy_base)
+                 pool_dir=pool_dir, policy_base=policy_base, full_param=full_param)
 
 
 @app.local_entrypoint()
