@@ -24,6 +24,12 @@ RL adapters trained on a full-FT policy base (rl_disagg --policy-base): the SAME
     EVAL_APP=maemm-eval-ckpt-fftbase modal deploy eval/modal_eval_ckpt.py
     ... modal.Function.from_name('maemm-eval-ckpt-fftbase', 'daemon').spawn(ckpt_dir='/data/ckpts_<run>', tag='<run>',
         extra_args='--eval-cache /data/eval_universal_ho/eval_sets_heldout_v2.pt')
+Per-direction dump (one-off, its own app so the live daemons are untouched): extra_args='--dump-per-dir ...' makes
+eval_ckpt_daemon ALSO write <out_dir>/perdir_ckpt_<k>.json (every direction's best-of-bo score + sae best texts; the metric json
+is unchanged). A full-model checkpoint goes through `daemon` too: once=True, only_step=k, extra_args='--full-model ...'.
+    EVAL_APP=maemm-eval-ckpt-perdir modal deploy eval/modal_eval_ckpt.py
+    ... modal.Function.from_name('maemm-eval-ckpt-perdir', 'daemon').spawn(ckpt_dir='/data/sft_mix/<run>', tag='perdir_<run>', once=True,
+        only_step=10107, extra_args='--dump-per-dir --no-extra-evals --no-wandb --eval-cache /data/eval_universal_ho/eval_sets_heldout_v2.pt')
 """
 import os
 from pathlib import Path

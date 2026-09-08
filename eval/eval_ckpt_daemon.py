@@ -64,6 +64,11 @@ def parse_args(argv=None):
     ap.add_argument("--first-adapter", default="/data/sft_mix/last5_rp/final",
                     help="an adapter of the run's LoRA geometry to build the PEFT actor with before the engine (the SFT init)")
     ap.add_argument("--no-extra-evals", action="store_true")
+    ap.add_argument("--dump-per-dir", action="store_true",
+                    help="ALSO write <out_dir>/perdir_ckpt_<k>.json: the per-direction best-of-bo scores behind every aggregate (every "
+                         "cosine family's cos per direction; sae feature id / best act / norm_act / fired / rank / rank1 / every sample's "
+                         "act / the best sample's text; cache-v2 mlp families' cos + fire-back) -- rl.per_dir_dump. The metric json, "
+                         "wandb row and state file are byte-identical to a run without this flag")
     ap.add_argument("--policy-base", default="auto",
                     help="base the RL adapters were trained on (rl_disagg --policy-base, a full-FT checkpoint dir): the engine serves it + "
                          "the adapter, scoring stays the clean MODEL. 'auto' (default) = <ckpt_dir>/run_meta.json's policy_base when present "
@@ -352,6 +357,11 @@ def main():
     elif fft_lora:
         a.engine_model, a.engine_lora = policy_base, True
         log(f"policy-base mode: engine serves {policy_base} + LoRA slots; HF side = clean base for scoring")
+    else:
+        # plain LoRA-on-MODEL protocol. Set the engine model EXPLICITLY: rl_disagg._build_engine falls back to
+        # getattr(a, "policy_base") and here that is the CLI flag ('auto' by default), which vLLM would try to load as a repo id
+        # (LocalEntryNotFoundError: 'auto' is not in the HF cache).
+        a.engine_model, a.engine_lora = MODEL, True
     llm = DG._build_engine(a, 0, p_len, a.max_num_seqs, a.cuda_graphs, "eval-ckpt")
     _hn = {"v": None}   # policy-base mode: the served (policy base + adapter) marker norm, refreshed per checkpoint
     if a.full_model or fft_lora:
@@ -481,6 +491,7 @@ def main():
             n_t = _save_adapter_for_vllm(actor, name, lora_dir)
             t_load = time.time() - t1
         ev = R.inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, s, s, 0, 1, EV)
+        perdir = ev.pop("_perdir", None)   # --dump-per-dir only; never a wandb scalar, never in ckpt_<k>.json
         ex = {}
         if EX is not None:
             ex = IX.run_extra_evals_gpu(llm, actor, submodule, tok, prompt_ids, marker, a, device, s, s, 0, 1, EX,
@@ -505,6 +516,15 @@ def main():
             "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "full_model": a.full_model,
             "policy_base": policy_base or MODEL, "hnorm_adapter_on": hnorm_on,
             "injection_check": chk}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
+        if perdir is not None:
+            json.dump({"ckpt_step": s, "ckpt": ck, "tag": a.tag, **extras, "protocol": {
+                "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]), "bo": a.eval_bo, "temp": a.eval_temp,
+                "min_new": a.eval_min_new, "max_new": a.eval_max_new, "eval_cache": a.eval_cache, "sae_fire": EV["EU"].SAE_FIRE,
+                "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "full_model": a.full_model,
+                "policy_base": policy_base or MODEL}, "aggregates": {k: v for k, v in ev.items() if k.startswith("eval/")},
+                "perdir": perdir}, open(f"{a.out_dir}/perdir_ckpt_{s}.json", "w"))
+            log(f"step {s}: per-direction dump -> {a.out_dir}/perdir_ckpt_{s}.json ({len(perdir['cos'])} cos families + sae {len(perdir['sae'].get('row', []))}"
+                f" + extra {list(perdir['extra'])})")
         if EX is not None and "extra/locality/fire_frac" in ex:
             try:
                 IX.launch_judge_stage(None, s, EX, a)
