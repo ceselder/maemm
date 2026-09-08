@@ -54,6 +54,7 @@ Standalone:
 """
 import argparse
 import json
+import math
 import os
 
 import numpy as np
@@ -83,6 +84,15 @@ CONTROL_FAMS = {"random"}   # lower-is-better control(s): logged per-family, EXC
 EXTRA_FAMS_KEY = "extra_families"
 MLP_LAST_K = 5                       # fire-back: max over the LAST 5 kept tokens of polarity * a_i / corpus_max_i
 MLP_FIRE_LEVELS = (0.10, 0.25, 0.50)  # -> eval/<fam>/fired10 / fired25 / fired50
+# RANK metrics (the SAE family's rank1_frac / rank_le5 / mean_rank / mrr mirrored for MLP neurons): the paired neuron's rank
+# among ALL d_ff layer-42 neurons by NORMALIZED value polarity_j * a_j / corpus_max_j at the token (of the last MLP_LAST_K
+# kept) where its own normalized value peaks -- rank 1 = the single most (relatively) active neuron there. Needs corpus
+# statistics for EVERY neuron (MLP_STATS_DEFAULT = data/mlp42_neurons_worker.py's stats: polarity, max|a|, log-histograms).
+MLP_RANK_LE = 10                                   # eval/<fam>/rank_le10
+MLP_TOP_PCT = 0.99                                 # eval/<fam>/top1pct_frac: achieved value above the neuron's own 99th corpus percentile
+MLP_STATS_DEFAULT = "/data/mlp42/neuron_stats.npz"  # per-neuron corpus stats of all 17,408 neurons (1.02M FineFineWeb tokens)
+MLP_CHANCE_ACTS_DEFAULT = "/data/acts27b"          # random corpus windows (held-out tail rows) for the chance level of the rank metrics
+MLP_CHANCE_SEED = 20260908                         # window draw seed (per eval row, so sharding over ranks never changes the draw)
 ENV_EVAL_CACHE = "MAEMM_EVAL_CACHE"  # env override of the eval-cache path (rl.py / rl_disagg.py / eval_ckpt_daemon.py --eval-cache default)
 
 
@@ -136,16 +146,14 @@ class _Stop(Exception):
 
 
 @torch.no_grad()
-def _reencode_mlp(gen_texts, neuron_ids, actor, tok, device, sbatch=32):
-    """_reencode that ALSO returns the layer-42 MLP neuron values (down_proj input) of each row's k paired neurons.
-    neuron_ids: LongTensor / list [N, k]. Yields (s, h [b,T,d] fp32, keep [b,T], a_sel [b,k,T] fp32, lastk [b,T]) with
-    lastk = keep restricted to the last MLP_LAST_K positions of the row (sink counted in the length, as in the
-    verbalization scorer of data/mlp42_neurons_worker.py). Same tokenization / sink / 10x-median norm filter as _reencode."""
+def _reencode_mlp_full(gen_texts, actor, tok, device, sbatch=32):
+    """_reencode that ALSO returns EVERY layer-42 MLP neuron value (the down_proj input, [b, T, d_ff] fp32) of each row.
+    Yields (s, h [b,T,d] fp32, keep [b,T], a [b,T,d_ff] fp32, lastk [b,T]) with lastk = keep restricted to the last MLP_LAST_K
+    positions of the row (sink counted in the length, as in the verbalization scorer of data/mlp42_neurons_worker.py). Same
+    tokenization / sink / 10x-median norm filter as _reencode. _reencode_mlp (the fire-back scorer) gathers the paired
+    neurons from this; score_mlp_rank ranks them against all d_ff columns."""
     layer = get_layer(actor, READ_LAYER)
     down = layer.mlp.down_proj
-    nid_all = torch.as_tensor(neuron_ids, dtype=torch.long)
-    if nid_all.dim() == 1:
-        nid_all = nid_all[:, None]
     prev = tok.padding_side; tok.padding_side = "right"
     sink = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
     try:
@@ -174,8 +182,7 @@ def _reencode_mlp(gen_texts, neuron_ids, actor, tok, device, sbatch=32):
             finally:
                 h1.remove(); h2.remove()
             h = cap["h"]
-            nid = nid_all[s:s + B].to(device)                                       # [b, k]
-            a_sel = cap["a"].float()[torch.arange(B, device=device)[:, None], :, nid]  # [b, k, T]
+            a = cap["a"].float()                                                    # [b, T, d_ff]
             keep = am.bool().clone(); keep[:, 0] = False
             nrm = h.norm(dim=-1)
             med = nrm.masked_fill(~keep, float("nan")).nanmedian(dim=1, keepdim=True).values
@@ -183,9 +190,26 @@ def _reencode_mlp(gen_texts, neuron_ids, actor, tok, device, sbatch=32):
             L = am.sum(1)                                                            # incl. sink
             pos = torch.arange(h.shape[1], device=device)[None, :]
             lastk = keep & (pos >= (L - MLP_LAST_K)[:, None])
-            yield s, h, keep, a_sel, lastk
+            yield s, h, keep, a, lastk
     finally:
         tok.padding_side = prev
+
+
+@torch.no_grad()
+def _reencode_mlp(gen_texts, neuron_ids, actor, tok, device, sbatch=32):
+    """_reencode that ALSO returns the layer-42 MLP neuron values (down_proj input) of each row's k paired neurons.
+    neuron_ids: LongTensor / list [N, k]. Yields (s, h [b,T,d] fp32, keep [b,T], a_sel [b,k,T] fp32, lastk [b,T]) with
+    lastk = keep restricted to the last MLP_LAST_K positions of the row (sink counted in the length, as in the
+    verbalization scorer of data/mlp42_neurons_worker.py). Same tokenization / sink / 10x-median norm filter as _reencode
+    (gathered from _reencode_mlp_full; the values are the same fp32 tensor's columns)."""
+    nid_all = torch.as_tensor(neuron_ids, dtype=torch.long)
+    if nid_all.dim() == 1:
+        nid_all = nid_all[:, None]
+    for s, h, keep, a, lastk in _reencode_mlp_full(gen_texts, actor, tok, device, sbatch):
+        B = a.shape[0]
+        nid = nid_all[s:s + B].to(device)                                           # [b, k]
+        a_sel = a[torch.arange(B, device=device)[:, None], :, nid]                  # [b, k, T]
+        yield s, h, keep, a_sel, lastk
 
 
 @torch.no_grad()
@@ -220,6 +244,202 @@ def mlp_metrics(fam, best_na, best_na_any=None):
         for lv in MLP_FIRE_LEVELS:
             out[f"eval/{fam}/any_fired{int(round(lv * 100))}"] = float(np.mean(best_na_any >= lv))
     return out
+
+
+# ---------------------------------------------------------------------------------------------
+# MLP RANK metrics: the paired neuron's rank among ALL d_ff layer-42 neurons (+ within-neuron corpus percentile, + chance)
+# ---------------------------------------------------------------------------------------------
+
+def load_mlp_neuron_stats(path=MLP_STATS_DEFAULT):
+    """Per-neuron corpus statistics of EVERY layer-42 MLP neuron (data/mlp42_neurons_worker.py `stats` stage: 4,000 x 256
+    FineFineWeb train windows = 1.02M tokens): polarity (sign of the extreme corpus value), corpus max|a| (the eval cache's
+    <fam>_corpus_max IS max_abs[neuron]; polarity likewise) and the sign-resolved log10|a| histograms (16 bins/decade over
+    [1e-4, 1e3) + under/overflow), re-keyed by FIRING side: hist_same = tokens with polarity * a > 0, hist_opp = polarity * a
+    < 0. Returns a dict of numpy arrays (+ torch views of polarity / corpus_max for the scorer)."""
+    z = np.load(path)
+    pol = z["polarity"].astype(np.float32); cmax = z["max_abs"].astype(np.float32)
+    hp, hn = z["hist_pos"].astype(np.float64), z["hist_neg"].astype(np.float64)                # [NB, N]
+    pos_pol = pol[None, :] > 0
+    return {"path": path, "N": int(z["N"]), "n_tok": float(z["n_tok"]), "polarity": pol, "corpus_max": cmax,
+            "hist_same": np.where(pos_pol, hp, hn), "hist_opp": np.where(pos_pol, hn, hp),
+            "n_zero": z["n_zero"].astype(np.float64), "hist_lo": float(z["hist_lo"]), "hist_bpd": int(z["hist_bpd"]),
+            "polarity_t": torch.from_numpy(pol.copy()), "corpus_max_t": torch.from_numpy(cmax.copy())}
+
+
+def _hist_count_below(hist, nid, mag, lo, bpd):
+    """#tokens (one side's histogram, [NB, N]: bin 0 = |a| < 10^lo, bin b in 1..NB-2 = [10^(lo+(b-1)/bpd), 10^(lo+b/bpd)),
+    bin NB-1 = overflow) of neurons nid [n] with |a| < mag [n]; log-uniform interpolation inside the straddling bin."""
+    NB = hist.shape[0]
+    mag = np.asarray(mag, np.float64); nid = np.asarray(nid, np.int64)
+    pos = (np.log10(np.maximum(mag, 1e-300)) - lo) * bpd
+    b = np.clip(np.floor(pos).astype(np.int64) + 1, 0, NB - 1)
+    frac = np.where(pos < 0, 0.0, np.where(b >= NB - 1, 0.0, pos - np.floor(pos)))
+    csum = np.concatenate([np.zeros((1, hist.shape[1])), np.cumsum(hist, axis=0)], 0)   # csum[b] = tokens in bins < b
+    return csum[b, nid] + hist[b, nid] * frac
+
+
+def mlp_corpus_percentile(vals, nid, stats):
+    """Within-neuron corpus percentile of achieved polarity-signed values: P_corpus(polarity * a <= v) for neuron nid, from
+    the stats histograms. vals, nid: array-like [n]. Returns np float64 [n] in [0, 1] (0.99 = the value beats 99% of the
+    neuron's own 1.02M corpus tokens; a norm_act of 1.0 is by construction ~1.0)."""
+    vals = np.asarray(vals, np.float64); nid = np.asarray(nid, np.int64)
+    lo, bpd = stats["hist_lo"], stats["hist_bpd"]
+    n_opp = stats["hist_opp"].sum(0)[nid]; n_zero = stats["n_zero"][nid]
+    pos = vals > 0
+    cnt = np.empty_like(vals)
+    # v > 0: every opposite-side token, the exact zeros, and the same-side tokens with |a| < v
+    cnt[pos] = n_opp[pos] + n_zero[pos] + _hist_count_below(stats["hist_same"], nid[pos], vals[pos], lo, bpd)
+    # v <= 0: the opposite-side tokens with |a| >= |v|
+    cnt[~pos] = n_opp[~pos] - _hist_count_below(stats["hist_opp"], nid[~pos], -vals[~pos], lo, bpd)
+    return np.clip(cnt / stats["n_tok"], 0.0, 1.0)
+
+
+@torch.no_grad()
+def score_mlp_rank(gen_texts, neuron_ids, stats, actor, tok, device, sbatch=32):
+    """Cross-neuron RANK of each text's paired neuron(s) among ALL d_ff layer-42 neurons on the CLEAN base (the MLP analogue
+    of sae_rank_at_peaks). Per text and member, over the last MLP_LAST_K kept tokens:
+      av          polarity_i * a_i at the member's best token (max over the window; == norm_act * corpus_max_i)
+      na          av / corpus_max_i  (identical to score_mlp_fireback's per-member value)
+      rank        1 + #neurons j with polarity_j * a_j / corpus_max_j > the member's normalized value, AT ITS BEST TOKEN
+      rank_best5  the smallest such rank over the window's tokens (rank recomputed at every kept last-k token)
+      raw_rank    same best token, ranked by the polarity-signed RAW value polarity_j * a_j (no normalization: dense
+                  high-magnitude neurons dominate -- the contrast metric)
+      pct         within-neuron corpus percentile of av (mlp_corpus_percentile)
+    No kept token in the window -> av = na = 0, ranks = d_ff (worst), pct = P(polarity * a <= 0). Returns a dict of cpu
+    tensors [N_text, k] (float32 av/na/pct, int64 ranks). neuron_ids: [N, k] or [N]."""
+    nid_all = torch.as_tensor(neuron_ids, dtype=torch.long)
+    if nid_all.dim() == 1:
+        nid_all = nid_all[:, None]
+    n, k = nid_all.shape
+    pol = stats["polarity_t"].to(device); cm = stats["corpus_max_t"].to(device).clamp_min(1e-6)
+    N = pol.numel()
+    out = {"av": torch.zeros(n, k), "na": torch.zeros(n, k), "rank": torch.full((n, k), N, dtype=torch.long),
+           "rank_best5": torch.full((n, k), N, dtype=torch.long), "raw_rank": torch.full((n, k), N, dtype=torch.long)}
+    for s, h, keep, a, lastk in _reencode_mlp_full(gen_texts, actor, tok, device, sbatch):
+        b = a.shape[0]
+        a_s = a * pol                                                       # [b, T, N] polarity-signed raw values
+        a_n = a_s / cm                                                      # [b, T, N] normalized (corpus max = 1)
+        nid = nid_all[s:s + b].to(device)                                   # [b, k]
+        bi = torch.arange(b, device=device)
+        has = lastk.any(1)                                                  # [b] a kept token in the window at all
+        for j in range(k):
+            nj = nid[:, j]
+            tj = a_n[bi, :, nj]                                             # [b, T] the member's normalized value per token
+            best_v, best_t = tj.masked_fill(~lastk, -float("inf")).max(1)  # its best token in the window
+            best_t = torch.where(has, best_t, torch.zeros_like(best_t))
+            row_n = a_n[bi, best_t]                                         # [b, N] every neuron, normalized, at that token
+            r_norm = (row_n > row_n[bi, nj][:, None]).sum(1) + 1
+            row_r = a_s[bi, best_t]                                         # [b, N] every neuron, raw signed, at that token
+            r_raw = (row_r > row_r[bi, nj][:, None]).sum(1) + 1
+            r_all = (a_n > tj[:, :, None]).sum(2) + 1                       # [b, T] the member's rank at every token
+            r_best = r_all.masked_fill(~lastk, N + 1).min(1).values
+            av = torch.where(has, a_s[bi, best_t, nj], torch.zeros_like(best_v))
+            out["av"][s:s + b, j] = av.float().cpu()
+            out["na"][s:s + b, j] = torch.where(has, best_v, torch.zeros_like(best_v)).float().cpu()
+            out["rank"][s:s + b, j] = torch.where(has, r_norm, torch.full_like(r_norm, N)).cpu()
+            out["raw_rank"][s:s + b, j] = torch.where(has, r_raw, torch.full_like(r_raw, N)).cpu()
+            out["rank_best5"][s:s + b, j] = torch.where(has, r_best, torch.full_like(r_best, N)).cpu()
+        del a_s, a_n
+    out["pct"] = torch.from_numpy(mlp_corpus_percentile(out["av"].numpy().reshape(-1), nid_all.numpy().reshape(-1), stats)
+                                  .reshape(n, k).astype(np.float32))
+    return out
+
+
+def mlp_rank_metrics(fam, rank, rank_best5, raw_rank, pct, prefix=""):
+    """eval/<fam>/<prefix>{rank1_frac, rank_le10, mean_rank, median_rank, mrr} (+ best5_* over the whole last-k window, raw_*
+    by raw magnitude) and corpus_pct_mean / top1pct_frac from per-direction [n, k] arrays (best-of-bo sample). k = 1 singles:
+    plain shares. k > 1 (pairs): rank1_frac / rank_le10 / mrr / top1pct_frac are MEMBER-level shares (over 2n members),
+    mean_rank / median_rank average the two members' ranks first (one number per pair), and both_rank_le10 / any_rank_le10 /
+    both_top1pct_frac are the pair-level flags."""
+    p = f"eval/{fam}/{prefix}"
+    rank = np.asarray(rank, np.float64).reshape(len(rank), -1)
+    k = rank.shape[1]
+    out = {}
+
+    def block(name, r):
+        r = np.asarray(r, np.float64).reshape(len(r), -1)
+        flat = r.reshape(-1)
+        out[f"{p}{name}rank1_frac"] = float(np.mean(flat == 1))
+        out[f"{p}{name}rank_le{MLP_RANK_LE}"] = float(np.mean(flat <= MLP_RANK_LE))
+        out[f"{p}{name}mean_rank"] = float(np.mean(r.mean(1)))
+        out[f"{p}{name}median_rank"] = float(np.median(r.mean(1)))
+        out[f"{p}{name}mrr"] = float(np.mean(1.0 / flat))
+        if k > 1:
+            out[f"{p}{name}both_rank_le{MLP_RANK_LE}"] = float(np.mean((r <= MLP_RANK_LE).all(1)))
+            out[f"{p}{name}any_rank_le{MLP_RANK_LE}"] = float(np.mean((r <= MLP_RANK_LE).any(1)))
+
+    block("", rank); block("best5_", rank_best5); block("raw_", raw_rank)
+    pct = np.asarray(pct, np.float64).reshape(len(pct), -1)
+    out[f"{p}corpus_pct_mean"] = float(pct.mean())
+    out[f"{p}top1pct_frac"] = float(np.mean(pct >= MLP_TOP_PCT))
+    if k > 1:
+        out[f"{p}both_top1pct_frac"] = float(np.mean((pct >= MLP_TOP_PCT).all(1)))
+    return out
+
+
+def mlp_chance_windows(acts_dir, rows, bo, min_len, max_len, fam_idx=0, seed=MLP_CHANCE_SEED):
+    """Random corpus windows for the CHANCE level of the MLP metrics: bo windows per eval row (same best-of-bo protocol as the
+    generations, each window a uniform 16-64-token span, like the 16-64-token generations) from the HELD-OUT tail rows of
+    the acts27b dump (>= ceil(0.95 n_seq): the same rows the realact eval family comes from; every neuron statistic, scan
+    and bank used rows below). The draw is seeded PER ROW ([seed, fam_idx, row]) so sharding over ranks never changes it.
+    Returns (spec [len(rows)*bo, 3] int64 of (seq, offset, length), ids: list of token-id lists), row-major rows x bo."""
+    meta = json.load(open(os.path.join(acts_dir, "meta.json")))
+    NS, T = int(meta["n_seq"]), int(meta["seq_len"])
+    lo = int(math.ceil((1.0 - HELDOUT_FRAC) * NS))
+    toks = np.memmap(os.path.join(acts_dir, "toks.i32"), dtype=np.int32, mode="r", shape=(NS, T))
+    spec, ids = [], []
+    for i in rows:
+        rng = np.random.default_rng([seed, int(fam_idx), int(i)])
+        for _ in range(bo):
+            L = int(rng.integers(min_len, max_len + 1))
+            r = int(rng.integers(lo, NS)); o = int(rng.integers(0, T - L + 1))
+            spec.append((r, o, L)); ids.append([int(x) for x in toks[r, o:o + L]])
+    return np.asarray(spec, np.int64).reshape(-1, 3), ids
+
+
+@torch.no_grad()
+def mlp_chance_rows(fam, fam_idx, es, stats, actor, tok, device, acts_dir, rows, bo, min_len, max_len):
+    """The MLP fire-back AND rank metrics of RANDOM corpus text, per eval row of family `fam` (chance level): bo random
+    windows (mlp_chance_windows) stand in for the bo generations; the best-of-bo sample is picked exactly as for
+    generations (max over samples of the weakest member's normalized fire-back). Returns {row: {"na", "na_any", "rank",
+    "rank_best5", "raw_rank", "pct", "av": [k], "win": [[seq, off, len]] * bo}} for the given rows (sharding-safe)."""
+    rows = [int(i) for i in rows]
+    if not rows:
+        return {}
+    spec, ids = mlp_chance_windows(acts_dir, rows, bo, min_len, max_len, fam_idx=fam_idx)
+    texts = [tok.decode(x, skip_special_tokens=True) for x in ids]
+    rr = [i for i in rows for _ in range(bo)]
+    nid = es[f"{fam}_neuron"][rr]
+    na_min, na_max = score_mlp_fireback(texts, nid, es[f"{fam}_polarity"][rr], es[f"{fam}_corpus_max"][rr], actor, tok, device)
+    rk = score_mlp_rank(texts, nid, stats, actor, tok, device)
+    na_min = na_min.view(len(rows), bo); na_max = na_max.view(len(rows), bo)
+    best, arg = na_min.max(1)
+    sel = torch.arange(len(rows)) * bo + arg
+    out = {}
+    for j, i in enumerate(rows):
+        out[i] = {"na": float(best[j]), "na_any": float(na_max[j].max()), "av": rk["av"][sel[j]].tolist(),
+                  "rank": rk["rank"][sel[j]].tolist(), "rank_best5": rk["rank_best5"][sel[j]].tolist(),
+                  "raw_rank": rk["raw_rank"][sel[j]].tolist(), "pct": rk["pct"][sel[j]].tolist(),
+                  "win": spec[j * bo:(j + 1) * bo].tolist()}
+    return out
+
+
+def mlp_chance_metrics(fam, ch, k):
+    """Aggregate mlp_chance_rows output ({row: {...}}) -> eval/<fam>/chance_* scalars (+ the per-direction arrays for the
+    per-direction dump), rows in sorted order."""
+    idx = sorted(ch)
+    A = lambda key: np.asarray([ch[i][key] for i in idx], np.float64).reshape(len(idx), -1)
+    na = A("na")[:, 0]
+    m = mlp_rank_metrics(fam, A("rank"), A("rank_best5"), A("raw_rank"), A("pct"), prefix="chance_")
+    m[f"eval/{fam}/chance_norm_act"] = float(na.mean())
+    for lv in MLP_FIRE_LEVELS:
+        m[f"eval/{fam}/chance_fired{int(round(lv * 100))}"] = float(np.mean(na >= lv))
+    if k > 1:
+        m[f"eval/{fam}/chance_any_norm_act"] = float(A("na_any")[:, 0].mean())
+    pd = {"row": idx, "norm_act": na.tolist(), "rank": A("rank").astype(int).tolist(), "rank_best5": A("rank_best5").astype(int).tolist(),
+          "raw_rank": A("raw_rank").astype(int).tolist(), "corpus_pct": A("pct").tolist(), "best_signed_act": A("av").tolist(),
+          "windows": [ch[i]["win"] for i in idx], "windows_note": "(acts27b seq, offset, length) of the bo random held-out windows per row"}
+    return m, pd
 
 
 @torch.no_grad()
@@ -318,20 +538,30 @@ def eval_sae_family(dirs_unit, feats, sae, actor, tok, prompt_ids, marker, sub, 
 
 @torch.no_grad()
 def eval_mlp_family(tag, dirs_unit, neuron, polarity, corpus_max, actor, tok, prompt_ids, marker, sub, dev,
-                    bo, temp, max_new, min_new, gen_chunk):
+                    bo, temp, max_new, min_new, gen_chunk, stats=None):
     """Extra (MLP neuron) family: best-of-bo max-token cosine (the standard metric) AND best-of-bo normalized fire-back
-    (weakest member / strongest member). Returns (best_cos [N], best_na [N], best_na_any [N]) np arrays."""
+    (weakest member / strongest member). Returns (best_cos [N], best_na [N], best_na_any [N]) np arrays -- plus, with
+    `stats` (load_mlp_neuron_stats), a 4th item: the RANK metrics of the best-of-bo sample (the one behind best_na) as a dict
+    of np arrays [N, k] {rank, rank_best5, raw_rank, pct, av} (score_mlp_rank)."""
     n = len(dirs_unit)
     best_cos = np.full(n, -1e9); best_na = np.full(n, -1e9); best_any = np.full(n, -1e9)
+    k = int(torch.as_tensor(neuron).reshape(n, -1).shape[1])
+    rk = {key: np.zeros((n, k), np.int64 if "rank" in key else np.float64) for key in ("rank", "rank_best5", "raw_rank", "pct", "av")}
     for rows, texts in _gen_batches(tag, dirs_unit, actor, tok, prompt_ids, marker, sub, dev,
                                     bo, temp, max_new, min_new, gen_chunk):
         rdirs = F.normalize(torch.stack([dirs_unit[i] for i in rows]), dim=-1)
         cos = score_probe_cos(texts, rdirs, actor, tok, dev)
         na_min, na_max = score_mlp_fireback(texts, neuron[rows], polarity[rows], corpus_max[rows], actor, tok, dev)
+        if stats is not None:   # rank of the sample that sets each direction's best_na (== its norm_act)
+            r = score_mlp_rank(texts, neuron[rows], stats, actor, tok, dev)
+            for j, i in enumerate(rows):
+                if na_min[j].item() > best_na[i]:
+                    for key in rk:
+                        rk[key][i] = r[key][j].numpy()
         np.maximum.at(best_cos, rows, cos.numpy().astype(np.float64))
         np.maximum.at(best_na, rows, na_min.numpy().astype(np.float64))
         np.maximum.at(best_any, rows, na_max.numpy().astype(np.float64))
-    return best_cos, best_na, best_any
+    return (best_cos, best_na, best_any, rk) if stats is not None else (best_cos, best_na, best_any)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -525,7 +755,7 @@ def build_eval_sets(cache_path, sae, wu, j42, probe_bank_path, acts_dir, n, dev,
 
 @torch.no_grad()
 def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_new, min_new, dev,
-             gen_chunk=64, sae_fire=SAE_FIRE, per_dir=False):
+             gen_chunk=64, sae_fire=SAE_FIRE, per_dir=False, mlp_stats=None, chance_acts_dir=None):
     """Run every family in eval_sets (meta["cos_families"] cosine families + the sae metric
     family); return a FLAT {wandb scalar name: float} dict. Generation RNG is forked + fixed
     (GEN_SEED) so repeat evals of the same checkpoint are deterministic and the trainer's RNG
@@ -533,7 +763,11 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
     per_dir=True ADDS out["_perdir"] (NOT a scalar -- pop it before wandb.log): the per-direction
     best-of-bo scores behind every aggregate in eval-cache row order -- {"cos": {fam: [n]},
     "sae": {row, feature, best_act, corpus_peak, norm_act, fired, beat_corpus, rank, rank1,
-    best_text}, "extra": {fam: {cos, norm_act, any_norm_act}}}. Default output is unchanged."""
+    best_text}, "extra": {fam: {cos, norm_act, any_norm_act}}}. Default output is unchanged.
+    mlp_stats (load_mlp_neuron_stats) ADDS the cross-neuron RANK metrics of the extra (mlp) families -- eval/<fam>/{rank1_frac,
+    rank_le10, mean_rank, median_rank, mrr, best5_*, raw_*, corpus_pct_mean, top1pct_frac} (mlp_rank_metrics) -- and, with
+    chance_acts_dir, their chance level on random held-out corpus windows (eval/<fam>/chance_*). Every pre-existing key is
+    unchanged."""
     was_training = actor.training
     actor.eval()
     fork_devs = [dev] if str(dev).startswith("cuda") else []
@@ -572,13 +806,26 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
                 if pool_rows is not None:
                     pd["sae"]["pool_vec_idx"] = [int(x) for x in pool_rows]
             # extra families (cache v2: layer-42 MLP neurons / co-firing pairs): cosine + fire-back, NOT in mean_all
-            for fam in xfams:
+            for fi, fam in enumerate(xfams):
                 k = eval_sets[f"{fam}_neuron"].shape[1]
-                bc, bn, ba = eval_mlp_family(fam, eval_sets[f"{fam}_dirs"], eval_sets[f"{fam}_neuron"],
-                                             eval_sets[f"{fam}_polarity"], eval_sets[f"{fam}_corpus_max"], *gen_args)
+                res = eval_mlp_family(fam, eval_sets[f"{fam}_dirs"], eval_sets[f"{fam}_neuron"],
+                                      eval_sets[f"{fam}_polarity"], eval_sets[f"{fam}_corpus_max"], *gen_args, stats=mlp_stats)
+                bc, bn, ba = res[0], res[1], res[2]
                 out[f"eval/{fam}/cos"] = float(bc.mean())
                 out.update(mlp_metrics(fam, bn, ba if k > 1 else None))
                 pd["extra"][fam] = {"cos": bc.tolist(), "norm_act": bn.tolist(), "any_norm_act": ba.tolist()}
+                if mlp_stats is not None:
+                    rk = res[3]
+                    out.update(mlp_rank_metrics(fam, rk["rank"], rk["rank_best5"], rk["raw_rank"], rk["pct"]))
+                    pd["extra"][fam].update({"neuron": eval_sets[f"{fam}_neuron"].tolist(), "rank": rk["rank"].tolist(),
+                                             "rank_best5": rk["rank_best5"].tolist(), "raw_rank": rk["raw_rank"].tolist(),
+                                             "corpus_pct": rk["pct"].tolist(), "best_signed_act": rk["av"].tolist()})
+                    if chance_acts_dir:
+                        ch = mlp_chance_rows(fam, fi, eval_sets, mlp_stats, actor, tok, dev, chance_acts_dir,
+                                             range(len(bn)), bo, min_new, max_new)
+                        cm, cpd = mlp_chance_metrics(fam, ch, k)
+                        out.update(cm)
+                        pd["extra"][fam]["chance"] = cpd
     finally:
         if was_training:
             actor.train()
@@ -600,6 +847,9 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
     for fam in xfams:
         out[f"eval/all/{fam}_norm_act"] = out[f"eval/{fam}/norm_act"]
         out[f"eval/all/{fam}_fired10"] = out[f"eval/{fam}/fired10"]
+        if f"eval/{fam}/rank_le{MLP_RANK_LE}" in out:
+            out[f"eval/all/{fam}_rank_le{MLP_RANK_LE}"] = out[f"eval/{fam}/rank_le{MLP_RANK_LE}"]
+            out[f"eval/all/{fam}_mrr"] = out[f"eval/{fam}/mrr"]
     return out
 
 
@@ -634,6 +884,11 @@ def main():
                     help="ALSO write <out>.perdir.json (needs --out): per-direction best-of-bo scores behind every aggregate "
                          "(cos per direction per family; sae feature id / best act / norm_act / fired / rank / best text); "
                          "the --out json and the wandb row are unchanged")
+    ap.add_argument("--mlp-stats", default=MLP_STATS_DEFAULT,
+                    help="per-neuron corpus stats of ALL layer-42 neurons (data/mlp42_neurons_worker.py neuron_stats.npz) -> the "
+                         "extra mlp families' cross-neuron RANK metrics + corpus percentile; missing file = rank metrics skipped")
+    ap.add_argument("--mlp-chance-acts", default=MLP_CHANCE_ACTS_DEFAULT,
+                    help="acts27b dump (toks.i32 + meta.json) for the random-corpus-window CHANCE level of the MLP metrics ('' = off)")
     ap.add_argument("--wandb", default=None, help="optional wandb project; init + log one step")
     ap.add_argument("--run-name", default=None)
     a = ap.parse_args()
@@ -661,11 +916,16 @@ def main():
         assert os.path.exists(a.cache_file), f"--cache-file {a.cache_file} does not exist"
     es = build_eval_sets(cache_path, sae, wu, j42, a.probe_bank, a.acts_dir, a.n, dev,
                          seed=0, maxacts_path=a.maxacts_path, heldout_pool=a.heldout_pool)
+    stats = None
     if extra_families(es):
-        print(f"[eval-universal] extra families {extra_families(es)} (cosine + MLP fire-back; not in mean_all)", flush=True)
+        if a.mlp_stats and os.path.exists(a.mlp_stats):
+            stats = load_mlp_neuron_stats(a.mlp_stats)
+        print(f"[eval-universal] extra families {extra_families(es)} (cosine + MLP fire-back; not in mean_all) | rank metrics "
+              f"{'ON (' + a.mlp_stats + ')' if stats else 'OFF (no ' + str(a.mlp_stats) + ')'}", flush=True)
     m = run_eval(actor, tok, prompt_ids, marker, sub, es, sae, a.bo, a.temp,
                  a.max_new_tokens, a.min_new_tokens, dev, gen_chunk=a.gen_chunk, sae_fire=a.sae_fire,
-                 per_dir=a.dump_per_dir)
+                 per_dir=a.dump_per_dir, mlp_stats=stats,
+                 chance_acts_dir=a.mlp_chance_acts if (stats and a.mlp_chance_acts and os.path.exists(a.mlp_chance_acts)) else None)
     perdir = m.pop("_perdir", None)
     print("=== EVAL-UNIVERSAL ===\n" + json.dumps(m, indent=1), flush=True)
     if a.out:

@@ -101,8 +101,17 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
            final_step: int = 1000, vllm_gpu_mem: float = 0.5, wandb_name: str = "", extra_args: str = "", policy_base: str = ""):
     """LoRA checkpoints (one long-lived eval_ckpt_daemon.py process; it discovers step_*, examples_* and final itself, see _scan there).
     policy_base: the full-FT base the RL adapters under ckpt_dir were trained on (rl_disagg --policy-base). Default '' = auto:
-    eval_ckpt_daemon reads <ckpt_dir>/run_meta.json (absent / MODEL -> the plain LoRA-on-MODEL protocol)."""
+    eval_ckpt_daemon reads <ckpt_dir>/run_meta.json (absent / MODEL -> the plain LoRA-on-MODEL protocol).
+    Launcher hygiene (from eval/modal_eval_ckpt_uplift.py, 2026-09-05): vol.reload() BEFORE the daemon starts (a reused warm
+    container's mount can predate the checkpoint) and the daemon runs in its own process group, killed if this function is
+    cancelled (a GPU-holding zombie made the next daemon on that container OOM at model load)."""
+    import signal
     import subprocess
+    import threading
+    try:
+        vol.reload()
+    except Exception as e:  # noqa
+        print(f"[modal] initial vol.reload failed: {e}", flush=True)
     env = os.environ.copy()
     env["PYTHONPATH"] = "/pmx/helpers:/pmx/eval:/pmx/RL"
     env["HF_HOME"] = "/data/hf_cache"
@@ -126,12 +135,12 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
     if extra_args:
         cmd += extra_args.split()
     print("[modal] launching:", " ".join(cmd), flush=True)
-    p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    p = subprocess.Popen(cmd, cwd="/pmx", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         start_new_session=True)   # own process group -> killable on cancel
     # The daemon polls the volume from a SUBPROCESS, where `modal.Volume.from_name(...).reload()` is not the mounted
     # handle (it silently no-ops) -> it would never see checkpoints committed after it started. Refresh the mount from
     # THIS process instead — but only while the daemon is idle: a reload during its model/asset load or a checkpoint
     # eval invalidates open file handles (that is how the first attempt died with LocalEntryNotFoundError).
-    import threading
     _stop = threading.Event()
     _state = {"loaded": False, "busy": False}
     def _reload_loop():
@@ -143,16 +152,29 @@ def daemon(ckpt_dir: str, tag: str, rl_run_id: str = "", poll_s: int = 120, once
             except Exception as e:  # noqa
                 print(f"[modal] vol.reload failed: {e}", flush=True)
     threading.Thread(target=_reload_loop, daemon=True).start()
-    for line in p.stdout:
-        print(line, end="", flush=True)
-        if "previously evaled:" in line:
-            _state["loaded"] = True
-        if "evaluating LATEST step" in line or "-> evaluating" in line or "] evaluating step" in line:
-            _state["busy"] = True
-        if "evaled in" in line or "adapter load failed" in line or "nothing pending" in line:
-            _state["busy"] = False
-    rc = p.wait()
-    _stop.set()
+    rc = None
+    try:
+        for line in p.stdout:
+            print(line, end="", flush=True)
+            if "previously evaled:" in line:
+                _state["loaded"] = True
+            if "evaluating LATEST step" in line or "-> evaluating" in line or "] evaluating step" in line:
+                _state["busy"] = True
+            if "evaled in" in line or "adapter load failed" in line or "nothing pending" in line:
+                _state["busy"] = False
+        rc = p.wait()
+    finally:
+        _stop.set()
+        if p.poll() is None:   # cancelled (or errored) while the daemon runs: do not leave a GPU-holding zombie behind
+            print("[modal] terminating eval daemon process group (cancel/error)", flush=True)
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+                p.wait(timeout=20)
+            except Exception:  # noqa
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except Exception:  # noqa
+                    pass
     vol.commit()
     if rc != 0:
         raise RuntimeError(f"eval daemon exited rc={rc}")
