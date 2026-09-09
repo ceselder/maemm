@@ -169,8 +169,9 @@ def main():
                  f"<b>50.1 GB</b> of bf16 weights into the 3 vLLM samplers by NCCL after <b>every</b> step in <b>{pubsum['trainer_total_s_median']:.2f} s</b> "
                  f"({pubsum['gbps_mean']:.0f} GB/s; engines stall {pubsum['engine_stall_s_mean']:.2f} s), the sampler stays on-policy (|Δlogp| {mean(dl):.3f} vs "
                  f"{mean([r['dlogp'] for r in L.get('initboth', []) if 1 <= r['step'] <= 49]):.3f} for the LoRA arm), and 50 steps at lr 1e-6 lift the reward "
-                 f"{v0['reward']:.3f} → {vN['reward']:.3f} on the LoRA arm's trajectory with a better held-out eval at step 25 ({fmt(evrow(ev_fp, 25), 4)} vs "
-                 f"{fmt(evrow(ev_if, 25), 4)} for LoRA on the same init). The step costs {step_s:.0f} s (LoRA arm: {lora_step:.0f} s) because micro-batch 8 pays "
+                 f"{v0['reward']:.3f} → {vN['reward']:.3f} on the LoRA arm's trajectory with a better held-out eval at both checkpoints (mean_all step 25: {fmt(evrow(ev_fp, 25), 4)} vs "
+                 f"{fmt(evrow(ev_if, 25), 4)} for LoRA on the same init; step 50: {fmt(evrow(ev_fp, 50), 4)} vs {fmt(evrow(ev_if, 50), 4)}, and vs {fmt(evrow(ev_ib, 50), 4)} for the "
+                 f"LoRA-on-base arm). The step costs {step_s:.0f} s (LoRA arm: {lora_step:.0f} s) because micro-batch 8 pays "
                  f"~22 TB/rank of FSDP all-gather/reduce-scatter traffic; the production arm was launched at this validated configuration and the recompute + "
                  f"chunked-head knobs that reach micro-batch 24 are implemented but still hang in step 0 (§6)."),
         "kpis": {"items": [
@@ -179,7 +180,7 @@ def main():
             {"v": f"{v0['reward']:.3f} → {vN['reward']:.3f}", "l": "reward, 50 steps, lr 1e-6 (LoRA 7e-6: 0.203 → 0.245)", "cls": "good"},
             {"v": f"{peak_train:.0f} GB", "l": "peak GPU memory per trainer rank (of 178)"},
             {"v": f"{step_s:.0f} s", "l": f"seconds per step at micro-batch 8 (LoRA arm {lora_step:.0f} s)", "cls": "bad"},
-            {"v": fmt(evrow(ev_fp, 25), 4), "l": f"held-out mean_all at step 25 (LoRA same init {fmt(evrow(ev_if, 25), 4)})", "cls": cls(evrow(ev_fp, 25), evrow(ev_if, 25))}]},
+            {"v": fmt(evrow(ev_fp, 50), 4), "l": f"held-out mean_all at step 50 (LoRA same init {fmt(evrow(ev_if, 50), 4)}, LoRA on base {fmt(evrow(ev_ib, 50), 4)})", "cls": cls(evrow(ev_fp, 50), evrow(ev_if, 50))}]},
         "sections": {
             "curves": (f"50-step validation run <code>rl_fullparam_val50_lr1e-6</code> (wandb {val_id}) vs the LoRA ablation arms at the same steps: "
                        f"<code>rl_abl_initboth_8x512_lr7e-6</code> (LoRA r64 on the base, SFT-adapter init) and <code>rl_abl_initnewfft_8x512_lr7e-6</code> "
@@ -219,8 +220,10 @@ def main():
                                           "production arm therefore runs the validated micro-batch-8 configuration (68 s/step).</p>",
             "eval": eval_table + (f"<p>Step 25 of the full-parameter run scores <b>{fmt(evrow(ev_fp, 25), 4)}</b> mean_all vs {fmt(evrow(ev_if, 25), 4)} for the LoRA "
                                   f"arm on the same init and {fmt(evrow(ev_ib, 25), 4)} for the LoRA arm on the base + SFT adapter; SAE fired {fmt(evrow(ev_fp, 25, 'eval/sae/fired'))} "
-                                  f"vs {fmt(evrow(ev_if, 25, 'eval/sae/fired'))}. The step-50 (final) checkpoint's eval is filled in as it lands (eval run "
-                                  f"<code>rl_fullparam_val50_lr1e-6_eval</code>).</p>"),
+                                  f"vs {fmt(evrow(ev_if, 25, 'eval/sae/fired'))}. At step 50 (the final checkpoint of the validation run) the full-parameter policy reaches "
+                                  f"<b>{fmt(evrow(ev_fp, 50), 4)}</b> vs {fmt(evrow(ev_if, 50), 4)} (LoRA, same init) and {fmt(evrow(ev_ib, 50), 4)} (LoRA on base + SFT adapter): "
+                                  f"+{100 * (evrow(ev_fp, 50) - evrow(ev_if, 50)):.1f} pp over the LoRA arm that started from the same weights, at a 7× lower learning rate "
+                                  f"(eval run <code>rl_fullparam_val50_lr1e-6_eval</code>). Same eval protocol, same clean scorer; one seed each, so treat ~0.5 pp as noise.</p>"),
             "limits": ("<ul>"
                        "<li><b>Step time.</b> 68 s/step at micro-batch 8 vs 30 s for the LoRA arm — the FSDP2 traffic per micro-batch. The knobs that fix it "
                        "(--suffix-ckpt: exact per-layer recompute of the suffix forward; --chunked-head: no full logits; --fsdp-prefetch 2) are implemented, unit-tested "
