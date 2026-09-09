@@ -92,9 +92,10 @@ def _scan_records(bank, all_one_family=None):
 
 @app.function(image=image, gpu=SMALL_GPUS, cpu=16, memory=131072, ephemeral_disk=512 * 1024, volumes={"/data": vol}, timeout=8 * 3600)
 def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overwrite: bool = False, threads: int = 48, exclude_json: str = ""):
-    """exclude_json: JSON dict {source bank: path of an end_anchor_rows.json} — rows listed under families[*].fail_vec_idx of that file
-    are removed from the selection pool of that bank (the SAE end-anchor filter: rows whose feature does not peak within the last 2
-    tokens when the target is re-tokenized standalone)."""
+    """exclude_json: JSON dict {source bank: path of a rows file} — rows listed under families[*].fail_vec_idx of that file are removed from
+    the selection pool of that bank. Used for (a) the SAE end-anchor filter (end_anchor_rows.json: rows whose feature does not peak within
+    the last 2 tokens when the target is re-tokenized standalone) and (b) the MLP eval-pair exclusion (eval_cos_rows.json: rows whose
+    direction has cos > 0.99 to an eval mlp/mlp_pair direction or whose neuron set contains a train neuron dominating an eval pair)."""
     import shutil
     import time
     from concurrent.futures import ThreadPoolExecutor
@@ -298,7 +299,7 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
              "leak_check": {"threshold": LEAK_COS, "reference_sets": ref_names, "n_reference_dirs": int(offs[-1]), "rows_dropped": n_bad,
                             "rows_dropped_by_family": dropped, "max_cos_table": leak_tbl, "eval_cache": EVAL_CACHE_V2, "pool_heldout": POOL_HELDOUT},
              "source_norm_range": norm_stats, "pretrain_corpus_parts_excluded": PRETRAIN_PARTS, "unused_parts_used": UNUSED_PARTS,
-             "end_anchor_exclusions": excl_info,
+             "row_exclusions": excl_info,
              "source_meta": src_meta, "d_model": D, "model": "Qwen/Qwen3.6-27B", "layer": 42, "created": time.time(), "wall_s": time.time() - T0}
     json.dump(stats, open(f"{out}/build_stats.json", "w"), indent=1)
     json.dump({**stats, "trainer_args": {"--data-dir": out, "--bank-file": "vecs.f32"}}, open(f"{out}/meta.json", "w"), indent=1)

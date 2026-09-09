@@ -247,7 +247,7 @@ def _alloc(counts, total, floor=0):
 def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512, n_eval_pair=256, k_single=8, k_pair=4,
               w_lo=16, w_hi=32, min_tok=8, min_c=10, min_lift=10.0, max_p=1e-10, check_mix=True,
               scan_file=None, bank_out=BANK_OUT, write_eval_cache=True, selection_file=None,
-              distinct_windows=False, k_triple=0, min_c3=None):
+              distinct_windows=False, k_triple=0, min_c3=None, eval_cos_max=LEAK_COS):
     """min_c is an ABSOLUTE joint-firing count on the scan tokens: the original rule (C >= 10 at T = 409,600) is a joint-firing
     RATE floor of 2.4e-5, so an expanded scan with T tokens keeps the same semantics with min_c = round(10 * T / 409600)
     (500 at 20.48M tokens); lift and the Poisson p are scale-free.
@@ -263,7 +263,11 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
     k_triple > 0 adds the family "mlp_triple": triangles of the strong-pair graph (all three pairs strong, all three members
     train neurons) with >= min_c3 (default max(10, min_c // 10)) tokens where ALL THREE fire; direction at a joint token =
     unit(a_i col_i + a_j col_j + a_k col_k) (raw activations at that token), target = window ending at that token, top-k_triple
-    joint tokens per triple by min normalized activation."""
+    joint tokens per triple by min normalized activation.
+    eval_cos_max (< LEAK_COS to activate; the 5M bank used 0.99): rows whose direction has cos > eval_cos_max to ANY eval mlp / mlp_pair
+    direction are dropped, and every train neuron that DOMINATES an eval pair direction (cos(pair_dir, unit col) > eval_cos_max) is
+    treated as held-out (its singles and every pair/triple containing it are dropped) — an eval "pair" whose direction is 0.99-close to
+    one train member's column is effectively that single train direction (audit 2026-09-09: 5 of 256 eval pairs, 1,478 rows at 0.999)."""
     T0 = time.time()
     scan_file = scan_file or f"{OUT}/bank_scan.npz"
     selection_file = selection_file or f"{OUT}/bank_selection.json"
@@ -619,6 +623,29 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
                 if mm.any():
                     leak[fi, ri] = max(leak[fi, ri], float(cm[mm].max()))
     bad = maxcos > LEAK_COS
+    n_eval_cos = n_dom = 0
+    if eval_cos_max < LEAK_COS:
+        mlp_ref_idx = [ri for ri, n in enumerate(ref_names) if n in ("mlp", "mlp_pair")]
+        # (a) direction-level: max cos vs the eval mlp-family directions only
+        for c0 in range(0, n_staged, 8192):
+            c1 = min(c0 + 8192, n_staged)
+            x = materialize(np.arange(c0, c1)).to(dev)
+            for ri in mlp_ref_idx:
+                cm = (x @ ref[offs[ri]:offs[ri + 1]].T).max(1).values.cpu().numpy()
+                hit = cm > eval_cos_max
+                n_eval_cos += int((hit & ~bad[c0:c1]).sum()); bad[c0:c1] |= hit
+        # (b) neuron-level: train neurons dominating an eval pair direction
+        pd = F.normalize(v2["mlp_pair_dirs"].float(), dim=-1).numpy()
+        dom_neurons = set()
+        for (pi_, pj_), d_ in zip(v2["mlp_pair_neuron"].numpy().tolist(), pd):
+            for m in (int(pi_), int(pj_)):
+                if m not in ho_set and abs(float(d_ @ signed[m])) > eval_cos_max:
+                    dom_neurons.add(m)
+        if dom_neurons:
+            dn = np.array(sorted(dom_neurons), np.int64)
+            hit = np.isin(n1, dn) | np.isin(n2, dn) | np.isin(n3, dn)
+            n_dom = int((hit & ~bad).sum()); bad |= hit
+        log(f"eval-cos rule (cos > {eval_cos_max} vs eval mlp/mlp_pair dirs): +{n_eval_cos} rows; dominant-member rule: neurons {sorted(dom_neurons)} -> +{n_dom} rows")
     leak_examples = []
     for q in np.flatnonzero(bad)[:20].tolist():
         ri = int(np.searchsorted(offs, argref[q], side="right") - 1)
@@ -696,7 +723,8 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
                 "triples": ({**tri_stats, "rows_per_triple_max": k_triple} if k_triple > 0 else None),
                 "distinct_windows": {"enabled": bool(distinct_windows), "same_window_tokens_skipped": dup_win},
                 "eval": {"mlp": int(v2["mlp_dirs"].shape[0]), "mlp_pair": int(v2["mlp_pair_dirs"].shape[0]), "written": write_eval_cache},
-                "leak_check": {"threshold": LEAK_COS, "dropped_rows": int(bad.sum()), "examples": leak_examples,
+                "leak_check": {"threshold": LEAK_COS, "dropped_rows": int(bad.sum()), "examples": leak_examples, "eval_cos_max": eval_cos_max,
+                               "dropped_by_eval_cos_rule": n_eval_cos, "dropped_by_dominant_member_rule": n_dom,
                                "max_cos_table": {f: {n: round(float(leak[fi, ri]), 4) for ri, n in enumerate(ref_names)} for fi, f in enumerate(FAM3) if f in counts}},
                 "new_eval_dirs_vs_mix_1m_v2": mix_max, "dropped_short_text": n_short_txt, "scan": scan_desc, "created": time.time()}
     json.dump(stats, open(wpath(f"{bank_out}/build_stats.json"), "w"), indent=1)

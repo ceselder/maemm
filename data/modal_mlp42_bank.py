@@ -93,7 +93,8 @@ def scan(n_windows: int = 1600, win_len: int = 256, batch: int = 16, topk: int =
 def build(seed: int = 2026, heldout_frac: float = 0.10, n_eval_single: int = 512, n_eval_pair: int = 256, k_single: int = 8,
           k_pair: int = 4, w_lo: int = 16, w_hi: int = 32, min_tok: int = 8, check_mix: bool = True, scan_file: str | None = None,
           bank_out: str | None = None, write_eval_cache: bool = True, selection_file: str | None = None, min_c: int = 10,
-          min_lift: float = 10.0, max_p: float = 1e-10, distinct_windows: bool = False, k_triple: int = 0, min_c3: int | None = None):
+          min_lift: float = 10.0, max_p: float = 1e-10, distinct_windows: bool = False, k_triple: int = 0, min_c3: int | None = None,
+          eval_cos_max: float = 0.999):
     """Defaults == today's bank (draws the hold-out split, writes eval cache v2 -> /data/banks/mlp42). For an EXPANDED bank pass
     scan_file (a bank_scan_big.npz), bank_out (new dir), write_eval_cache=False (hold-out + eval dirs READ from the existing v2
     cache, nothing under /data/eval_universal_ho is written), selection_file (new path), k_single/k_pair, and min_c scaled with the
@@ -107,7 +108,8 @@ def build(seed: int = 2026, heldout_frac: float = 0.10, n_eval_single: int = 512
     res = BW.run_build(tok, dev="cuda:0", seed=seed, heldout_frac=heldout_frac, n_eval_single=n_eval_single, n_eval_pair=n_eval_pair,
                        k_single=k_single, k_pair=k_pair, w_lo=w_lo, w_hi=w_hi, min_tok=min_tok, check_mix=check_mix,
                        scan_file=scan_file, bank_out=bank_out or BW.BANK_OUT, write_eval_cache=write_eval_cache, selection_file=selection_file,
-                       min_c=min_c, min_lift=min_lift, max_p=max_p, distinct_windows=distinct_windows, k_triple=k_triple, min_c3=min_c3)
+                       min_c=min_c, min_lift=min_lift, max_p=max_p, distinct_windows=distinct_windows, k_triple=k_triple, min_c3=min_c3,
+                       eval_cos_max=eval_cos_max)
     vol.commit()
     return res
 
