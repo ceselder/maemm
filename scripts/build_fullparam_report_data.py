@@ -186,15 +186,17 @@ def main():
                  f"{mean([r['dlogp'] for r in L.get('initboth', []) if 1 <= r['step'] <= 49]):.3f} for the LoRA arm), and 50 steps at lr 1e-6 lift the reward "
                  f"{v0['reward']:.3f} → {vN['reward']:.3f} on the LoRA arm's trajectory with a better held-out eval at both checkpoints (mean_all step 25: {fmt(evrow(ev_fp, 25), 4)} vs "
                  f"{fmt(evrow(ev_if, 25), 4)} for LoRA on the same init; step 50: {fmt(evrow(ev_fp, 50), 4)} vs {fmt(evrow(ev_if, 50), 4)}, and vs {fmt(evrow(ev_ib, 50), 4)} for the "
-                 f"LoRA-on-base arm). The step costs {step_s:.0f} s (LoRA arm: {lora_step:.0f} s) because micro-batch 8 pays "
-                 f"~22 TB/rank of FSDP all-gather/reduce-scatter traffic; the production arm was launched at this validated configuration and the recompute + "
-                 f"chunked-head knobs that reach micro-batch 24 are implemented but still hang in step 0 (§6)."),
+                 f"LoRA-on-base arm). The validated configuration costs {step_s:.0f} s per step (LoRA arm: {lora_step:.0f} s) because micro-batch 8 pays "
+                 f"~22 TB/rank of FSDP all-gather/reduce-scatter traffic; the production arm runs at it. Exact per-layer recompute + a chunked lm_head "
+                 f"(now the default) lift the micro-batch to 24 → <b>44 s/step</b> on 3 vLLM + 5 trainer GPUs and to 32 → <b>35 s/step</b> on 2 + 6 "
+                 f"(the engines still keep the queue full), after a hang caused by FSDP2's gradient-dependent reduce-scatter payload was root-caused and fixed (§2b)."),
         "kpis": {"items": [
             {"v": f"{pubsum['trainer_total_s_median']:.2f} s", "l": "per-step publish of 50.1 GB bf16 → 3 vLLM engines (NCCL)", "cls": "good"},
             {"v": f"{mean(dl):.3f}", "l": "sampler |Δlogp| after the pushes (LoRA arm 0.025)", "cls": "good"},
             {"v": f"{v0['reward']:.3f} → {vN['reward']:.3f}", "l": "reward, 50 steps, lr 1e-6 (LoRA 7e-6: 0.203 → 0.245)", "cls": "good"},
             {"v": f"{peak_train:.0f} GB", "l": "peak GPU memory per trainer rank (of 178)"},
-            {"v": f"{step_s:.0f} s", "l": f"seconds per step at micro-batch 8 (LoRA arm {lora_step:.0f} s)", "cls": "bad"},
+            {"v": f"{step_s:.0f} s", "l": f"s/step, production config (mb 8; LoRA arm {lora_step:.0f} s)", "cls": "bad"},
+            {"v": "35 s", "l": "s/step, fast default (recompute + chunked head, mb 32, 2 vLLM + 6 trainer)", "cls": "good"},
             {"v": fmt(evrow(ev_fp, 50), 4), "l": f"held-out mean_all at step 50 (LoRA same init {fmt(evrow(ev_if, 50), 4)}, LoRA on base {fmt(evrow(ev_ib, 50), 4)})", "cls": cls(evrow(ev_fp, 50), evrow(ev_if, 50))}]},
         "sections": {
             "curves": (f"50-step validation run <code>rl_fullparam_val50_lr1e-6</code> (wandb {val_id}) vs the LoRA ablation arms at the same steps: "
@@ -230,8 +232,12 @@ def main():
             "bench": ("Step-time configurations. The first 8-GPU bench of the fast configuration (--suffix-ckpt --chunked-head --fsdp-prefetch 2, probe → micro-batch 24) "
                       "hung in step 0: FSDP2 reduce-scatters only the parameters that have a gradient, as one flat collective per group, and the zero-weight dummy "
                       "micro-batch that equalizes the micro-batch count across uneven shards bypassed lm_head under the chunked head → one rank's root reduce-scatter "
-                      "was shorter than the others' → all five NCCL watchdogs stuck. Reproduced and fixed on a 2-GPU trainer-only harness (table 1); the 8-GPU numbers "
-                      "of the fixed configuration are in table 2 when its bench has run."),
+                      "was shorter than the others' → all five NCCL watchdogs stuck. Reproduced and fixed on a 2-GPU trainer-only harness (table 1). Table 2: the fixed "
+                      "configuration on 8×B200 — 3 vLLM + 5 trainer at micro-batch 24 (43–45 s/step steady; the mean includes step 1's Triton autotune) and 2 vLLM + 6 "
+                      "trainer at micro-batch 32 (35–36 s/step; the two engines still keep the 32-block queue full, so the rollout side is not the bottleneck). An explicit "
+                      "<code>--micro-batch 32</code> on 3 + 5 (probe skipped) OOMed in step 0 (174 GB live during a forward; log in data/bench_mb32_3plus5_oom_launch.log) — "
+                      "the 5-rank fixed cost is ~8 GB/rank higher and the probe's linear extrapolation from 24 is optimistic there. Rewards, |Δlogp| and gradient norms of "
+                      "every fast-config bench step match the baseline's at the same seed (exact recompute)."),
             "bench_table": bench_table,
             "eval": eval_table + (f"<p>Step 25 of the full-parameter run scores <b>{fmt(evrow(ev_fp, 25), 4)}</b> mean_all vs {fmt(evrow(ev_if, 25), 4)} for the LoRA "
                                   f"arm on the same init and {fmt(evrow(ev_ib, 25), 4)} for the LoRA arm on the base + SFT adapter; SAE fired {fmt(evrow(ev_fp, 25, 'eval/sae/fired'))} "
@@ -240,11 +246,11 @@ def main():
                                   f"+{100 * (evrow(ev_fp, 50) - evrow(ev_if, 50)):.1f} pp over the LoRA arm that started from the same weights, at a 7× lower learning rate "
                                   f"(eval run <code>rl_fullparam_val50_lr1e-6_eval</code>). Same eval protocol, same clean scorer; one seed each, so treat ~0.5 pp as noise.</p>"),
             "limits": ("<ul>"
-                       "<li><b>Step time.</b> The production arm runs 68 s/step at micro-batch 8 vs 30 s for the LoRA arm — the FSDP2 traffic per micro-batch. The knobs "
-                       "that lift the micro-batch (--suffix-ckpt: exact per-layer recompute of the suffix forward; --chunked-head: no full logits; --fsdp-prefetch 2) are "
-                       "implemented, unit-tested for gradient equality on CPU, their probe reached micro-batch 24 at 106 GB, and the hang their first 8-GPU bench hit is "
-                       "root-caused and fixed (§2b). The production arm was launched before that fix on the validated micro-batch-8 configuration and is NOT hot-swapped: "
-                       "a mid-run switch would restart the AdamW moments (no --save-optim) and blur the ablation. Use the fast configuration for the next runs.</li>"
+                       "<li><b>Step time.</b> The production arm runs 68 s/step at micro-batch 8 (vs 30 s for the LoRA arm) — the FSDP2 traffic per micro-batch. The fast "
+                       "configuration (now rl_disagg's default for --full-param: --suffix-ckpt --chunked-head --fsdp-prefetch 2) reaches 44 s/step on 3 + 5 and 35 s/step "
+                       "on 2 + 6 (§2b); the ≤ 30 s target is not met — the remaining update time is still the per-micro-batch all-gather + fp32 reduce-scatter. Next levers: "
+                       "bf16 gradient reduce-scatter (−54 GB per micro-batch), --fsdp-keep-unsharded N (fullft), micro-batch 48 on 2 + 6. The production arm was launched "
+                       "before the fix and is deliberately NOT hot-swapped (a resume without --save-optim would restart the AdamW moments and confound the ablation).</li>"
                        "<li><b>Budget.</b> Development used ≈ 22 GPU-hours on 8×B200 (two failed smokes: probe fit + uneven-shard deadlock; the 50-step validation; one "
                        "failed fast-config bench) against the ≈ 12 asked for; the production arm is on top.</li>"
                        "<li><b>fs publish mode</b> implemented and CPU-tested, not exercised on the GPUs (the NCCL path met the target immediately).</li>"
