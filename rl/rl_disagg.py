@@ -1929,8 +1929,12 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix1.tolist()], [[inj_pos]], STEER_COEFF, device, torch.bfloat16, mode=inj_mode)
         with R.hooked(submodule, hook), fp.suffix_ctx():
             lg = policy_logits(ix1, Lc1, acc.cache if acc is not None else None)
-            (lg[..., :1].float().sum() * 0.0).backward()
-        del lg
+            # the dummy loss must reach EVERY parameter the real micro-batches reach: FSDP2 reduce-scatters only the params that
+            # have a grad, as ONE flat collective per group -> a rank whose lm_head.grad is None (chunked head bypassed) would
+            # issue a shorter reduce-scatter than the others and hang. Go through the (chunked) head like a real micro-batch.
+            lp1, _ = fp.logp_from(lg, ids[ix1, p_len:Lc1].to(device), a.vocab_chunk, False, a.fp32_head)
+            (lp1.float().sum() * 0.0).backward()
+        del lg, lp1
         if acc is not None:
             acc.accumulate()
     if acc is not None:

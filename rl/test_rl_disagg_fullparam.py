@@ -362,6 +362,35 @@ def test_chunked_head_matches_plain_fp32_head_gradients():
     assert not fp.head.active and fp.head.hidden is None
 
 
+# ------------------------------------------------------------------ dummy micro-batch reaches every parameter (FSDP2 reduce-scatter sizes)
+def test_dummy_micro_batch_gives_every_param_a_grad_with_chunked_head():
+    """FSDP2 reduce-scatters only params WITH grads as one flat collective per group: a dummy micro-batch whose loss skips lm_head
+    (chunked head) would make that rank's root reduce-scatter shorter than the others' -> hang. The dummy must go through the head."""
+    sp = importlib.util.spec_from_file_location("rl_hf", os.path.join(_HERE, "rl.py"))
+    R = importlib.util.module_from_spec(sp); sys.modules["rl_hf"] = R; sp.loader.exec_module(R)
+    m = _fsdp_policy(21)
+    fp = D.FullParamCtx(FP, FP.fullft_module(), 1, 0)
+    fp.head = FP.ChunkedHead(m)
+    a = D.parse_args(_BASE + ["--full-param", "--init-adapter", "none", "--chunked-head", "--fp32-head", "--vocab-chunk", "4", "--loss", "cispo",
+                              "--loss-agg", "prompt", "--group-size", "2", "--groups-per-step", "2", "--kl-coef", "0", "--max-grad-norm", "1e9"])
+    p_len, T, n = len(PROMPT), 4, 2
+    ids = torch.zeros((n, p_len + T), dtype=torch.long); attn = torch.zeros_like(ids)
+    for i in range(n):
+        ids[i, :p_len] = torch.tensor(PROMPT); ids[i, p_len:] = torch.randint(5, 500, (T,)); attn[i] = 1
+    # replicate the dummy block of update_disagg by hand: one short row through policy_logits + logp_from, zero-weight loss
+    sub = get_layer(m, 1)
+    dirs_rep = torch.nn.functional.normalize(torch.randn(n, 64), dim=-1)
+    hook = R.make_inject_hook([dirs_rep[:1]], [[MARKER]], 1.0, "cpu", torch.bfloat16, mode="add_clone")
+    with hooked(sub, hook), fp.suffix_ctx():
+        lg = m(input_ids=ids[:1], attention_mask=attn[:1], use_cache=False, logits_to_keep=T + 1).logits[:, :-1]
+        assert lg.shape[-1] == 1                                   # the chunked head returned its dummy
+        lp1, _ = fp.logp_from(lg, ids[:1, p_len:], a.vocab_chunk, False, a.fp32_head)
+        (lp1.float().sum() * 0.0).backward()
+    missing = [nme for nme, p in m.named_parameters() if p.grad is None]
+    assert not missing, f"params without a grad after the dummy pass (would desync FSDP2's reduce-scatter): {missing[:5]}"
+    assert m.lm_head.weight.grad is not None and float(m.lm_head.weight.grad.to_local().abs().sum()) == 0.0   # zero, but PRESENT
+
+
 # ------------------------------------------------------------------ full-param micro-batch probe planning
 def test_plan_probe_step_walks_up_within_budget():
     GB = 2**30
