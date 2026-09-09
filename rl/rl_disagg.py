@@ -296,8 +296,42 @@ def parse_args(argv=None):
                          "the clean base, so the rewards are unchanged up to bf16 kernel noise). The policy/KL-ref update needs no "
                          "such flag: update_disagg has always length-sorted its micro-batches (chunks(); trainer/pad_frac logs the "
                          "residual padding).")
+    # --full-param (rl/rl_fullparam.py): the POLICY is the whole model -- FSDP2 fp32 masters + AdamW over the Y trainer ranks
+    # (sft/fullft.py), bf16 weights pushed to the vLLM engines every step, full-model checkpoints. Off = every path above
+    # byte-identical (the LoRA path never touches these flags).
+    ap.add_argument("--full-param", action="store_true",
+                    help="train EVERY weight of the policy (FSDP2 over the trainer ranks, fp32 masters/AdamW, bf16 compute) instead of a "
+                         "LoRA. Init = --policy-base (a full model dir with SAVE_DONE) or MODEL; no --init-adapter/--ref-adapter; the "
+                         "reward scorer is a frozen FSDP2-sharded copy of MODEL; checkpoints are full HF model dirs (sft/fullft.py "
+                         "layout) at --save-steps/--save-every + final; inline eval unsupported (eval_ckpt_daemon --full-model)")
+    ap.add_argument("--publish-mode", choices=("nccl", "fs"), default="nccl",
+                    help="--full-param weight publish: nccl = NCCL broadcast trainer rank 0 -> every vLLM worker at a block boundary "
+                         "(default) | fs = bf16 shard files in --work-dir (RAM-backed; ~54 GB per kept step), engines load at their "
+                         "next block boundary")
+    ap.add_argument("--wu-port", type=int, default=0, help="--publish-mode nccl: TCP store port of the weight-update group (0 = --master-port + 111)")
+    ap.add_argument("--fs-keep-steps", type=int, default=2, help="--publish-mode fs: shard sets kept in --work-dir (each ~54 GB)")
+    ap.add_argument("--fsdp-prefetch", type=int, default=None, help="--full-param: explicit FSDP2 all-gather prefetch depth (sft/fullft.py; default 2 = the fast configuration; 0 = implicit one-ahead)")
+    ap.add_argument("--no-scorer-shard", dest="scorer_shard", action="store_false", default=True,
+                    help="--full-param: keep the frozen scorer copy of MODEL UNsharded on every rank (~35 GB/rank instead of ~7) -- debug only")
+    ap.add_argument("--mb-target-frac", type=float, default=0.0,
+                    help="micro-batch probe: largest candidate predicted under this fraction of GPU memory (0 = 0.85). --full-param: the "
+                         "budget also reserves the not-yet-allocated AdamW moments (2 x the fp32 master shard) and the probe walks the "
+                         "candidates upwards, measuring each (an OOM inside an FSDP2 forward is not recoverable)")
+    ap.add_argument("--suffix-ckpt", dest="suffix_ckpt", action="store_true", default=None,
+                    help="--full-param: exact per-layer activation checkpointing of the SUFFIX forward (sft/prefix_cache.SuffixCheckpointer; "
+                         "needs --prefix-cache): recompute in the backward -> the micro-batch grows 3x (8 -> 24 on 5 B200 ranks), i.e. that many fewer "
+                         "per-micro-batch FSDP2 all-gathers/reduce-scatters (the entire update cost). DEFAULT ON with --full-param + --prefix-cache "
+                         "(68 -> 44 s/step measured); --no-suffix-ckpt = the first validated configuration")
+    ap.add_argument("--no-suffix-ckpt", dest="suffix_ckpt", action="store_false")
+    ap.add_argument("--chunked-head", dest="chunked_head", action="store_true", default=None,
+                    help="--full-param: never materialize [tokens x 248k] logits -- lm_head + fp32 log-softmax + gather/entropy per --vocab-chunk "
+                         "positions under torch.utils.checkpoint (rl_fullparam.ChunkedHead; same math as --fp32-head + _chunked_logp). DEFAULT ON "
+                         "with --full-param; --no-chunked-head = the fp32-head hook")
+    ap.add_argument("--no-chunked-head", dest="chunked_head", action="store_false")
+    ap.add_argument("--save-optim", action="store_true", help="--full-param: also write the sharded AdamW state (torch.distributed.checkpoint, fp32, ~2x the model) next to each checkpoint")
+    ap.add_argument("--load-optim", default=None, help="--full-param: <ckpt>/optim_dcp dir to restore the AdamW state from (same world size)")
     a = ap.parse_args(argv)
-    for k in ("init_adapter", "ref_adapter", "policy_base"):   # launcher lists can only APPEND flags: `--init-adapter none` unsets an earlier one
+    for k in ("init_adapter", "ref_adapter", "policy_base", "load_optim"):   # launcher lists can only APPEND flags: `--init-adapter none` unsets an earlier one
         if getattr(a, k) in ("", "none", "None"):
             setattr(a, k, None)
     assert a.div_coef == 0 and a.firsttok_coef == 0
@@ -308,6 +342,32 @@ def parse_args(argv=None):
     if a.no_len_penalty:
         a.len_penalty_start = None
     _resolve_recipe(a)
+    if a.wu_port <= 0:
+        a.wu_port = a.master_port + 111
+    if a.mb_target_frac <= 0:
+        a.mb_target_frac = 0.85
+    if a.full_param:
+        assert a.init_adapter is None and a.ref_adapter is None, "--full-param: the policy init is --policy-base (a full model dir) or MODEL; no LoRA adapters (--init-adapter/--ref-adapter must be unset or 'none')"
+        assert a.inline_eval_every == 0, "--full-param: inline eval is not supported (checkpoints are full-model dirs: eval/eval_ckpt_daemon.py --full-model)"
+        assert a.backend == "nccl", "--full-param needs --backend nccl (FSDP2)"
+        assert not a.publish_fp32, "--full-param publishes bf16 weights (the engines run bf16)"
+        assert a.role in ("launch", "trainer", "rollout"), "--full-param has no bench roles"
+        if a.role in ("launch", "trainer"):
+            assert a.n_trainer >= 2, "--full-param needs >= 2 trainer ranks (fp32 masters + AdamW of the 27B do not fit one GPU)"
+        if a.autocast_bf16:   # FSDP2 MixedPrecisionPolicy(param_dtype=bf16) already runs the compute in bf16 (sft/pretrain.py does the same)
+            a.autocast_bf16 = False
+        # the FAST configuration is the default (bench 2026-09-09: 68 -> 44 s/step, peak 151 -> 139 GB); explicit --no-* flags opt out
+        if a.suffix_ckpt is None:
+            a.suffix_ckpt = bool(a.prefix_cache)
+        if a.chunked_head is None:
+            a.chunked_head = True
+        if a.fsdp_prefetch is None:
+            a.fsdp_prefetch = 2
+        assert not a.suffix_ckpt or a.prefix_cache, "--suffix-ckpt is a --prefix-cache knob"
+    else:
+        assert not (a.suffix_ckpt or a.chunked_head), "--suffix-ckpt / --chunked-head are --full-param knobs"
+        a.suffix_ckpt, a.chunked_head = False, False
+        a.fsdp_prefetch = a.fsdp_prefetch or 0
     if a.rollout_block_groups <= 0:
         a.rollout_block_groups = max(1, a.groups_per_step // max(a.n_rollout, 1))
     assert a.groups_per_step % a.rollout_block_groups == 0, "groups_per_step must be a multiple of rollout_block_groups"
@@ -536,11 +596,15 @@ def write_run_meta(a, path, micro_batch=None, step=None):
     from mxf.config import INJECT_LAYER, MODEL, READ_LAYER, TrainConfig
     tr = TrainConfig()
     ref_src = (a.ref_adapter or a.init_adapter) if a.kl_coef > 0 else None
-    meta = {"format": "rl_disagg_lora_v1", "policy_base": policy_base_of(a), "policy_base_is_model": policy_base_is_model(a),
+    full_param = bool(getattr(a, "full_param", False))
+    meta = {"format": "rl_disagg_fullparam_v1" if full_param else "rl_disagg_lora_v1", "full_param": full_param,
+            "policy_base": policy_base_of(a), "policy_base_is_model": policy_base_is_model(a),
             "scorer_base": MODEL, "tokenizer": MODEL, "init_adapter": a.init_adapter, "ref_adapter": ref_src,
-            "kl_ref": "none" if a.kl_coef <= 0 else ("adapter" if ref_src else "policy_base_lora_off"),
-            "lora": ("from init_adapter" if a.init_adapter else
+            "kl_ref": "none" if a.kl_coef <= 0 else ("frozen_init_copy" if full_param else ("adapter" if ref_src else "policy_base_lora_off")),
+            "lora": (None if full_param else "from init_adapter" if a.init_adapter else
                      {"r": tr.lora_r, "alpha": tr.lora_alpha, "rslora": True, "target_modules": "all-linear"}),
+            "publish_mode": getattr(a, "publish_mode", None) if full_param else "lora_adapter",
+            "checkpoint_layout": "full_model_bf16_base_layout (sft/fullft.py; SAVE_DONE)" if full_param else "peft_adapter",
             "inject_layer": INJECT_LAYER, "read_layer": READ_LAYER, "run_name": a.run_name, "save_dir": a.save_dir, "seed": a.seed,
             "micro_batch": micro_batch, "step": step, "argv": sys.argv[1:], "written_at": time.time()}
     os.makedirs(path, exist_ok=True)
@@ -811,10 +875,15 @@ class _PrefixGradAccumulator:
     gradients through the original prefix graph ONCE (chain rule -- not a frozen prefix). Summation order differs from the
     naive full-sequence path, so bf16 gradients agree to kernel noise, not bitwise. Build a new one after every update."""
 
-    def __init__(self, cache):
+    def __init__(self, cache, extra_outputs=None):
+        """extra_outputs (--full-param): prefix-graph tensors that must receive a ZERO gradient in the final backward -- the
+        prefix logits: the loss depends on the prefix only through the caches, so the LAST layer's / the root's output never
+        gets a gradient and FSDP2's pre-backward unshard hook (hung on module outputs) would not fire for them
+        (sft/prefix_cache.PrefixGradientAccumulator extra_outputs; no-op for the LoRA path)."""
         import copy
         import torch
         self._pairs, self._sums, self._finished = [], [], False
+        self._extra = [t for t in (extra_outputs or []) if t is not None and t.requires_grad]
         seen = {}
 
         def detach(v):
@@ -861,11 +930,13 @@ class _PrefixGradAccumulator:
         for (orig, _), g in zip(self._pairs, self._sums):
             if g is not None:
                 outs.append(orig); grads.append(g.to(orig.dtype))
+        for t in self._extra:                       # zero-weight grad path (FSDP2 unshard hooks on the last layer's / root's output)
+            outs.append(t); grads.append(torch.zeros_like(t))
         if outs:
             torch.autograd.backward(outs, grads)
         self._finished = True
         self.cache = None
-        self._pairs.clear(); self._sums.clear()
+        self._pairs.clear(); self._sums.clear(); self._extra = []
 
 
 class PrefixRunner:
@@ -883,10 +954,12 @@ class PrefixRunner:
         self.actor, self.device, self.P = actor, device, int(marker)
         self._prefix = torch.tensor(list(prompt_ids[:marker]), dtype=torch.long, device=device)[None]
 
-    def run_prefix(self, autocast_cm=None):
+    def run_prefix(self, autocast_cm=None, return_logits=False):
         with (autocast_cm if autocast_cm is not None else contextlib.nullcontext()):
             out = self.actor(input_ids=self._prefix, use_cache=True, logits_to_keep=1)
         assert out.past_key_values is not None, "prefix forward returned no cache"
+        if return_logits:   # --full-param: the [1, 1, V] prefix logits = the zero-grad path FSDP2 needs (see _PrefixGradAccumulator)
+            return out.past_key_values, out.logits
         return out.past_key_values
 
     def suffix_logits(self, cache, ids_suf, attn_suf):
@@ -997,6 +1070,251 @@ class _GenCfgStub:
     """rl.py's _eos_ids(tok, actor) only reads actor.generation_config -- rollout ranks have no actor."""
     def __init__(self, gen_cfg):
         self.generation_config = gen_cfg
+
+
+
+# ----------------------------------------------------------------------------------------------
+# --full-param (rl/rl_fullparam.py): trainer-side glue. Everything here is only reached when a.full_param is set.
+# ----------------------------------------------------------------------------------------------
+class FullParamCtx:
+    """What update_disagg / find_micro_batch / the publish + save paths need to know about the FSDP2 policy."""
+
+    def __init__(self, FP, FT, world, rank):
+        self.FP, self.FT, self.world, self.rank = FP, FT, world, rank
+        self.inject_mode = "add_clone"        # FSDP2 hangs backward hooks on the layer output: never modify it in place
+        self.ref_model = self.ref_submodule = self.ref_pfx = None
+        self.manifest = None
+        self.comm = None                      # rank 0: TrainerWeightComm (publish-mode nccl), created at the first publish
+        self.nontext_shard = None
+        self.last_pub = {}
+        self.pub_hist = []
+        self.mem = {}
+        self.ckpt = None                      # --suffix-ckpt: rl_fullparam.suffix_checkpointer(actor)
+        self.head = None                      # --chunked-head: rl_fullparam.ChunkedHead(actor)
+
+    @contextlib.contextmanager
+    def suffix_ctx(self):
+        """Around every suffix forward/backward of the policy: checkpointing on, chunked head capturing."""
+        if self.ckpt is not None:
+            self.ckpt.enabled = True
+        if self.head is not None:
+            self.head.active = True
+        try:
+            yield
+        finally:
+            if self.ckpt is not None:
+                self.ckpt.enabled = False
+            if self.head is not None:
+                self.head.active, self.head.hidden = False, None
+
+    def logp_from(self, logits, tgt, vocab_chunk, need_entropy_grad, fp32_head):
+        """new_lp / entropy for a micro-batch: from the stashed head input (--chunked-head) or from the logits (_chunked_logp)."""
+        if self.head is not None:
+            return self.head.logp(self.head.hidden[:, :-1], tgt, vocab_chunk, need_entropy_grad, fp32=fp32_head)
+        return _chunked_logp(logits, tgt, vocab_chunk, need_entropy_grad)
+
+
+def load_scorer_fullparam(a, device, world, tag, use_gates, need_logits=False):
+    """--full-param REWARD model: a frozen bf16 copy of the ORIGINAL base MODEL on every trainer rank, truncated to layers
+    [0, READ_LAYER] with a TinyHead when nothing needs logits (gates off, no KL-on-MODEL), FSDP2-sharded over the trainer
+    ranks (--scorer-shard, default: ~7 GB/rank instead of ~35). Read through rl_fullparam.read_resid_noraise (installed as
+    rl_hf.read_resid): the forward runs to its end so FSDP2's hooks all fire."""
+    import torch
+    import rl_fullparam as FP
+    from transformers import AutoModelForCausalLM
+    from mxf.config import MODEL, READ_LAYER
+    n_keep = a.scorer_layers
+    if n_keep == 0:
+        n_keep = -1 if (use_gates or need_logits) else READ_LAYER + 1
+    assert n_keep == -1 or n_keep > READ_LAYER, f"--scorer-layers {n_keep} would drop the read layer {READ_LAYER}"
+    assert n_keep == -1 or not (use_gates or need_logits), "the gates / KL-on-MODEL need the scorer's logits: use --scorer-layers -1"
+    t0 = time.time()
+    base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+    base.eval()
+    for p in base.parameters():
+        p.requires_grad_(False)
+    n_layers, head_dropped = FP.truncate_scorer_fsdp_safe(base, n_keep)
+    if a.scorer_shard:
+        FP.shard_frozen_bf16(base, world)
+    gc.collect(); torch.cuda.empty_cache()
+    _log(tag, f"scorer = frozen ORIGINAL base {MODEL} ({len(base.model.layers)}/{n_layers} layers{', lm_head -> TinyHead' if head_dropped else ''}, "
+              f"{'FSDP2-sharded over ' + str(world) + ' ranks' if a.scorer_shard else 'UNsharded'}) loaded in {time.time() - t0:.0f}s | "
+              f"resident now {torch.cuda.memory_allocated() / 2**30:.1f} GB")
+    return BaseActor(base)
+
+
+def _publish_fullparam(fp, actor, submodule, prompt, marker, device, work, step, tag, a, is_main, world, initial=False):
+    """COLLECTIVE over the trainer ranks: ||h_marker|| of the policy (FSDP forward) + the bf16 weights to the engines
+    (rl_fullparam.publish_nccl / write_shard_file), then rank 0 writes lora/step_<k>/meta.json and flips `latest`.
+    initial=True (step_offset): the engines loaded exactly these weights from disk -- meta only."""
+    import torch
+    import torch.distributed as dist
+    import rl_hf as R
+    FP = fp.FP
+    t0 = time.time()
+    with torch.no_grad():
+        hnorm = R._marker_norm(actor, submodule, prompt, marker, device, adapter=True)
+    FP.reshard_root(actor)   # the no-grad forward left embed/norm/lm_head gathered: back to the fp32 DTensor shards before iterating params
+    t_norm = time.time() - t0
+    d = f"{work}/lora/step_{step}"
+    if is_main:
+        os.makedirs(d, exist_ok=True)
+    tm, checks, mode = {}, {}, "initial"
+    if not initial and a.publish_mode == "nccl":
+        mode = "nccl"
+
+        def comm_getter():   # rank 0, after every engine wrote its ready file: the workers join the group in wu_init right after
+            if fp.comm is None:
+                fp.comm = FP.TrainerWeightComm("127.0.0.1", a.wu_port, a.n_rollout, device)
+                _log(tag, f"weight-update NCCL group up ({fp.comm.world} members: trainer rank 0 + {a.n_rollout} vLLM workers) in {fp.comm.init_s:.1f}s")
+            return fp.comm
+        tm, checks = FP.publish_nccl(actor, fp.manifest, comm_getter, is_main, work, step, a.n_rollout, ready_timeout_s=1800,
+                                     log=lambda m: _log(tag, m), stop=lambda: _stop_requested(work))
+        if tm.get("aborted"):
+            return hnorm, time.time() - t0
+    elif not initial:
+        mode = "fs"
+        tm_r = FP.write_shard_file(actor, fp.manifest, f"{d}/shard_{fp.rank}.safetensors", fp.rank)
+        loc = FP.local_check_abs_sums(actor, fp.manifest)
+        checks = FP.all_reduce_dict_sum(loc, device)
+        if world > 1:
+            dist.barrier()
+        tm = {"t_transfer": time.time() - t0 - t_norm, "gb": tm_r["gb"] * world, "to_cpu_s": tm_r["to_cpu_s"], "write_s": tm_r["write_s"]}
+        if is_main:
+            FP.prune_fs_steps(work, a.fs_keep_steps)
+    if is_main:
+        meta = {"step": step, "hnorm": hnorm, "mode": mode, "checks": checks, "t": time.time(), "timing": tm, "n_tensors": len(fp.manifest["names"])}
+        _atomic_write_text(f"{d}/meta.json", json.dumps(meta))
+        _atomic_write_text(f"{work}/lora/latest", str(step))
+        for old in sorted(glob.glob(f"{work}/lora/step_*"), key=lambda q: int(q.rsplit("_", 1)[-1]))[:-a.keep_loras]:
+            shutil.rmtree(old, ignore_errors=True)
+    tot = time.time() - t0
+    fp.last_pub = {**{k: v for k, v in tm.items() if isinstance(v, (int, float))}, "hnorm_s": t_norm, "total_s": tot}
+    fp.pub_hist.append({"step": step, "mode": mode, **fp.last_pub})
+    if is_main and (step <= a.step_offset + 2 or step % 10 == 0):
+        _log(tag, f"publish step {step} [{mode}]: hnorm {t_norm:.2f}s | " + " ".join(f"{k} {v:.2f}" for k, v in tm.items() if isinstance(v, (int, float))) + f" | total {tot:.2f}s")
+    return hnorm, tot
+
+
+def _save_fullparam_ckpt(fp, actor, path, tok, is_main, world, a, mb, step, opt, tag, final=False):
+    """COLLECTIVE: full HF model dir (sft/fullft.py layout, SAVE_DONE last) + run_meta.json (+ optim_dcp/ with --save-optim)."""
+    import torch.distributed as dist
+    from mxf.config import MODEL
+    t0 = time.time()
+    fp.FP.save_full_checkpoint(actor, path, tok, MODEL, is_main, world, fp.nontext_shard, log=lambda m: _log(tag, m),
+                               extra_meta={"step": step, "optimizer_updates": (step if final else step + 1), "run_name": a.run_name, "lr": a.lr,
+                                           "rl_fullparam": True, "policy_base": policy_base_of(a), "publish_mode": a.publish_mode})
+    if is_main:
+        write_run_meta(a, path, mb, step=step)
+    if a.save_optim:
+        fp.FP.save_optim_dcp(actor, opt, f"{path}/optim_dcp", log=lambda m: _log(tag, m))
+    if world > 1:
+        dist.barrier()
+    if is_main:
+        _log(tag, f"full-model checkpoint {path} written in {time.time() - t0:.0f}s (step {step}{', final' if final else ''})")
+
+
+class _FullParamSync:
+    """Rollout-side --full-param weight refresh (one per rollout rank). nccl: when the trainer flags lora/pending = k, write
+    lora/ready_<r>_<k>, join the weight-update group (first time), receive step k into the engine (worker.wu_recv), wait for
+    lora/latest == k and verify the checksums. fs: load lora/step_<k>/shard_*.safetensors when `latest` moves. Only ever
+    called between generate() calls (a block boundary)."""
+
+    def __init__(self, llm, a, rank, work, tag):
+        self.llm, self.a, self.rank, self.work, self.tag = llm, a, rank, work, tag
+        self.manifest_path = f"{work}/lora/manifest.json"
+        self.inited = False
+        self.cur_step = None
+        self.hnorm = None
+        self.hist = []
+
+    def _meta(self, k, timeout_s=1800):
+        p = f"{self.work}/lora/step_{k}/meta.json"
+        t0 = time.time()
+        while True:
+            try:
+                with open(p) as f:
+                    return json.load(f)
+            except (FileNotFoundError, ValueError):
+                if time.time() - t0 > timeout_s:
+                    raise
+                time.sleep(0.02)
+
+    def initial(self):
+        k = _read_latest(self.work)
+        m = self._meta(k)
+        self.cur_step, self.hnorm = k, float(m["hnorm"])
+        return k
+
+    def pending(self):
+        return self.a.publish_mode == "nccl" and os.path.exists(f"{self.work}/lora/pending")
+
+    def _verify(self, k, meta, res):
+        import rl_fullparam as FP
+        bad = FP.verify_checks(meta.get("checks", {}), res.get("checks", {}))
+        if bad:
+            raise RuntimeError(f"weight publish step {k}: engine checksums differ from the trainer's: {bad}")
+
+    def poll(self):
+        """-> True when the engine now serves a newer step."""
+        a, work = self.a, self.work
+        if a.publish_mode == "nccl":
+            pend = f"{work}/lora/pending"
+            try:
+                with open(pend) as f:
+                    k = int(f.read().strip())
+            except (FileNotFoundError, ValueError):
+                return False
+            if k == self.cur_step:
+                return False
+            t0 = time.time()
+            open(f"{work}/lora/ready_{self.rank}_{k}", "w").close()
+            if not self.inited:
+                import rl_fullparam as FP
+                FP.wait_for_files([self.manifest_path], 1800)
+                info = self.llm.collective_rpc("wu_init", args=("127.0.0.1", a.wu_port, 1 + self.rank, 1 + a.n_rollout, self.manifest_path))[0]
+                self.inited = True
+                _log(self.tag, f"weight-update group joined as rank {info['rank']}/{info['world']} in {info['init_s']:.1f}s ({info['n_tensors']} tensors, {info['gb']:.1f} GB bf16 per publish)")
+            res = self.llm.collective_rpc("wu_recv", args=(k,))[0]
+            t_recv = time.time() - t0
+            while _read_latest(work) != k:          # rank 0 writes meta + latest right after its last broadcast
+                if _stop_requested(work):
+                    return False
+                time.sleep(0.02)
+            meta = self._meta(k)
+            self._verify(k, meta, res)
+            self.cur_step, self.hnorm = k, float(meta["hnorm"])
+            rec = {"step": k, "mode": "nccl", "wall_s": time.time() - t0, "recv_s": t_recv, "engine_load_s": res["load_s"], "gb": res["gb"], "gbps": res["gbps"],
+                   "n_vllm_params": res["n_vllm_params_loaded"]}
+            self.hist.append(rec)
+            if k <= a.step_offset + 2 or k % 10 == 0:
+                _log(self.tag, f"weights -> step {k} [nccl]: {res['gb']:.1f} GB in {res['load_s']:.2f}s ({res['gbps']:.0f} GB/s), {res['n_vllm_params_loaded']} vLLM params, "
+                               f"checksums OK, engine stalled {rec['wall_s']:.2f}s")
+            return True
+        # fs
+        k = _read_latest(work)
+        if k is None or k == self.cur_step:
+            return False
+        meta = self._meta(k)
+        if meta.get("mode") == "initial":
+            self.cur_step, self.hnorm = k, float(meta["hnorm"])
+            return True
+        t0 = time.time()
+        res = self.llm.collective_rpc("wu_load_fs", args=(f"{work}/lora/step_{k}", self.manifest_path))[0]
+        self._verify(k, meta, res)
+        self.cur_step, self.hnorm = k, float(meta["hnorm"])
+        rec = {"step": k, "mode": "fs", "wall_s": time.time() - t0, "engine_load_s": res["load_s"], "gb": res["gb"], "gbps": res["gbps"],
+               "n_vllm_params": res["n_vllm_params_loaded"]}
+        self.hist.append(rec)
+        if k <= a.step_offset + 2 or k % 10 == 0:
+            _log(self.tag, f"weights -> step {k} [fs]: {res['gb']:.1f} GB in {res['load_s']:.2f}s ({res['gbps']:.0f} GB/s), checksums OK, engine stalled {rec['wall_s']:.2f}s")
+        return True
+
+    def dump(self):
+        try:
+            json.dump(self.hist, open(f"{self.work}/fullparam_sync_r{self.rank}.json", "w"), indent=1)
+        except Exception:  # noqa
+            pass
 
 
 # ==============================================================================================
@@ -1238,6 +1556,9 @@ def run_rollout(a):
     # the engine can load while the trainer is still loading the actor; the first block waits for step 0
     if not policy_base_is_model(a):
         _log(tag, f"policy base = {check_policy_base(a)} (full-FT checkpoint served by vLLM; tokenizer/prompt/eos from {MODEL})")
+    if a.full_param:   # the engine serves the policy weights themselves (no LoRA slots); they are refreshed IN PLACE every step
+        a.engine_lora = False
+        _log(tag, f"FULL-PARAMETER policy: engine serves {policy_base_of(a)} without LoRA; weights refreshed via {a.publish_mode} at block boundaries")
     llm = _build_engine(a, rank, p_len, a.max_num_seqs, a.cuda_graphs, tag)
     t_wait = time.time()
     while _read_latest(work) is None:
@@ -1246,9 +1567,14 @@ def run_rollout(a):
         time.sleep(1.0)
     _log(tag, f"first adapter published after {time.time() - t_wait:.0f}s of waiting")
     cur_step, lora_req, hnorm = None, None, None
+    fsync = _FullParamSync(llm, a, rank, work, tag) if a.full_param else None
 
     def refresh():
         nonlocal cur_step, lora_req, hnorm
+        if fsync is not None:
+            sw = fsync.poll() if fsync.cur_step is not None else bool(fsync.initial())
+            cur_step, hnorm = fsync.cur_step, fsync.hnorm
+            return sw
         k = _read_latest(work)
         if k is None or k == cur_step:
             return False
@@ -1298,6 +1624,8 @@ def run_rollout(a):
         while depth() >= a.max_queue_blocks:                           # backpressure: bounded lag, no wasted rollouts
             if _stop_requested(work):
                 return
+            if fsync is not None and fsync.pending():                  # --full-param nccl: the trainer waits for THIS rank at a block boundary
+                refresh()
             if eval_job() is not None:
                 break                                                  # -> top of the loop: eval chunk instead of idling
             time.sleep(0.25 + 0.05 * rank)
@@ -1328,6 +1656,8 @@ def run_rollout(a):
                   f"{n_tok} tok in gen {gen_s:.1f}s ({n_tok / gen_s:.0f} tok/s, {len(gen_ids) / gen_s:.1f} seq/s) "
                   f"| appended_stop {appended} | wall {time.time() - t0:.1f}s | queue {len(_queue_files(work))}")
         blk += 1
+    if fsync is not None:
+        fsync.dump()
     _log(tag, "STOP seen, exiting")
 
 
@@ -1460,7 +1790,7 @@ def _chunked_logp(logits, targets, vocab_chunk, need_entropy_grad):
     return torch.cat(lp_chunks, 1), torch.cat(ent_chunks, 1)
 
 
-def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=None, pfx=None):
+def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=None, pfx=None, fp=None):
     """rl.py update() with: vLLM sampler logprobs as old_lp (ratio := 1 where the sampler logp is unknown, i.e.
     the re-appended stop token), logits only for the completion positions (logits_to_keep), fp32 vocab math
     in chunks, use_cache off, exact weighted grad sync. Returns rl.py's stats + sampler_abs_dlogp.
@@ -1469,7 +1799,11 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     original arithmetic bit for bit.
     pfx (--prefix-cache, a PrefixRunner): the shared prompt prefix runs once per pass and only [marker]+response per rollout
     (suffix logits [:, :-1] == the full path's logits_to_keep=Tc+1 [:, :-1]); loss weights, denominators, IS weights and the
-    micro-batch composition are untouched -- only how the logits are computed changes."""
+    micro-batch composition are untouched -- only how the logits are computed changes.
+    fp (--full-param, a FullParamCtx): FSDP2 policy -- inject hook on a CLONE (FSDP2 hangs backward hooks on the layer output),
+    the KL reference is fp.ref (a separate frozen model + its own inject layer / prefix runner), no _sync_grads (FSDP2 reduce-
+    scatters every backward and AVERAGES over ranks, so the local loss is scaled by sync_w * world / sum(sync_w) up front =
+    the same weighted mean), DTensor-aware grad clipping, prefix logits as the zero-grad path. fp=None = the LoRA path, unchanged."""
     import torch
     import torch.distributed as dist
     import rl_hf as R
@@ -1482,6 +1816,17 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     lo, hi = 1 - a.clip_eps, 1 + a.clip_eps
     trunc_cap = a.cispo_eps_max if a.loss == "cispo" else a.tis_cap
     inj_pos = 0 if pfx is not None else marker            # prefix-cache: the marker is suffix index 0
+    inj_mode = fp.inject_mode if fp is not None else "add"
+    scale = 1.0
+    tot_w_fp = None
+    n_mb_max = n_ref_max = 0
+    if fp is not None:   # weighted-mean grad over uneven shards, FSDP2 style (rl_fullparam.loss_scale; sum(sync_w) == 0 -> skipped step)
+        tot_w_fp = fp.FP.all_reduce_scalar(sync_w, device)
+        scale = fp.FP.loss_scale(sync_w, tot_w_fp, fp.world)
+        # every FSDP2 forward/backward is a collective: with uneven shards (512 groups over 5 ranks = 103/103/102/102/102) the ranks
+        # would otherwise run different numbers of micro-batches and deadlock -> ranks with fewer run zero-weight dummies (below)
+        n_mb_max = int(fp.FP.all_reduce_max(-(-n // mb), device))
+        n_ref_max = int(fp.FP.all_reduce_max(-(-n // a.ref_micro_batch), device)) if a.kl_coef > 0 else 0
     t_ref = time.time()
     # micro-batches of LENGTH-SORTED rollouts, each padded only to ITS longest sequence: the loss weights are
     # per-sequence and independent of batching, so this is exactly the same gradient as global padding while
@@ -1496,28 +1841,40 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
             # shapes -> far fewer fla Triton autotune stalls in the first steps)
             yield ix, p_len + min(T, -(-int(lens[ix].max()) // 16) * 16)
 
-    def policy_logits(ix, Lc, cache=None):
+    def model_logits(model, pf, ix, Lc, cache=None):
         """[len(ix), Tc, V]: logits predicting completion tokens 0..Tc-1 (Tc = Lc - p_len), full-sequence or prefix-cached."""
-        if pfx is not None:
-            return pfx.suffix_logits(cache, ids[ix, marker:Lc].to(device), attn[ix, marker:Lc].to(device))[:, :-1]
-        return actor(input_ids=ids[ix, :Lc].to(device), attention_mask=attn[ix, :Lc].to(device), use_cache=False,
+        if pf is not None:
+            return pf.suffix_logits(cache, ids[ix, marker:Lc].to(device), attn[ix, marker:Lc].to(device))[:, :-1]
+        return model(input_ids=ids[ix, :Lc].to(device), attention_mask=attn[ix, :Lc].to(device), use_cache=False,
                      logits_to_keep=Lc - p_len + 1).logits[:, :-1]
+
+    def policy_logits(ix, Lc, cache=None):
+        return model_logits(actor, pfx, ix, Lc, cache)
     ref_lp_all = None
     if a.kl_coef > 0:
         ref_lp_all = torch.zeros_like(old_lp)
-        with _ref_policy(actor), torch.no_grad():   # 'ref' adapter (as before) or, without one, the policy base with the LoRA off
-            cache_ref = pfx.run_prefix() if pfx is not None else None      # ref policy's prefix, no grad
+        # LoRA: the 'ref' adapter (as before) or, without one, the policy base with the LoRA off. --full-param: fp.ref = a frozen
+        # copy of the init (its own inject layer and prefix runner), run exactly like the policy pass below.
+        ref_model, ref_sub, ref_pfx = (fp.ref_model, fp.ref_submodule, fp.ref_pfx) if fp is not None else (actor, submodule, pfx)
+        with (contextlib.nullcontext() if fp is not None else _ref_policy(actor)), torch.no_grad():
+            cache_ref = ref_pfx.run_prefix() if ref_pfx is not None else None      # ref policy's prefix, no grad
             for ix, Lc in chunks(a.ref_micro_batch):
                 Tc = Lc - p_len
                 tgt = ids[ix, p_len:Lc].to(device)
                 hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[inj_pos]] * len(ix),
-                                          STEER_COEFF, device, torch.bfloat16)
-                with R.hooked(submodule, hook):
-                    lg = policy_logits(ix, Lc, cache_ref)
+                                          STEER_COEFF, device, torch.bfloat16, mode=inj_mode)
+                with R.hooked(ref_sub, hook):
+                    lg = model_logits(ref_model, ref_pfx, ix, Lc, cache_ref)
                 for c0 in range(0, Tc, a.vocab_chunk):
                     c1 = min(c0 + a.vocab_chunk, Tc)
                     ref_lp_all[ix, c0:c1] = torch.log_softmax(lg[:, c0:c1].float(), -1).gather(
                         -1, tgt[:, c0:c1, None]).squeeze(-1).cpu()
+                del lg
+            for _ in range(n_ref_max - (-(-n // a.ref_micro_batch))):      # FSDP2: equal forward counts on every rank
+                ix1, Lc1 = order[:1], p_len + min(T, 16)
+                hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix1.tolist()], [[inj_pos]], STEER_COEFF, device, torch.bfloat16, mode=inj_mode)
+                with R.hooked(ref_sub, hook):
+                    lg = model_logits(ref_model, ref_pfx, ix1, Lc1, cache_ref)
                 del lg
             del cache_ref
     t_ref = time.time() - t_ref
@@ -1529,7 +1886,12 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
     body_tok = 0                 # tokens actually run through the transformer body this pass (prompt/prefix + response + pad)
     if pfx is not None:   # ONE differentiable prefix forward for the whole step; its backward runs once after the micro-batches
         with _policy_precision(actor, a.autocast_bf16):
-            acc = _PrefixGradAccumulator(pfx.run_prefix())
+            if fp is not None:   # FSDP2: the prefix logits carry the zero-weight grad path (see _PrefixGradAccumulator)
+                cache0, lg0 = pfx.run_prefix(return_logits=True)
+                acc = _PrefixGradAccumulator(cache0, extra_outputs=[lg0])
+                del cache0, lg0
+            else:
+                acc = _PrefixGradAccumulator(pfx.run_prefix())
         body_tok += pfx.P
     for ix, Lc in chunks(mb):
         Tc = Lc - p_len
@@ -1537,12 +1899,15 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         tgt = ids[ix, p_len:Lc].to(device)
         m = gen_mask[ix, :Tc].to(device); w = w_all[ix, :Tc].to(device); A = adv[ix, None].to(device)
         olp = old_lp[ix, :Tc].to(device); kn = known[ix, :Tc].to(device)
-        hook = _hook_outside_autocast(R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[inj_pos]] * len(ix), STEER_COEFF, device, torch.bfloat16),
+        hook = _hook_outside_autocast(R.make_inject_hook([dirs_rep[i : i + 1] for i in ix.tolist()], [[inj_pos]] * len(ix), STEER_COEFF, device, torch.bfloat16, mode=inj_mode),
                                       a.autocast_bf16)
-        with R.hooked(submodule, hook):
+        with R.hooked(submodule, hook), (fp.suffix_ctx() if fp is not None else contextlib.nullcontext()):
             with _policy_precision(actor, a.autocast_bf16):   # --autocast-bf16: bf16 LoRA matmuls/activations; fp32 vocab math below is outside
                 logits = policy_logits(ix, Lc, acc.cache if acc is not None else None)
-            new_lp, ent = _chunked_logp(logits, tgt, a.vocab_chunk, a.entropy_coef > 0)
+            if fp is not None:
+                new_lp, ent = fp.logp_from(logits, tgt, a.vocab_chunk, a.entropy_coef > 0, a.fp32_head)
+            else:
+                new_lp, ent = _chunked_logp(logits, tgt, a.vocab_chunk, a.entropy_coef > 0)
             del logits
             olp_eff = torch.where(kn, olp, new_lp.detach())
             loss_tok, ratio, rho = pg_token_loss(new_lp, olp_eff, A, a.loss, a.clip_eps, a.tis_cap, a.cispo_eps_max)
@@ -1556,7 +1921,11 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
                 kl = (torch.exp(delta) - delta - 1).clamp(0.0, a.kl_cap)
                 loss = loss + a.kl_coef * (kl * w).sum()
                 kl_sum += float((kl.detach() * m).sum())
+            if fp is not None:
+                loss = loss * scale       # FSDP2 mean over ranks -> sync_w-weighted mean (loss/loss stats stay the unscaled local value)
             loss.backward()
+            if fp is not None and scale > 0:
+                loss = loss / scale
         if acc is not None:
             acc.accumulate()
         loss_sum += loss.item()
@@ -1568,13 +1937,28 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         mk = m & kn
         dlp_sum += float(((new_lp.detach() - olp).abs() * mk).sum()); dlp_n += int(mk.sum())
         del new_lp, ent, ratio, loss, olp_eff, loss_tok, rho, eff
+    for _ in range(n_mb_max - (-(-n // mb))):   # FSDP2: zero-weight dummy micro-batches so every rank issues the same collectives
+        ix1, Lc1 = order[:1], p_len + min(T, 16)
+        hook = R.make_inject_hook([dirs_rep[i : i + 1] for i in ix1.tolist()], [[inj_pos]], STEER_COEFF, device, torch.bfloat16, mode=inj_mode)
+        with R.hooked(submodule, hook), fp.suffix_ctx():
+            lg = policy_logits(ix1, Lc1, acc.cache if acc is not None else None)
+            # the dummy loss must reach EVERY parameter the real micro-batches reach: FSDP2 reduce-scatters only the params that
+            # have a grad, as ONE flat collective per group -> a rank whose lm_head.grad is None (chunked head bypassed) would
+            # issue a shorter reduce-scatter than the others and hang. Go through the (chunked) head like a real micro-batch.
+            lp1, _ = fp.logp_from(lg, ids[ix1, p_len:Lc1].to(device), a.vocab_chunk, False, a.fp32_head)
+            (lp1.float().sum() * 0.0).backward()
+        del lg, lp1
+        if acc is not None:
+            acc.accumulate()
     if acc is not None:
         acc.backward()               # the summed cache gradients through the shared prefix forward, once
     t_fb = time.time() - t_fb
     params = [p for p in actor.parameters() if p.requires_grad]
     t_sync = time.time()
     tot_w = sync_w
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+    if fp is not None:
+        tot_w = tot_w_fp             # FSDP2 already reduce-scattered (and averaged) every micro-batch's grads; the loss scaling did the weighting
+    elif dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         tot_w = _sync_grads(params, sync_w, a.backend, device)
     t_sync = time.time() - t_sync
     skipped = 0
@@ -1582,7 +1966,7 @@ def update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known
         opt.zero_grad(set_to_none=True); gn = 0.0; skipped = 1
         print("[update] empty effective batch (every group zero-variance) -- skipping step", flush=True)
     else:
-        gn = float(torch.nn.utils.clip_grad_norm_(params, a.max_grad_norm))
+        gn = fp.FT.clip_grad_norm(params, a.max_grad_norm) if fp is not None else float(torch.nn.utils.clip_grad_norm_(params, a.max_grad_norm))
         if math.isfinite(gn):
             opt.step()
         else:
@@ -1622,7 +2006,7 @@ def _mb_candidates(a):
     return cands
 
 
-def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx=None):
+def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx=None, fp=None):
     """Largest micro-batch whose forward+backward at MAX length (prompt + max_new_tokens) fits with <90% of the GPU
     allocated. Synthetic tokens; same hook, same chunked vocab math as update_disagg. pfx (--prefix-cache): the probe
     runs the prefix-cached suffix path (prefix fwd + expanded cache + [marker]+max_new_tokens suffix + prefix bwd), i.e.
@@ -1632,11 +2016,16 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
     under 85% of the GPU and VERIFY it (<90%); only on a failed verification step down. The old descending scan started at
     mb=64 and OOM'd on purpose -- on the H200:4 run a CUDA OOM mid-forward left the partial graph resident (every later
     candidate saw ~138 GB 'allocated by PyTorch' on a 140 GB card, with only 56.6 GB resident before the scan), so this
-    probe never OOMs by design. Each attempt runs in its own function so no local of a failed attempt can outlive it."""
+    probe never OOMs by design. Each attempt runs in its own function so no local of a failed attempt can outlive it.
+    fp (--full-param): the FSDP2 policy -- clone-mode inject hook, prefix logits as the zero-grad path, and a lower target
+    fraction (--mb-target-frac 0.80): an OOM inside an FSDP2 forward/backward leaves its state machine inconsistent, so a
+    failed verification is FATAL here (pass --micro-batch explicitly) instead of stepping down."""
     import torch
     import torch.nn.functional as F
     import rl_hf as R
     from mxf.config import D_MODEL, STEER_COEFF
+    inj_mode = fp.inject_mode if fp is not None else "add"
+    frac = float(getattr(a, "mb_target_frac", 0.85) or 0.85)
     L = len(prompt_ids) + a.max_new_tokens
     p_len = len(prompt_ids)
     total = torch.cuda.get_device_properties(0).total_memory
@@ -1658,11 +2047,15 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
             dirs = F.normalize(torch.randn(mb, D_MODEL, device=device), dim=-1)
             ac = getattr(a, "autocast_bf16", False)
             hook = _hook_outside_autocast(R.make_inject_hook([dirs[i : i + 1] for i in range(mb)], [[0 if pfx is not None else marker]] * mb,
-                                                             STEER_COEFF, device, torch.bfloat16), ac)
+                                                             STEER_COEFF, device, torch.bfloat16, mode=inj_mode), ac)
             acc = None
             if pfx is not None:
                 with _policy_precision(actor, ac):
-                    acc = _PrefixGradAccumulator(pfx.run_prefix())
+                    if fp is not None:
+                        c0, l0 = pfx.run_prefix(return_logits=True)
+                        acc = _PrefixGradAccumulator(c0, extra_outputs=[l0]); del c0, l0
+                    else:
+                        acc = _PrefixGradAccumulator(pfx.run_prefix())
             with R.hooked(submodule, hook):
                 with _policy_precision(actor, ac):
                     if pfx is not None:
@@ -1701,14 +2094,23 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
     if ok1 and ok2 and not leaked:
         per = max(p2 - p1, 64 * 2**20)
         fixed = max(p1 - base - per, 0)
-        pred = int((0.85 * total - base - fixed) // per)
+        pred = int((frac * total - base - fixed) // per)
+        if fp is not None and fp.world > 1:   # FSDP2: every rank must run the SAME attempts (each backward is a collective) -> agree on the prediction
+            import torch.distributed as dist
+            t = torch.tensor([pred], dtype=torch.int64, device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            pred = int(t.item())
         _log(tag, f"probe fit: {per / GB:.2f} GB/seq + {fixed / GB:.1f} GB fixed on {base / GB:.1f} GB resident -> "
-                  f"predicted max mb {pred} at 85% of {total / GB:.0f} GB")
+                  f"predicted max mb {pred} at {frac:.0%} of {total / GB:.0f} GB" + (" (min over ranks)" if fp is not None else ""))
         for mb in sorted({c for c in cands if 2 < c <= pred}, reverse=True):
             ok, peak, err = attempt(mb); leaked = record(mb, ok, peak, err, "(verify)")
             if ok:
                 chosen = mb
                 break
+            if fp is not None:
+                raise RuntimeError(f"--full-param micro-batch verification at mb={mb} failed ({err}); FSDP2 state is not trustworthy after an "
+                                   f"OOM -- relaunch with --micro-batch <= {max(2, mb // 2)} or a lower --mb-target-frac (probe fit: {per / GB:.2f} GB/seq, "
+                                   f"{fixed / GB:.1f} GB fixed, {base / GB:.1f} GB resident)")
             if leaked:
                 _log(tag, "verification OOM leaked GPU memory; not probing further")
                 break
@@ -1722,6 +2124,116 @@ def find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands
             if ok:
                 chosen = mb
                 break
+    return chosen, res
+
+
+
+def plan_probe_step(measured, cands, budget_bytes, max_growth=2.0, per_seq_floor=0.0):
+    """--full-param micro-batch probe planning (pure; unit-tested). measured: {mb: peak_bytes} of the attempts so far (all fit),
+    cands: the candidate list. Returns the next mb to try or None when done. Rule: walk the candidates upwards; the next one must
+    be <= max_growth x the largest measured mb and its peak, extrapolated linearly from the two largest measured points (slope
+    floored at per_seq_floor), must stay under the budget. The first two attempts (the two smallest candidates >= 4) are free:
+    at tiny micro-batches the peak is the mb-independent fp32-grad allocation, so a slope from mb 1/2 says nothing."""
+    ok = sorted(measured)
+    todo = [c for c in sorted(set(cands)) if c not in measured and (not ok or c > ok[-1])]
+    if not todo:
+        return None
+    if len(ok) < 2:
+        return todo[0]
+    a, b = ok[-2], ok[-1]
+    per = max((measured[b] - measured[a]) / max(b - a, 1), per_seq_floor)
+    for c in todo:
+        if c > max_growth * b:
+            return None
+        pred = measured[b] + per * (c - b)
+        return c if pred <= budget_bytes else None
+    return None
+
+
+def find_micro_batch_fullparam(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx, fp):
+    """--full-param: the largest micro-batch whose MEASURED forward+backward peak at max length, plus the AdamW moments that
+    torch.optim.AdamW allocates at the first step (2 x the fp32 master shard; not present during the probe), stays under
+    --mb-target-frac of the GPU. Walks the candidates upwards (plan_probe_step) so no attempt can OOM by more than one
+    doubling's worth of extrapolation error; every rank runs the same attempts (each backward is an FSDP2 collective) and
+    uses the MAX peak over ranks. An OOM is fatal (FSDP2 cannot resume after an exception inside a forward)."""
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+    import rl_hf as R
+    from mxf.config import D_MODEL, STEER_COEFF
+    L = len(prompt_ids) + a.max_new_tokens
+    p_len = len(prompt_ids)
+    total = torch.cuda.get_device_properties(0).total_memory
+    GB = 2**30
+    frac = float(a.mb_target_frac)
+    fp.FP.reshard_root(actor)   # after the initial publish's no-grad forward the root params are still gathered (5 GB, plain tensors)
+    gc.collect(); torch.cuda.empty_cache()
+    base = torch.cuda.memory_allocated()
+    reserve = 0 if len(opt.state) else 2 * sum((p.to_local().numel() if fp.FP.is_dtensor(p) else p.numel()) * 4 for p in actor.parameters())
+    world = fp.world
+    reserve = fp.FP.all_reduce_max(reserve, device)      # shard padding differs per rank: ONE budget everywhere (identical probe decisions)
+    budget = frac * total - reserve
+    _log(tag, f"micro-batch probe (full-param) @ L={L}: resident {base / GB:.1f} GB, AdamW reserve {reserve / GB:.1f} GB, budget for the measured "
+              f"fwd/bwd peak {budget / GB:.1f} GB ({frac:.0%} of {total / GB:.0f} GB minus the reserve)")
+
+    def attempt(mb):
+        peak, err = None, None
+        try:
+            torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+            ids = torch.randint(1000, 100000, (mb, L), device=device)
+            ids[:, :p_len] = torch.tensor(prompt_ids, device=device)
+            attn = torch.ones_like(ids)
+            dirs = F.normalize(torch.randn(mb, D_MODEL, device=device), dim=-1)
+            hook = R.make_inject_hook([dirs[i : i + 1] for i in range(mb)], [[0 if pfx is not None else marker]] * mb,
+                                      STEER_COEFF, device, torch.bfloat16, mode=fp.inject_mode)
+            acc = None
+            if pfx is not None:
+                c0, l0 = pfx.run_prefix(return_logits=True)
+                acc = _PrefixGradAccumulator(c0, extra_outputs=[l0]); del c0, l0
+            with R.hooked(submodule, hook), fp.suffix_ctx():
+                if pfx is not None:
+                    logits = pfx.suffix_logits(acc.cache, ids[:, marker:], attn[:, marker:])[:, :-1]
+                else:
+                    logits = actor(input_ids=ids, attention_mask=attn, use_cache=False, logits_to_keep=L - p_len + 1).logits[:, :-1]
+                new_lp, ent = fp.logp_from(logits, ids[:, p_len:], a.vocab_chunk, False, a.fp32_head)
+                del logits
+                loss = new_lp.mean() * 0.0
+                loss.backward()
+            if acc is not None:
+                acc.backward()
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated()
+        except torch.cuda.OutOfMemoryError as e:
+            err = re.sub(r"\s+", " ", str(e))[:300]
+        finally:
+            opt.zero_grad(set_to_none=True)
+            gc.collect(); torch.cuda.empty_cache()
+        return peak, err
+
+    def sync_max(x):
+        t = torch.tensor([float(x)], dtype=torch.float64, device=device)
+        if world > 1:
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return float(t.item())
+
+    measured, res = {}, {}
+    cands = sorted({c for c in cands if c >= 4})
+    while True:
+        mb = plan_probe_step(measured, cands, budget)
+        if mb is None:
+            break
+        peak, err = attempt(mb)
+        peak_all = sync_max(peak if peak is not None else float("inf"))
+        if peak is None or peak_all == float("inf"):
+            raise RuntimeError(f"--full-param micro-batch probe: mb={mb} ran out of memory ({err}); measured so far "
+                               f"{ {k: round(v / GB, 1) for k, v in measured.items()} } GB; relaunch with --micro-batch <= {max(measured) if measured else 4}")
+        res[mb] = {"ok": peak_all <= budget, "peak_gb": peak_all / GB, "peak_plus_reserve_gb": (peak_all + reserve) / GB}
+        _log(tag, f"mb {mb}: peak {peak_all / GB:.1f} GB (max over ranks; + AdamW reserve = {(peak_all + reserve) / GB:.1f} of {total / GB:.0f} GB) -> "
+                  f"{'fits' if peak_all <= budget else 'over budget'}")
+        if peak_all > budget:
+            break
+        measured[mb] = peak_all
+    chosen = max(measured) if measured else None
     return chosen, res
 
 
@@ -1970,44 +2482,103 @@ def run_trainer(a):
 
     t0 = time.time()
     pb = check_policy_base(a)   # MODEL unless --policy-base (a full-FT checkpoint dir); tokenizer, prompt and eos ids stay MODEL's
-    actor = AutoModelForCausalLM.from_pretrained(pb, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
-    if a.init_adapter:
-        actor = PeftModel.from_pretrained(actor, a.init_adapter, is_trainable=True)
+    fp = None
+    if a.full_param:   # rl/rl_fullparam.py: FSDP2 whole-model policy (sft/fullft.py sharding), frozen sharded scorer, bf16 weight publish
+        import rl_fullparam as FP
+        FT = FP.fullft_module()
+        R.read_resid = FP.read_resid_noraise      # rl.py score() reads layer 42 without the _Stop exception (FSDP2-safe); full-param mode only
+        fp = FullParamCtx(FP, FT, world, rank)
+        actor = AutoModelForCausalLM.from_pretrained(pb, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+        _log(tag, f"bf16 policy base loaded in {time.time() - t0:.0f}s | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB -> FSDP2 sharding over {world} ranks")
+        actor = FT.shard_full_model(actor, world, device, log=(lambda m: _log(tag, m)) if is_main else (lambda *x, **k: None),
+                                    prefetch=a.fsdp_prefetch)
+        actor.train()
+        fp.mem["after_shard_gb"] = torch.cuda.memory_allocated() / 2**30
+        if a.chunked_head:   # lm_head + fp32 log-softmax per position chunk, recomputed in the backward: no [tokens x 248k] logits ever
+            fp.head = FP.ChunkedHead(actor)
+            _log(tag, f"lm_head chunked + recomputed ({'fp32' if a.fp32_head else 'bf16'} logits, {a.vocab_chunk} positions per chunk; rl_fullparam.ChunkedHead)")
+        elif a.fp32_head:   # trainable head: fp32 logits + grad path through the gathered bf16 weight (rl_fullparam)
+            FP.install_fp32_head_trainable(actor)
+            _log(tag, "lm_head recomputed in fp32 (trainable FSDP2 head: F.linear(x.float(), W_bf16.float()) per micro-batch)")
+        if a.suffix_ckpt:
+            fp.ckpt = FP.suffix_checkpointer(actor)
+            _log(tag, "suffix activation checkpointing ON (per decoder layer, exact with the prefix cache; sft/prefix_cache.SuffixCheckpointer)")
+        opt = torch.optim.AdamW(list(actor.parameters()), lr=a.lr, weight_decay=0.0, eps=a.adam_eps, betas=tuple(a.adam_betas))
+        if a.load_optim:
+            FP.load_optim_dcp(actor, opt, a.load_optim, log=lambda m: _log(tag, m))
+        if is_main:
+            fp.nontext_shard = "/tmp/base_nontext.safetensors"
+            FT.prepare_nontext_shard(MODEL, fp.nontext_shard, log=lambda m: _log(tag, m))
+        submodule = get_layer(actor, INJECT_LAYER)
+        if is_main:
+            _log(tag, f"kernel backends: {FT.kernel_backends(actor)}")
     else:
-        actor = get_peft_model(actor, LoraConfig(r=tr.lora_r, lora_alpha=tr.lora_alpha, lora_dropout=0.0, use_rslora=True,
-                                                 target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
-        _log(tag, f"fresh rsLoRA r{tr.lora_r}/a{tr.lora_alpha} all-linear on {pb}")
-    actor.train()
-    if a.fp32_head:   # before the micro-batch search so its +memory is part of the OOM probe
-        install_fp32_head(actor)
-        _log(tag, "lm_head recomputed in fp32 (ScaleRL precision fix, trainer side; the vLLM sampler stays bf16-head/fp32-softmax)")
-    opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0,
-                            eps=a.adam_eps, betas=tuple(a.adam_betas))
-    optim_p = os.path.join(a.init_adapter or "", "optim.pt")
-    if a.init_adapter and os.path.exists(optim_p) and not a.fresh_optim:
-        opt.load_state_dict(torch.load(optim_p, map_location="cpu"))
-        for _g in opt.param_groups:   # a loaded optimizer state carries the OLD run's lr/betas/eps — re-apply this run's flags (ablation arms rely on it)
-            _g["lr"], _g["betas"], _g["eps"] = a.lr, tuple(a.adam_betas), a.adam_eps
-        _log(tag, f"optimizer state loaded from {optim_p}; hyperparams re-applied: lr {a.lr} betas {tuple(a.adam_betas)} eps {a.adam_eps}")
-        _log(tag, f"AdamW state restored from {optim_p}")
-    submodule = get_layer(actor, INJECT_LAYER)
-    if a.kl_coef > 0:
-        ref_src = a.ref_adapter or a.init_adapter
-        if ref_src:
-            actor.load_adapter(ref_src, adapter_name="ref")
-            actor.set_adapter("default")
-        else:   # fresh LoRA (typically on a full-FT --policy-base): the KL anchor is the policy base itself = the LoRA disabled
-            _log(tag, f"KL reference = {pb} with the LoRA disabled (no --init-adapter / --ref-adapter)")
+        actor = AutoModelForCausalLM.from_pretrained(pb, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+        if a.init_adapter:
+            actor = PeftModel.from_pretrained(actor, a.init_adapter, is_trainable=True)
+        else:
+            actor = get_peft_model(actor, LoraConfig(r=tr.lora_r, lora_alpha=tr.lora_alpha, lora_dropout=0.0, use_rslora=True,
+                                                     target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
+            _log(tag, f"fresh rsLoRA r{tr.lora_r}/a{tr.lora_alpha} all-linear on {pb}")
+        actor.train()
+        if a.fp32_head:   # before the micro-batch search so its +memory is part of the OOM probe
+            install_fp32_head(actor)
+            _log(tag, "lm_head recomputed in fp32 (ScaleRL precision fix, trainer side; the vLLM sampler stays bf16-head/fp32-softmax)")
+        opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0,
+                                eps=a.adam_eps, betas=tuple(a.adam_betas))
+        optim_p = os.path.join(a.init_adapter or "", "optim.pt")
+        if a.init_adapter and os.path.exists(optim_p) and not a.fresh_optim:
+            opt.load_state_dict(torch.load(optim_p, map_location="cpu"))
+            for _g in opt.param_groups:   # a loaded optimizer state carries the OLD run's lr/betas/eps — re-apply this run's flags (ablation arms rely on it)
+                _g["lr"], _g["betas"], _g["eps"] = a.lr, tuple(a.adam_betas), a.adam_eps
+            _log(tag, f"optimizer state loaded from {optim_p}; hyperparams re-applied: lr {a.lr} betas {tuple(a.adam_betas)} eps {a.adam_eps}")
+            _log(tag, f"AdamW state restored from {optim_p}")
+        submodule = get_layer(actor, INJECT_LAYER)
+        if a.kl_coef > 0:
+            ref_src = a.ref_adapter or a.init_adapter
+            if ref_src:
+                actor.load_adapter(ref_src, adapter_name="ref")
+                actor.set_adapter("default")
+            else:   # fresh LoRA (typically on a full-FT --policy-base): the KL anchor is the policy base itself = the LoRA disabled
+                _log(tag, f"KL reference = {pb} with the LoRA disabled (no --init-adapter / --ref-adapter)")
     n_train = sum(p.numel() for p in actor.parameters() if p.requires_grad)
     _log(tag, f"actor ready in {time.time() - t0:.0f}s | policy base {pb} | trainable {n_train / 1e6:.0f}M | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB")
     use_gates = a.fluency_floor is not None or a.distinct_floor is not None
-    scorer = load_scorer(a, actor, device, tag, use_gates)   # the REWARD model: the actor with its LoRA off (default) or a frozen copy of MODEL
+    if fp is not None:
+        # the REWARD model: a frozen, FSDP2-sharded copy of the ORIGINAL base (the policy's weights move, so "LoRA off" no longer exists)
+        scorer = load_scorer_fullparam(a, device, world, tag, use_gates, need_logits=(a.kl_coef > 0 and policy_base_is_model(a)))
+        fp.mem["after_scorer_gb"] = torch.cuda.memory_allocated() / 2**30
+        if a.kl_coef > 0:   # KL anchor = a frozen copy of the init: the scorer itself when the policy started from MODEL, else a second sharded copy of the policy base
+            if policy_base_is_model(a):
+                fp.ref_model = scorer.get_base_model()
+                _log(tag, "KL reference = the frozen scorer copy of MODEL (policy base == MODEL; scorer kept full-depth for its logits)")
+            else:
+                t_ref0 = time.time()
+                ref = AutoModelForCausalLM.from_pretrained(pb, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+                fp.ref_model = FP.shard_frozen_bf16(ref, world)
+                gc.collect(); torch.cuda.empty_cache()
+                _log(tag, f"KL reference = frozen FSDP2-sharded copy of {pb} in {time.time() - t_ref0:.0f}s | resident {torch.cuda.memory_allocated() / 2**30:.1f} GB "
+                          f"(+~{54 / world:.0f} GB/rank; reuse the scorer by starting from MODEL to avoid it)")
+            fp.ref_submodule = get_layer(fp.ref_model, INJECT_LAYER)
+    else:
+        scorer = load_scorer(a, actor, device, tag, use_gates)   # the REWARD model: the actor with its LoRA off (default) or a frozen copy of MODEL
     pfx = _make_prefix_runner(actor, prompt_ids, marker, device, a, tag)
+    if fp is not None and fp.ref_model is not None and pfx is not None:
+        fp.ref_pfx = PrefixRunner(fp.ref_model, prompt_ids, marker, device)
 
     # publish the init policy FIRST so the rollout ranks start generating while we tune the micro-batch
     if is_main:
         for d in ("lora", "queue"):
             os.makedirs(f"{work}/{d}", exist_ok=True)
+    if fp is not None:   # COLLECTIVE: manifest (all ranks' shard geometry) + marker norm (FSDP forward); the engines already hold these weights
+        fp.manifest = FP.build_manifest(actor, world)
+        if is_main:
+            FP.write_manifest(f"{work}/lora/manifest.json", fp.manifest)
+        hnorm0, t_pub = _publish_fullparam(fp, actor, submodule, prompt, marker, device, work, a.step_offset, tag, a, is_main, world, initial=True)
+        if is_main:
+            _log(tag, f"published init policy as step {a.step_offset} (||h_marker|| = {hnorm0:.2f}; {len(fp.manifest['names'])} tensors, "
+                      f"{fp.manifest['bytes_bf16'] / 2**30:.1f} GB bf16 per publish, mode {a.publish_mode}) in {t_pub:.1f}s")
+    elif is_main:
         hnorm0, t_pub = _publish_adapter(actor, submodule, prompt, marker, device, work, a.step_offset, a.keep_loras, tag, a.publish_fp32)
         _log(tag, f"published init adapter as step {a.step_offset} (||h_marker|| = {hnorm0:.2f}) in {t_pub:.1f}s")
 
@@ -2015,7 +2586,10 @@ def run_trainer(a):
     mb_res = {}
     if mb <= 0:
         cands = _mb_candidates(a)
-        mb, mb_res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx=pfx)
+        if fp is not None:
+            mb, mb_res = find_micro_batch_fullparam(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx, fp)
+        else:
+            mb, mb_res = find_micro_batch(actor, opt, submodule, prompt_ids, marker, a, device, cands, tag, pfx=pfx, fp=fp)
         assert mb is not None, f"no micro-batch candidate fits: {mb_res}"
         if world > 1:
             t = torch.tensor([mb], dtype=torch.int64, device=device if a.backend == "nccl" else "cpu")
@@ -2070,7 +2644,9 @@ def run_trainer(a):
                   + f" | loss-agg {a.loss_agg} | zero-var filter {a.zero_var_filter} (eps {a.zero_var_eps}) | NPR {a.npr_threshold}"
                   + (f" (pass cos {a.npr_pass_cos}, {n_bank_avail} directions)" if npr is not None else " (off)")
                   + f" | max lag {a.max_lag} step(s) | fp32 head {a.fp32_head} | length control {a.length_control}")
-        _log(tag, f"policy base {pb} | scorer {'the actor with its LoRA off (= MODEL)' if scorer is actor else 'a frozen copy of MODEL'}")
+        _log(tag, f"policy base {pb} | scorer {'the actor with its LoRA off (= MODEL)' if scorer is actor else ('a frozen FSDP2-sharded copy of MODEL' if fp is not None else 'a frozen copy of MODEL')}"
+                  + (f" | FULL-PARAMETER policy: {sum(p.numel() for p in actor.parameters()) / 1e9:.2f}B trainable, publish {a.publish_mode}, "
+                     f"resident {torch.cuda.memory_allocated() / 2**30:.1f} GB/rank before step 0" if fp is not None else ""))
         if not a.no_wandb:
             wandb.init(project="maxact-fast", name=a.run_name, config={**vars(a), "micro_batch_used": mb, "mb_search": mb_res,
                                                                         "fla": fla_v, "disagg": True, "policy_base_resolved": pb},
@@ -2172,6 +2748,10 @@ def run_trainer(a):
             r, flu, dis = R.score(texts, dirs_rep, scorer, tok, device, a, with_fluency=True)
         else:
             r = R.score(texts, dirs_rep, scorer, tok, device, a)
+        if fp is not None:   # FSDP2 scorer: score() ran ceil(non-empty texts / score_batch) collective forwards on THIS rank -> equalize
+            n_sc = -(-sum(1 for t in texts if t.strip()) // a.score_batch)
+            for _ in range(int(FP.all_reduce_max(n_sc, device)) - n_sc):
+                FP.dummy_scorer_forward(scorer, tok, device)
         r = r * a.reward_scale
         raw_r, gate_frac = r.clone(), 1.0                      # raw_r = the TRUE cosine (logged/transcripts), before any shaping (rl.py fd2d144)
         trunc = torch.tensor([len(g) >= a.max_new_tokens and (not g or g[-1] not in eos_set) for g in gen_ids])
@@ -2233,7 +2813,7 @@ def run_trainer(a):
             for _g in opt.param_groups:
                 _g["lr"] = lr_now
 
-        stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=keep, pfx=pfx)
+        stats = update_disagg(actor, opt, submodule, ids, attn, p_len, marker, old_lp, known, adv, dirs_rep, a, device, mb, keep=keep, pfx=pfx, fp=fp)
         if a.entropy_target > 0:   # SAC-style temperature adaptation on the measured per-token entropy of this step
             a.entropy_coef = float(min(a.entropy_coef_max, max(a.entropy_coef_min,
                                    a.entropy_coef * math.exp(a.entropy_adapt_rate * (a.entropy_target - stats["entropy"])))))
@@ -2241,7 +2821,9 @@ def run_trainer(a):
 
         # ---- publish the new policy for the rollout ranks ----
         t_pub, hnorm = 0.0, float("nan")
-        if is_main and a.publish_every > 0 and (step + 1) % a.publish_every == 0:
+        if fp is not None and a.publish_every > 0 and (step + 1) % a.publish_every == 0:   # COLLECTIVE (every trainer rank gathers)
+            hnorm, t_pub = _publish_fullparam(fp, actor, submodule, prompt, marker, device, work, step + 1, tag, a, is_main, world)
+        elif is_main and a.publish_every > 0 and (step + 1) % a.publish_every == 0:
             hnorm, t_pub = _publish_adapter(actor, submodule, prompt, marker, device, work, step + 1, a.keep_loras, tag, a.publish_fp32)
             # rl.py evaluates ckpt `step` (the weights after this update) with the adapter published right here
             if EV is not None and step % a.inline_eval_every == 0:
@@ -2251,6 +2833,9 @@ def run_trainer(a):
         secs = time.time() - t0
         mem_alloc = torch.cuda.memory_allocated(device) / 2**30
         mem_peak = torch.cuda.max_memory_allocated(device) / 2**30
+        mem_peak_max = mem_peak
+        if fp is not None:   # COLLECTIVE: the worst rank's peak this step
+            _, mem_peak_max = FP.peak_gb_all_ranks(device)
         torch.cuda.reset_peak_memory_stats(device)
         n_gen = float(sum(len(g) for g in gen_ids))
         _rg = raw_r.view(Bl, G)
@@ -2288,13 +2873,15 @@ def run_trainer(a):
                "time/step_s": secs, "time/wait_rollouts_s": t_wait, "time/score_s": t_sc, "time/update_s": t_up,
                "time/ref_pass_s": stats["t_ref"], "time/fwd_bwd_s": stats["t_fb"], "time/grad_sync_s": stats["t_sync"],
                "time/publish_s": t_pub, "time/rollout_s": gen_s,
-               "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, "micro_batch": mb,
+               "mem/hf_alloc_gb": mem_alloc, "mem/hf_peak_gb": mem_peak, "mem/hf_peak_gb_max_rank": mem_peak_max, "micro_batch": mb,
                "trainer/pad_frac": stats["pad_frac"], "trainer/body_tokens_per_rollout": stats["body_tok_per_rollout"],
                "trainer/real_tokens_per_rollout": stats["real_tok_per_rollout"],
                # ScaleRL diagnostics (present in every run; zero/inert when the variant flags are off)
                "scalerl/is_weight_mean": stats["is_weight_mean"], "scalerl/is_trunc_frac": stats["is_trunc_frac"],
                "scalerl/zero_var_dropped_frac": float(loc[10] / n_groups_all), "scalerl/effective_groups": float(n_groups_all - loc[10]),
                "scalerl/lag_max": lag_max, "scalerl/trunc_frac": trunc_frac, "scalerl/step_skipped": float(stats["skipped"])}
+        if fp is not None:    # publish breakdown (rl_fullparam: block-boundary wait, transfer, GB, GB/s; engine-side load time arrives via meta on the rollout side)
+            log.update({f"publish/{k}": float(v) for k, v in fp.last_pub.items() if isinstance(v, (int, float))})
         if npr is not None:   # No-Positive-Resampling bookkeeping on the whole batch (every rank has the gathered rewards; rank 0 publishes)
             log.update(npr.update(idx_all, (raw_r_all / a.reward_scale).numpy(), G))
             log["scalerl/npr_dropped_frac_of_bank"] = len(npr.dropped) / max(n_bank_avail, 1)
@@ -2315,8 +2902,8 @@ def run_trainer(a):
         step_hist.append({"step": step, "step_s": secs, "wait_s": t_wait, "update_s": t_up, "score_s": t_sc, "lag": lag,
                           "gen_s": gen_s, "reward": log["reward/mean"], "entropy": log["policy/entropy"], "ratio": log["ratio/mean"],
                           "clipfrac": log["ratio/clipfrac"], "dlogp": log["policy/sampler_abs_dlogp"], "len": log["rollout/len_mean"],
-                          "peak_gb": mem_peak, "t_ref": stats["t_ref"], "t_fb": stats["t_fb"], "t_sync": stats["t_sync"], "t_pub": t_pub,
-                          "n_local": Bl * G})
+                          "peak_gb": mem_peak, "peak_gb_max_rank": mem_peak_max, "t_ref": stats["t_ref"], "t_fb": stats["t_fb"], "t_sync": stats["t_sync"], "t_pub": t_pub,
+                          "n_local": Bl * G, "gnorm": log["grad_norm"], "publish": dict(fp.last_pub) if fp is not None else None})
         if is_main:
             print(f"step {step:05d} | r {log['reward/mean']:.3f} (max {log['reward/max']:.2f}) | ent {log['policy/entropy']:.2f} "
                   f"| ratio {log['ratio/mean']:.3f} clip {log['ratio/clipfrac']:.2%} |dlogp| {log['policy/sampler_abs_dlogp']:.4f} lag {lag:.1f} "
@@ -2334,8 +2921,12 @@ def run_trainer(a):
                     if not a.no_wandb:
                         wandb.log({**m, "ckpt_step": cs})
             json.dump(step_hist, open(f"{work}/trainer_steps.json", "w"))
-            _save_steps = {int(x) for x in a.save_steps.split(",") if x.strip()}
-            if (a.save_every and step and step % a.save_every == 0) or (step in _save_steps):
+        _save_steps = {int(x) for x in a.save_steps.split(",") if x.strip()}
+        do_save = bool((a.save_every and step and step % a.save_every == 0) or (step in _save_steps))
+        if fp is not None and do_save:   # COLLECTIVE full-model checkpoint (every rank all-gathers, rank 0 writes)
+            _save_fullparam_ckpt(fp, actor, f"{a.save_dir}/step_{step}", tok, is_main, world, a, mb, step, opt, tag)
+        if is_main and fp is None:
+            if do_save:
                 actor.save_pretrained(f"{a.save_dir}/step_{step}")
                 write_run_meta(a, f"{a.save_dir}/step_{step}", mb, step=step)
                 torch.save(opt.state_dict(), f"{a.save_dir}/step_{step}/optim.pt")
@@ -2343,7 +2934,15 @@ def run_trainer(a):
                     stale_o = os.path.join(a.save_dir, f"step_{step - 2 * a.save_every}", "optim.pt")
                     if os.path.exists(stale_o) and (step - 2 * a.save_every) not in _save_steps:
                         os.remove(stale_o)
-    if is_main:
+    if fp is not None:   # COLLECTIVE full-model final checkpoint
+        _save_fullparam_ckpt(fp, actor, f"{a.save_dir}/final", tok, is_main, world, a, mb, a.total_steps, opt, tag, final=True)
+        if is_main:
+            ok = os.path.exists(f"{a.save_dir}/final/SAVE_DONE") and os.path.exists(f"{a.save_dir}/final/model.safetensors.index.json")
+            _log(tag, f"final full-model checkpoint {a.save_dir}/final: {'complete (SAVE_DONE + index)' if ok else 'INCOMPLETE'} | "
+                      f"memory: {json.dumps({k: round(v, 1) for k, v in fp.mem.items()})}")
+            json.dump({"mem": fp.mem, "publish_hist": fp.pub_hist, "manifest_summary": {k: fp.manifest[k] for k in ('n_trainer', 'n_params', 'bytes_bf16', 'checks')},
+                       "micro_batch": mb}, open(f"{work}/fullparam_summary.json", "w"), indent=1)
+    if is_main and fp is None:
         actor.save_pretrained(f"{a.save_dir}/final")
         write_run_meta(a, f"{a.save_dir}/final", mb, step=a.total_steps)
         if a.save_every:
@@ -2355,6 +2954,7 @@ def run_trainer(a):
             _log(tag, f"checkpoint {a.save_dir}/final loads via PeftModel.load_adapter: OK")
         except Exception as e:  # noqa
             _log(tag, f"checkpoint load-back FAILED: {type(e).__name__}: {e}")
+    if is_main:
         if IX is not None and EX is not None:
             IX.wait_for_judge_stages(900)
             for cs, m in IX.poll_judge_results():

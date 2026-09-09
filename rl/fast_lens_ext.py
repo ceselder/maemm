@@ -203,3 +203,75 @@ class FastSteerExtension(HiddenStatesExtension):
 
     def fast_lens_stats(self) -> dict:
         return dict(_STATS)
+
+    # ------------------------------------------------------------------------------------------
+    # full-parameter weight sync (rl_disagg --full-param; protocol in rl/rl_fullparam.py). `self` is the vLLM Worker
+    # (worker_extension_cls mixin): self.device, self.model_runner.model. Called through llm.collective_rpc between
+    # generate() calls, i.e. at a block boundary -- never while the engine runs a forward.
+    # ------------------------------------------------------------------------------------------
+    def wu_init(self, host: str, port: int, rank: int, world_size: int, manifest_path: str, store_timeout: int = 1800) -> dict:
+        """Join the weight-update NCCL group (rank 0 = trainer rank 0) and load the publish manifest."""
+        import json
+        import time
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+        t0 = time.time()
+        self._wu_manifest = json.load(open(manifest_path))
+        pg = StatelessProcessGroup.create(host, int(port), rank=int(rank), world_size=int(world_size), store_timeout=int(store_timeout))
+        self._wu_comm = PyNcclCommunicator(pg, device=self.device)
+        self._wu_pg = pg
+        assert not self._wu_comm.disabled, "PyNcclCommunicator disabled in the vLLM worker (NCCL library missing?)"
+        self._wu_n_loads = 0
+        return {"rank": int(rank), "world": int(world_size), "n_tensors": len(self._wu_manifest["names"]),
+                "gb": self._wu_manifest["bytes_bf16"] / 2**30, "init_s": time.time() - t0, "device": str(self.device)}
+
+    def _wu_load(self, stream_of_weights):
+        """Feed (ckpt name, tensor) lazily into vLLM's own model.load_weights (in place: parameters keep their storage, so
+        CUDA graphs, the steering hook and everything else stay valid). Returns the set of vLLM params it touched."""
+        model = self.model_runner.model
+        loaded = model.load_weights(stream_of_weights)
+        torch.cuda.synchronize()
+        self._wu_n_loads += 1
+        return loaded
+
+    def wu_recv(self, step: int) -> dict:
+        """publish-mode nccl: receive every tensor of the manifest by broadcast from group rank 0, in order, straight into
+        load_weights. One staging buffer per tensor (fresh torch.empty; the caching allocator reuses the blocks)."""
+        import time
+        man = self._wu_manifest
+        comm = self._wu_comm
+        stream = torch.cuda.current_stream(self.device)
+        t0 = time.time()
+        n_bytes = [0]
+
+        def gen():
+            for name, shape in zip(man["names"], man["shapes"]):
+                buf = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+                comm.broadcast(buf, src=0, stream=stream)
+                n_bytes[0] += buf.numel() * 2
+                yield name, buf
+        loaded = self._wu_load(gen())
+        t_load = time.time() - t0
+        from rl_fullparam import engine_checks
+        checks = engine_checks(self.model_runner.model, man["checks"])
+        return {"step": int(step), "n_vllm_params_loaded": len(loaded), "gb": n_bytes[0] / 2**30, "load_s": t_load,
+                "gbps": n_bytes[0] / 2**30 / max(t_load, 1e-6), "checks": checks, "n_loads": self._wu_n_loads}
+
+    def wu_load_fs(self, step_dir: str, manifest_path: str) -> dict:
+        """publish-mode fs: stream the trainer ranks' bf16 shard files (rl_fullparam.write_shard_file) into load_weights."""
+        import json
+        import time
+        from rl_fullparam import engine_checks, iter_fs_weights
+        man = json.load(open(manifest_path))
+        if not hasattr(self, "_wu_n_loads"):
+            self._wu_n_loads = 0
+        t0 = time.time()
+        loaded = self._wu_load(iter_fs_weights(step_dir, man, self.device))
+        t_load = time.time() - t0
+        checks = engine_checks(self.model_runner.model, man["checks"])
+        return {"step_dir": step_dir, "n_vllm_params_loaded": len(loaded), "gb": man["bytes_bf16"] / 2**30, "load_s": t_load,
+                "gbps": man["bytes_bf16"] / 2**30 / max(t_load, 1e-6), "checks": checks, "n_loads": self._wu_n_loads}
+
+    def wu_checks(self, names: list) -> dict:
+        from rl_fullparam import engine_checks
+        return engine_checks(self.model_runner.model, list(names))
