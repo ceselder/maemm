@@ -105,12 +105,21 @@ micro-batch, which the 5.2 GB/seq activation footprint forbids without recompute
 saved state drops to the layer inputs + the expanded prefix cache, ~0.3 GB/seq) and `--chunked-head` (the fp32 logits and their
 saved log-softmax were ~0.4 GB/seq). Measured numbers: report §2 (bench table).
 
-## 4. Parity / exactness
+## 4. Parity / exactness (measured, 50-step validation run `rl_fullparam_val50_lr1e-6`, wandb 4mexafu3)
 
-- Sampler vs trainer `policy/sampler_abs_dlogp` at step 0 (engines hold the on-disk weights) and at every later step (engines
-  hold the published weights): `[measured]` — the LoRA path sits at 0.02–0.04; a broken publish shows up as ~1–1.5 nats.
-- Publish checksums (six tensors, rtol 1e-3) verified by every engine at every step; a mismatch aborts the run.
-- The loss-scaling equivalence with `_sync_grads` and the manifest/shard geometry are unit-tested (`rl/test_rl_disagg_fullparam.py`).
+- Sampler vs trainer `policy/sampler_abs_dlogp`: 0.0215 at step 0 (engines on the on-disk weights) and 0.021–0.032 over steps
+  1–49 with the engines on the pushed weights (lag 2), rising with the learning rate exactly like the LoRA arm's 0.021–0.028 band.
+  A broken publish would sit at ~1–1.5 nats.
+- 50 publishes × 3 engines × 6 tensor checksums (rtol 1e-3): 0 mismatches. `hnorm` published vs the engines' own marker norm:
+  81.50 vs 81.5 at step 0 (injection check cos 1.0000, ratio 1.000).
+- Publish cost (NCCL): median 0.61 s per step trainer-side = 0.15–0.35 s waiting for the engines' block boundaries + 0.25 s for the
+  50.1 GB all-gather + broadcast (~200 GB/s) + 0.21 s marker-norm forward; engine stall 0.3–0.6 s; first publish 3.9 s including the
+  3.1 s NCCL group creation. The LoRA path's adapter publish costs 1.9 s.
+- Step time at micro-batch 8: 67–68 s (scoring 2–3 s, update 63–64 s, publish 0.6 s) vs 30 s for the LoRA arm — see §3 "why".
+- Learning: reward 0.205 → 0.257 over 50 steps at lr 1e-6 (LoRA arm at 7e-6: 0.203 → 0.245); held-out `eval/mean_all` at the
+  step-25 checkpoint 0.3679 vs 0.3549 for the LoRA arm on the same init (0.3628 for LoRA on base + SFT adapter); gradient norm
+  0.69–0.96 (LoRA 0.19–0.23 — every weight contributes), entropy 2.71 → 2.19 (LoRA 2.70 → 2.50).
+- Peak GPU memory per trainer rank: 111 GB at step 0, 151 GB from step 1 on (AdamW moments); 5 ranks, micro-batch 8.
 
 ## 5. Launch
 
@@ -118,9 +127,14 @@ saved log-softmax were ~0.4 GB/seq). Measured numbers: report §2 (bench table).
 DISAGG_APP=maemm-rl-disagg-fullparam DISAGG_GPU=B200:8 \
 DISAGG_TRANSFORMERS="transformers @ git+https://github.com/ceselder/transformers@e52940e567ab9a991a1c971c1094e340233baff3" \
 modal deploy rl/modal_rl_disagg.py
-python3 scripts/launchers/spawn_rl_fullparam.py {smoke|val50|prod} [lr] [-- extra rl_disagg flags]
+python3 scripts/launchers/spawn_rl_fullparam.py {smoke|val50|prod|bench5 <tag>} [lr] [--split 3+5] [-- extra rl_disagg flags]
 ```
-(`train(..., full_param=True)` adds `--full-param --init-adapter none`; the ablation recipe lives in the launcher.)
+(`train(..., full_param=True)` adds `--full-param --init-adapter none`; the ablation recipe lives in the launcher.) Production arm
+(launched 2026-09-09 00:30Z): `prod 1e-6` → run `rl_abl_initnewfft_fullparam_8x512`, 300 steps, saves 25,50,…,300 to
+`/data/ckpts_rl_abl_initnewfft_fullparam`, evaluator `maemm-eval-ckpt-fullrl/fullmodel_daemon` (eval cache v2, no judge extras);
+ids in `~/shared/overnight/rl_ablation_ids.json["initnewfft_fullparam"]`. Learning rate 1e-6: reproduced the LoRA arm's 50-step
+reward trajectory with stable gradient norms; the standard full-fine-tune RL value (5–7× below the LoRA lr, matching AdamW's
+per-parameter step applied to every weight).
 
 ## 6. Lessons from the first attempts (all fixed on the branch)
 
