@@ -24,7 +24,8 @@ CACHE = "/data/eval_universal_ho/eval_sets_heldout_v2.pt"
 EXTRA = f"--no-extra-evals --no-wandb --dump-per-dir --eval-cache {CACHE}"
 IDS = os.path.expanduser("~/shared/overnight/mlprank_rescore_ids.json")
 
-# name -> (ckpt_dir, ckpt_step to evaluate, final_step, note)
+# name -> (ckpt_dir, ckpt_step to evaluate, final_step, note[, full_model]) ; full_model=True -> the checkpoints are FULL-model dirs
+# (SAVE_DONE inside step_N / final): the daemon runs eval_ckpt_daemon --full-model (engine serves the checkpoint itself, no LoRA).
 CKPTS = {
     "sft_realact23m":   ("/data/sft_mix/realact20m_prefix_lr1e-4/final",       0,   0,   "SFT baseline: 23M real-activation LoRA pretrain (final)"),
     "sft_midtrain":     ("/data/sft_mix/mixeq_midtrain_only_from_base/final",  0,   0,   "SFT baseline: midtrain-only LoRA on the equal six-family bank (final)"),
@@ -33,19 +34,21 @@ CKPTS = {
     "rl_abl_initbase":  ("/data/ckpts_rl_abl_initbase",                         300, 300, "RL ablation arm: no SFT (fresh LoRA), 300 steps (final)"),
     "rl_abl_initboth":  ("/data/ckpts_rl_abl_initboth",                         300, 300, "RL ablation arm: 23M pretrain + midtrain init, 300 steps (final)"),
     "rl_abl_initnewfft": ("/data/ckpts_rl_abl_initnewfft",                      300, 300, "RL ablation arm: LoRA on the full-FT midtrain policy base, 300 steps (final)"),
+    "rl_abl_initnewfft_fullparam": ("/data/ckpts_rl_abl_initnewfft_fullparam",  300, 300, "RL ablation arm: FULL-PARAMETER RL (lr 1e-6) on the full-FT midtrain init, 300 steps (final)", True),
     "rl_I_8x4096_nowarm": ("/data/ckpts_rl_I_8x4096_nowarm",                    150, 1000, "best production RL checkpoint (step 150)"),
 }
 
 
-def spawn(name, ckpt_dir, step, final_step, note):
+def spawn(name, ckpt_dir, step, final_step, note, full_model=False):
     """A checkpoint saved as a bare adapter dir (the SFT finals) is served through a wrapper layout: the daemon scans <ckpt_dir>/step_* +
     final, so point it at the PARENT run dir and evaluate `final` (final_step = 0 -> ckpt_step 0, like the SFT-eval daemons did)."""
     if ckpt_dir.endswith("/final"):
         ckpt_dir = ckpt_dir[: -len("/final")]
     f = modal.Function.from_name(APP, "daemon")
-    c = f.spawn(ckpt_dir=ckpt_dir, tag=f"mlprank_{name}", once=True, only_step=step, final_step=final_step, extra_args=EXTRA)
-    rec = {"call_id": c.object_id, "ckpt_dir": ckpt_dir, "ckpt_step": step, "final_step": final_step, "note": note,
-           "spawned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "app": APP, "extra_args": EXTRA}
+    extra = EXTRA + (" --full-model" if full_model else "")
+    c = f.spawn(ckpt_dir=ckpt_dir, tag=f"mlprank_{name}", once=True, only_step=step, final_step=final_step, extra_args=extra)
+    rec = {"call_id": c.object_id, "ckpt_dir": ckpt_dir, "ckpt_step": step, "final_step": final_step, "note": note, "full_model": full_model,
+           "spawned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "app": APP, "extra_args": extra}
     print(f"[spawn] {name}: {c.object_id}  ({ckpt_dir} step {step}; {note})", flush=True)
     return rec
 

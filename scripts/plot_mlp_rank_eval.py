@@ -48,6 +48,8 @@ CKPTS = {
                               ref=("rl_abl_initboth", 300), ckpt="/data/ckpts_rl_abl_initboth/final"),
     "rl_abl_initnewfft": dict(step=300, label="RL 300 steps on full-FT midtrain base", short="RL on full-FT", group="rl",
                               ref=("rl_abl_initnewfft", 300), ckpt="/data/ckpts_rl_abl_initnewfft/final"),
+    "rl_abl_initnewfft_fullparam": dict(step=300, label="RL 300 steps, FULL-PARAMETER (lr 1e-6), on full-FT midtrain init", short="RL full-param on full-FT", group="rl",
+                                        ref=("rl_abl_initnewfft_fullparam_8x512", 300), ckpt="/data/ckpts_rl_abl_initnewfft_fullparam/final"),
     "rl_I_8x4096_nowarm": dict(step=150, label="production RL (step 150)", short="production RL", group="prod",
                                ref=("rl_I_8x4096_nowarm", 150), ckpt="/data/ckpts_rl_I_8x4096_nowarm/step_150"),
 }
