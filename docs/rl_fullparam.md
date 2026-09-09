@@ -148,6 +148,14 @@ per-parameter step applied to every weight).
    `model.parameters()` then yields plain bf16 tensors — harmless for the NCCL publish (they are the full tensors) but wrong for
    the fs shard files, the checksums and the optimizer-state estimate. `reshard_root()` after every no-grad forward.
 
+4. **FSDP2 reduce-scatters only the parameters that HAVE a gradient, as one flat collective per group.** The zero-weight dummy
+   micro-batch (item 2) originally used `0 * logits.sum()`; with `--chunked-head` the module output is a dummy that bypasses
+   `lm_head`, so on the ranks running a dummy `lm_head.weight.grad` stayed `None` and their root-group reduce-scatter was shorter
+   than the other ranks' → all five NCCL watchdogs stuck 8 min into step 0 of the fast-config bench (its probe, where every rank
+   runs identical shapes and no dummy, was fine). Reproduced on a 2-GPU trainer-only bench (`rl/fullparam_update_bench.py`:
+   `base` ran, `head` hung); the dummy now goes through the same (chunked) head path as a real micro-batch, and a unit test asserts
+   every parameter has a (zero) gradient after a dummy pass.
+
 ## 7. Known limits
 
 - `--kl-coef > 0` with a non-MODEL policy base loads a second frozen sharded copy (+~11 GB/rank at Y=5); its head is bf16 (no
