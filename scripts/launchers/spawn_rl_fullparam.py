@@ -8,7 +8,9 @@ ScaleRL/CISPO, pool mix_eq_1p45m), policy = the new-pretrain + full-fine-tune mi
                                                    evaluator fullmodel_daemon (eval cache v2, no judge extras); ids -> rl_ablation_ids.json["initnewfft_fullparam"]
     python3 spawn_rl_fullparam.py bench5 <tag> [lr] 5 steps, no saves, run rl_fullparam_bench5_<tag> (step-time / memory benchmark of one config)
 Extra rl_disagg flags after `--`, e.g. `python3 spawn_rl_fullparam.py smoke 1e-6 -- --publish-mode fs`; the split with
-`--split 2+6` (n_rollout+n_trainer, default 3+5). FAST = the step-time knobs (--suffix-ckpt --chunked-head --fsdp-prefetch 2)."""
+`--split 2+6` (n_rollout+n_trainer, default 3+5). The FAST step-time knobs (--suffix-ckpt --chunked-head --fsdp-prefetch 2; 68 -> 44 s/step)
+are rl_disagg's DEFAULT for --full-param since 2026-09-09; the production arm rl_abl_initnewfft_fullparam_8x512 (launched 00:30Z that day)
+runs the first validated configuration (= `-- --no-suffix-ckpt --no-chunked-head --fsdp-prefetch 0`)."""
 import json
 import os
 import sys

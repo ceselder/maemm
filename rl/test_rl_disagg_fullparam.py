@@ -66,8 +66,13 @@ def test_full_param_flags_and_asserts():
     a = D.parse_args(_BASE + ["--full-param", "--init-adapter", "none", "--autocast-bf16"])
     assert a.full_param and a.init_adapter is None and a.publish_mode == "nccl" and a.wu_port == a.master_port + 111
     assert a.mb_target_frac == 0.85 and a.autocast_bf16 is False and a.scorer_shard is True and a.fs_keep_steps == 2
+    assert a.chunked_head is True and a.suffix_ckpt is False and a.fsdp_prefetch == 2          # fast defaults; ckpt needs --prefix-cache
+    f = D.parse_args(_BASE + ["--full-param", "--init-adapter", "none", "--prefix-cache"])
+    assert f.suffix_ckpt is True and f.chunked_head is True and f.fsdp_prefetch == 2
+    g = D.parse_args(_BASE + ["--full-param", "--init-adapter", "none", "--prefix-cache", "--no-suffix-ckpt", "--no-chunked-head", "--fsdp-prefetch", "0"])
+    assert g.suffix_ckpt is False and g.chunked_head is False and g.fsdp_prefetch == 0       # the first validated (production) configuration
     b = D.parse_args(_BASE)
-    assert not b.full_param and b.mb_target_frac == 0.85 and b.autocast_bf16 is False
+    assert not b.full_param and b.mb_target_frac == 0.85 and b.autocast_bf16 is False and b.suffix_ckpt is False and b.chunked_head is False and b.fsdp_prefetch == 0
     for bad in (["--full-param", "--init-adapter", "/x"], ["--full-param", "--inline-eval-every", "5"],
                 ["--full-param", "--backend", "gloo"], ["--full-param", "--n-trainer", "1"], ["--full-param", "--publish-fp32"]):
         try:

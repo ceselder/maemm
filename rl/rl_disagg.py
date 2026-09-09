@@ -310,20 +310,24 @@ def parse_args(argv=None):
                          "next block boundary")
     ap.add_argument("--wu-port", type=int, default=0, help="--publish-mode nccl: TCP store port of the weight-update group (0 = --master-port + 111)")
     ap.add_argument("--fs-keep-steps", type=int, default=2, help="--publish-mode fs: shard sets kept in --work-dir (each ~54 GB)")
-    ap.add_argument("--fsdp-prefetch", type=int, default=0, help="--full-param: explicit FSDP2 all-gather prefetch depth (sft/fullft.py; 0 = implicit)")
+    ap.add_argument("--fsdp-prefetch", type=int, default=None, help="--full-param: explicit FSDP2 all-gather prefetch depth (sft/fullft.py; default 2 = the fast configuration; 0 = implicit one-ahead)")
     ap.add_argument("--no-scorer-shard", dest="scorer_shard", action="store_false", default=True,
                     help="--full-param: keep the frozen scorer copy of MODEL UNsharded on every rank (~35 GB/rank instead of ~7) -- debug only")
     ap.add_argument("--mb-target-frac", type=float, default=0.0,
                     help="micro-batch probe: largest candidate predicted under this fraction of GPU memory (0 = 0.85). --full-param: the "
                          "budget also reserves the not-yet-allocated AdamW moments (2 x the fp32 master shard) and the probe walks the "
                          "candidates upwards, measuring each (an OOM inside an FSDP2 forward is not recoverable)")
-    ap.add_argument("--suffix-ckpt", action="store_true",
+    ap.add_argument("--suffix-ckpt", dest="suffix_ckpt", action="store_true", default=None,
                     help="--full-param: exact per-layer activation checkpointing of the SUFFIX forward (sft/prefix_cache.SuffixCheckpointer; "
-                         "needs --prefix-cache): recompute in the backward -> the micro-batch can grow 4-8x, i.e. that many fewer per-micro-batch "
-                         "FSDP2 all-gathers/reduce-scatters (the entire update cost at mb 8)")
-    ap.add_argument("--chunked-head", action="store_true",
+                         "needs --prefix-cache): recompute in the backward -> the micro-batch grows 3x (8 -> 24 on 5 B200 ranks), i.e. that many fewer "
+                         "per-micro-batch FSDP2 all-gathers/reduce-scatters (the entire update cost). DEFAULT ON with --full-param + --prefix-cache "
+                         "(68 -> 44 s/step measured); --no-suffix-ckpt = the first validated configuration")
+    ap.add_argument("--no-suffix-ckpt", dest="suffix_ckpt", action="store_false")
+    ap.add_argument("--chunked-head", dest="chunked_head", action="store_true", default=None,
                     help="--full-param: never materialize [tokens x 248k] logits -- lm_head + fp32 log-softmax + gather/entropy per --vocab-chunk "
-                         "positions under torch.utils.checkpoint (rl_fullparam.ChunkedHead; same math as --fp32-head + _chunked_logp)")
+                         "positions under torch.utils.checkpoint (rl_fullparam.ChunkedHead; same math as --fp32-head + _chunked_logp). DEFAULT ON "
+                         "with --full-param; --no-chunked-head = the fp32-head hook")
+    ap.add_argument("--no-chunked-head", dest="chunked_head", action="store_false")
     ap.add_argument("--save-optim", action="store_true", help="--full-param: also write the sharded AdamW state (torch.distributed.checkpoint, fp32, ~2x the model) next to each checkpoint")
     ap.add_argument("--load-optim", default=None, help="--full-param: <ckpt>/optim_dcp dir to restore the AdamW state from (same world size)")
     a = ap.parse_args(argv)
@@ -352,9 +356,18 @@ def parse_args(argv=None):
             assert a.n_trainer >= 2, "--full-param needs >= 2 trainer ranks (fp32 masters + AdamW of the 27B do not fit one GPU)"
         if a.autocast_bf16:   # FSDP2 MixedPrecisionPolicy(param_dtype=bf16) already runs the compute in bf16 (sft/pretrain.py does the same)
             a.autocast_bf16 = False
+        # the FAST configuration is the default (bench 2026-09-09: 68 -> 44 s/step, peak 151 -> 139 GB); explicit --no-* flags opt out
+        if a.suffix_ckpt is None:
+            a.suffix_ckpt = bool(a.prefix_cache)
+        if a.chunked_head is None:
+            a.chunked_head = True
+        if a.fsdp_prefetch is None:
+            a.fsdp_prefetch = 2
         assert not a.suffix_ckpt or a.prefix_cache, "--suffix-ckpt is a --prefix-cache knob"
     else:
         assert not (a.suffix_ckpt or a.chunked_head), "--suffix-ckpt / --chunked-head are --full-param knobs"
+        a.suffix_ckpt, a.chunked_head = False, False
+        a.fsdp_prefetch = a.fsdp_prefetch or 0
     if a.rollout_block_groups <= 0:
         a.rollout_block_groups = max(1, a.groups_per_step // max(a.n_rollout, 1))
     assert a.groups_per_step % a.rollout_block_groups == 0, "groups_per_step must be a multiple of rollout_block_groups"
