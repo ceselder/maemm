@@ -18,10 +18,19 @@ reader's per-file line offsets snapshotted only after the pending-window queue i
 drained — a rerun skips exactly the consumed lines, never duplicating or dropping windows.
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
 import time
+
+ALIGN = 512   # docs are hashed at 512-token offsets (== the store's window cut) so any doc that contributed a row is caught
+
+
+def span_hash(ids, n=64):
+    """sha1[:16] of the first n token ids (int32) — the suite's document-exclusion key (== collect_bank_worker.span_hash)."""
+    import numpy as np
+    return hashlib.sha1(np.asarray(ids[:n], dtype=np.int32).tobytes()).hexdigest()[:16]
 
 
 def log(rank, *a):
@@ -174,8 +183,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True, help="shard dir (on the volume)")
     ap.add_argument("--assignment", required=True, help="json from the driver: mode + file slices")
+    ap.add_argument("--exclude-hashes", default="", help="json list of 16-hex span hashes; docs whose 512-aligned window "
+                    "starts hash into it are skipped (fresh stores must not re-use eval / existing-store documents)")
     a = ap.parse_args()
     r, L = a.rank, a.seq_len
+    excl = set(json.load(open(a.exclude_hashes))) if a.exclude_hashes else set()
 
     sys.path.insert(0, "/pmx/helpers")
     import numpy as np
@@ -189,6 +201,7 @@ def main():
     mu_path = f"{a.out}/musum_r{r}.npy"
 
     chunks, kept, mu_count, reader_state = [], 0, 0, None
+    n_docs, n_skipped_docs = 0, 0
     musum = np.zeros(D_MODEL, dtype=np.float64)
     if os.path.exists(man_path):
         man = json.load(open(man_path))
@@ -196,6 +209,7 @@ def main():
             log(r, f"already done ({man['kept']} seqs) — nothing to do")
             return
         chunks, kept, mu_count = man["chunks"], man["kept"], man["mu_count"]
+        n_docs, n_skipped_docs = man.get("docs", 0), man.get("skipped_docs", 0)
         reader_state = man["reader_state"]
         musum = np.load(mu_path).astype(np.float64)
         log(r, f"RESUME: {kept}/{a.n_seq} seqs in {len(chunks)} chunks")
@@ -209,7 +223,7 @@ def main():
         MODEL, dtype=torch.bfloat16, attn_implementation="sdpa",
         local_files_only=True, device_map={"": "cuda:0"}).eval()
     assert model.config.hidden_size == D_MODEL, model.config.hidden_size
-    log(r, f"model up in {time.time() - t0:.0f}s (bos={bos})")
+    log(r, f"model up in {time.time() - t0:.0f}s (bos={bos}); exclusion set: {len(excl)} span hashes")
 
     if assign["mode"] == "fffw":
         reader = FffwReader(assign["repo"], assign["ranks"][r], reader_state, r)
@@ -219,7 +233,7 @@ def main():
     def write_manifest(done):
         m = {"rank": r, "n_seq_target": a.n_seq, "kept": kept, "mu_count": mu_count,
              "chunks": chunks, "reader_state": reader.state(), "done": done,
-             "bos_id": int(bos), "mode": assign["mode"]}
+             "bos_id": int(bos), "mode": assign["mode"], "docs": n_docs, "skipped_docs": n_skipped_docs}
         with open(man_path + ".tmp", "w") as f:
             json.dump(m, f)
         os.replace(man_path + ".tmp", man_path)
@@ -275,6 +289,10 @@ def main():
     for text in reader.docs():
         ids = tok(text, add_special_tokens=False, truncation=True,
                   max_length=a.max_wins * L + 8)["input_ids"]
+        n_docs += 1
+        if excl and any(span_hash(ids[s:]) in excl for s in range(0, len(ids), ALIGN)):
+            n_skipped_docs += 1
+            continue
         nw = 0
         for s in range(0, len(ids) - L + 1, L):
             pending.append(ids[s:s + L])
@@ -299,7 +317,7 @@ def main():
         write_manifest(done=False)
         raise RuntimeError(f"rank {r}: corpus exhausted at {kept}/{a.n_seq} seqs")
     write_manifest(done=True)
-    log(r, f"DONE {kept} seqs ({kept * L:,} tokens) in {(time.time() - t0) / 60:.1f} min")
+    log(r, f"DONE {kept} seqs ({kept * L:,} tokens) from {n_docs} docs ({n_skipped_docs} excluded by hash) in {(time.time() - t0) / 60:.1f} min")
 
 
 if __name__ == "__main__":

@@ -108,38 +108,44 @@ def neuron_sets(st, rel_thr=REL_THR, cand_max=CAND_MAX, sparse_max=SPARSE_MAX):
 # ----------------------------------------------------------------------------------------------------------------
 # stage: scan
 # ----------------------------------------------------------------------------------------------------------------
-def sample_windows(n_windows, win_len, seed, sel_file):
-    """Fresh window sample for an EXPANDED scan. Every (TRAIN row < ceil(0.95 * n_seq), offset in {0, win_len, ...}) slot of
-    /data/acts27b/toks.i32 is a candidate (2 per 512-token row at win_len 256 -> 95,546 slots); `n_windows` are drawn
-    without replacement with `seed` and saved to `sel_file` (same keys as sel_windows.npz + `off`, `seed`, `n_windows`).
-    Rows >= n_train are the acts27b eval hold-out and are never touched. An existing file is reused iff its
-    (n_windows, win_len, seed) match, so a scan can be relaunched without re-sampling."""
+def sample_windows(n_windows, win_len, seed, sel_file, acts_dir=None, train_frac=0.95):
+    """Fresh window sample for an EXPANDED scan. Every (TRAIN row < ceil(train_frac * n_seq), offset in {0, win_len, ...}) slot
+    of <acts_dir>/toks.i32 is a candidate (2 per 512-token row at win_len 256 -> 95,546 slots on acts27b); `n_windows` are
+    drawn without replacement with `seed` and saved to `sel_file` (same keys as sel_windows.npz + `off`, `seed`, `n_windows`,
+    `acts_dir`). acts_dir None = /data/acts27b with train_frac 0.95 (rows >= n_train are the acts27b eval hold-out and are
+    never touched); a FRESH store (data/modal_acts27b_fresh.py) has no hold-out -> train_frac 1.0. An existing file is
+    reused iff its (n_windows, win_len, seed, acts_dir) match, so a scan can be relaunched without re-sampling."""
+    acts_dir = acts_dir or W.ACTS
     if os.path.exists(sel_file):
         sw = np.load(sel_file)
         assert (int(sw["n_windows"]), int(sw["win_len"]), int(sw["seed"])) == (n_windows, win_len, seed), sel_file
-        log(f"reusing {sel_file}: {sw['ids'].shape} windows (seed {seed})")
+        assert (str(sw["acts_dir"]) if "acts_dir" in sw else W.ACTS) == acts_dir, (sel_file, acts_dir)
+        log(f"reusing {sel_file}: {sw['ids'].shape} windows (seed {seed}, store {acts_dir})")
         return sw
-    meta = json.load(open(f"{W.ACTS}/meta.json"))
+    meta = json.load(open(f"{acts_dir}/meta.json"))
     NS, T = int(meta["n_seq"]), int(meta["seq_len"])
-    n_train = int(math.ceil(NS * 0.95))                                 # == W.load_windows: rows >= n_train are the eval hold-out
+    n_train = int(math.ceil(NS * train_frac))                           # acts27b: == W.load_windows (rows >= n_train = eval hold-out)
     n_off = T // win_len
-    toks = np.fromfile(f"{W.ACTS}/toks.i32", np.int32).reshape(NS, T)
+    toks = np.fromfile(f"{acts_dir}/toks.i32", np.int32).reshape(NS, T)
     rng = np.random.default_rng(seed)
     pick = np.sort(rng.choice(n_train * n_off, n_windows, replace=False))
     sel = (pick // n_off).astype(np.int64); off = ((pick % n_off) * win_len).astype(np.int64)
     assert sel.max() < n_train and (off + win_len <= T).all()
     ids = toks[sel[:, None], off[:, None] + np.arange(win_len)[None, :]].astype(np.int32)
-    np.savez(sel_file, sel_windows=sel, off=off, ids=ids, bos=W.BOS, n_train=n_train, n_windows=n_windows, win_len=win_len, seed=seed)
-    log(f"sampled {n_windows} x {win_len}-token windows from {n_train} train rows x {n_off} offsets (seed {seed}) -> {sel_file}")
+    np.savez(sel_file, sel_windows=sel, off=off, ids=ids, bos=W.BOS, n_train=n_train, n_windows=n_windows, win_len=win_len, seed=seed,
+             acts_dir=acts_dir, train_frac=train_frac)
+    log(f"sampled {n_windows} x {win_len}-token windows from {n_train} train rows x {n_off} offsets of {acts_dir} (seed {seed}) -> {sel_file}")
     return np.load(sel_file)
 
 
 @torch.no_grad()
-def run_scan(model, n_windows=1600, win_len=256, batch=16, topk=32, dev="cuda:0", sample_seed=None, sel_file=None, scan_file=None):
+def run_scan(model, n_windows=1600, win_len=256, batch=16, topk=32, dev="cuda:0", sample_seed=None, sel_file=None, scan_file=None,
+             acts_dir=None, train_frac=0.95):
     """sample_seed None (today's bank): the first n_windows of /data/mlp42/sel_windows.npz -> /data/mlp42/bank_scan.npz.
-    sample_seed set (expanded bank): a fresh seeded sample of n_windows windows over ALL acts27b TRAIN rows (both 256-token
-    halves, see sample_windows) saved to sel_file, scanned into scan_file. Both must be NEW paths; an existing scan file is
-    never overwritten."""
+    sample_seed set (expanded bank): a fresh seeded sample of n_windows windows over ALL TRAIN rows of acts_dir (default
+    /data/acts27b, first 95%; a fresh store passes train_frac=1.0; both win_len-token slots per row, see sample_windows)
+    saved to sel_file, scanned into scan_file. Both must be NEW paths; an existing scan file is never overwritten."""
+    acts_dir = acts_dir or W.ACTS
     sel_file = sel_file or f"{OUT}/sel_windows.npz"; scan_file = scan_file or f"{OUT}/bank_scan.npz"
     assert not os.path.exists(scan_file), f"{scan_file} exists — refusing to overwrite a scan"
     st = np.load(f"{OUT}/neuron_stats.npz")
@@ -147,7 +153,7 @@ def run_scan(model, n_windows=1600, win_len=256, batch=16, topk=32, dev="cuda:0"
         sw = np.load(sel_file)
     else:
         assert sel_file != f"{OUT}/sel_windows.npz" and scan_file != f"{OUT}/bank_scan.npz", "an expanded scan must use new file names"
-        sw = sample_windows(n_windows, win_len, sample_seed, sel_file)
+        sw = sample_windows(n_windows, win_len, sample_seed, sel_file, acts_dir=acts_dir, train_frac=train_frac)
     N = int(st["N"])
     assert int(sw["ids"].shape[1]) == win_len and n_windows <= sw["ids"].shape[0], (sw["ids"].shape, n_windows)
     ids_np = sw["ids"][:n_windows]; sel = sw["sel_windows"][:n_windows]
@@ -194,7 +200,7 @@ def run_scan(model, n_windows=1600, win_len=256, batch=16, topk=32, dev="cuda:0"
     nf = n_fire.cpu().numpy()
     log(f"scan done in {time.time() - t0:.0f}s: sparse events {len(ev_tok)} | universe neurons with >=1 firing "
         f"{int((nf[cand_ids] > 0).sum())}/{len(cand_ids)} | sparse pairs C>=10: {int((torch.triu(C_ss, 1) >= 10).sum())}")
-    np.savez(scan_file, n_windows=n_windows, win_len=win_len, T=T, sel=sel, off=off, sel_file=sel_file,
+    np.savez(scan_file, n_windows=n_windows, win_len=win_len, T=T, sel=sel, off=off, sel_file=sel_file, acts_dir=acts_dir,
              sample_seed=-1 if sample_seed is None else int(sample_seed), rel_thr=REL_THR,
              n_fire=nf, sum_fire=sum_fire.cpu().numpy(), topv=topv.cpu().numpy(), topi=topi.cpu().numpy(),
              ev_tok=ev_tok, ev_nid=ev_nid, ev_val=ev_val, C_ss=C_ss.to(torch.int32).cpu().numpy(),
@@ -240,7 +246,8 @@ def _alloc(counts, total, floor=0):
 @torch.no_grad()
 def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512, n_eval_pair=256, k_single=8, k_pair=4,
               w_lo=16, w_hi=32, min_tok=8, min_c=10, min_lift=10.0, max_p=1e-10, check_mix=True,
-              scan_file=None, bank_out=BANK_OUT, write_eval_cache=True, selection_file=None):
+              scan_file=None, bank_out=BANK_OUT, write_eval_cache=True, selection_file=None,
+              distinct_windows=False, k_triple=0, min_c3=None, eval_cos_max=LEAK_COS):
     """min_c is an ABSOLUTE joint-firing count on the scan tokens: the original rule (C >= 10 at T = 409,600) is a joint-firing
     RATE floor of 2.4e-5, so an expanded scan with T tokens keeps the same semantics with min_c = round(10 * T / 409600)
     (500 at 20.48M tokens); lift and the Poisson p are scale-free.
@@ -250,7 +257,17 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
     directions are READ from the existing v2 cache and excluded exactly as before — held-out neurons and every pair touching
     one never become bank rows, and the leak check runs against every v2 eval direction family + pool_heldout. Every usable
     neuron of the scan that is not held out is a train neuron (this includes neurons that never fired in the 410k-token scan
-    and therefore sat outside the original universe; their count is reported)."""
+    and therefore sat outside the original universe; their count is reported).
+    distinct_windows=True: at most ONE row per (neuron|pair|triple, scan window) — the strongest firing token of each window
+    (rows are then distinct text windows rather than several tokens of one window).
+    k_triple > 0 adds the family "mlp_triple": triangles of the strong-pair graph (all three pairs strong, all three members
+    train neurons) with >= min_c3 (default max(10, min_c // 10)) tokens where ALL THREE fire; direction at a joint token =
+    unit(a_i col_i + a_j col_j + a_k col_k) (raw activations at that token), target = window ending at that token, top-k_triple
+    joint tokens per triple by min normalized activation.
+    eval_cos_max (< LEAK_COS to activate; the 5M bank used 0.99): rows whose direction has cos > eval_cos_max to ANY eval mlp / mlp_pair
+    direction are dropped, and every train neuron that DOMINATES an eval pair direction (cos(pair_dir, unit col) > eval_cos_max) is
+    treated as held-out (its singles and every pair/triple containing it are dropped) — an eval "pair" whose direction is 0.99-close to
+    one train member's column is effectively that single train direction (audit 2026-09-09: 5 of 256 eval pairs, 1,478 rows at 0.999)."""
     T0 = time.time()
     scan_file = scan_file or f"{OUT}/bank_scan.npz"
     selection_file = selection_file or f"{OUT}/bank_selection.json"
@@ -278,9 +295,10 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
     assert sw["ids"].shape[0] >= n_windows and sw["ids"].shape[1] == win_len, (sw["ids"].shape, n_windows, win_len)
     ids_np = sw["ids"][:n_windows]; sel = sc["sel"]
     off = sc["off"] if "off" in sc else np.zeros(n_windows, np.int64)
-    scan_desc = {"n_windows": n_windows, "win_len": win_len, "T": T, "scan_file": scan_file, "sel_file": sel_file,
+    acts_dir = str(sc["acts_dir"]) if "acts_dir" in sc else W.ACTS
+    scan_desc = {"n_windows": n_windows, "win_len": win_len, "T": T, "scan_file": scan_file, "sel_file": sel_file, "acts_dir": acts_dir,
                  "windows": (f"first {n_windows} windows of {sel_file} (acts27b TRAIN rows, seed 0)" if sample_seed < 0 else
-                             f"{n_windows} windows sampled with seed {sample_seed} over acts27b TRAIN rows x both {win_len}-token halves ({sel_file})")}
+                             f"{n_windows} windows sampled with seed {sample_seed} over {acts_dir} TRAIN rows x all {win_len}-token slots ({sel_file})")}
     max_abs = st["max_abs"].astype(np.float64); pol = st["polarity"].astype(np.float32)
     freq_rel, band = sc["freq_rel"], sc["band"]
     cand_ids, sparse_ids = sc["cand_ids"], sc["sparse_ids"]
@@ -399,6 +417,41 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
         d = a_i * wnorm[i] * signed[i] + a_j * wnorm[j] * signed[j]      # == a_raw_i * col_i + a_raw_j * col_j
         return d / np.linalg.norm(d)
 
+    # ---- triples: triangles of the strong-pair graph (i<j<k, all three pairs strong), all-train, >= min_c3 joint firings ----
+    tr_triples, tri_stats = [], {}
+    if k_triple > 0:
+        min_c3 = int(min_c3) if min_c3 is not None else max(10, min_c // 10)
+        pair_of = {(p["i"], p["j"]): p for p in pairs}                  # every usable strong pair (held-out-touching ones filtered below)
+        adj = {}
+        for (i, j) in pair_of:
+            adj.setdefault(i, set()).add(j); adj.setdefault(j, set()).add(i)
+        n_cand = n_ho3 = n_lowc = 0
+        for (i, j), pij in pair_of.items():
+            for k in sorted(adj[i] & adj[j]):
+                if k <= j:                                              # each triangle once
+                    continue
+                n_cand += 1
+                if i in ho_set or j in ho_set or k in ho_set:
+                    n_ho3 += 1; continue
+                pik, pjk = pair_of[(i, k)], pair_of[(j, k)]
+                joint, ii, kk = np.intersect1d(pij["joint"], pik["joint"], assume_unique=True, return_indices=True)
+                if len(joint) < min_c3:
+                    n_lowc += 1; continue
+                a_i, a_j, a_k = pij["a_i"][ii], pij["a_j"][ii], pik["a_j"][kk]     # pik = (i, k): its "a_j" is neuron k
+                E3 = float(n_fire[i]) * float(n_fire[j]) * float(n_fire[k]) / float(T) ** 2
+                tr_triples.append({"i": i, "j": j, "k": k, "C": int(len(joint)), "E": E3, "lift": float(len(joint) / max(E3, 1e-12)),
+                                   "joint": joint, "a_i": a_i, "a_j": a_j, "a_k": a_k,
+                                   "pair_C": [pij["C"], pik["C"], pjk["C"]], "pair_lift": [pij["lift"], pik["lift"], pjk["lift"]],
+                                   "usable_pos": (joint % win_len) >= min_tok - 1, "band_min": int(min(band[i], band[j], band[k]))})
+        tr_triples = [t for t in tr_triples if t["usable_pos"].any()]
+        tri_stats = {"triangles_in_strong_pair_graph": n_cand, "touching_heldout_excluded": n_ho3, "below_min_c3": n_lowc, "min_c3": min_c3,
+                     "train_with_usable_token": len(tr_triples),
+                     "C_quantiles": ({q: float(np.percentile([t["C"] for t in tr_triples], q)) for q in (10, 50, 90)} if tr_triples else None),
+                     "rule": f"i<j<k with (i,j),(i,k),(j,k) all strong pairs ({pair_rule if 'pair_rule' in dir() else 'see pairs.rule'}), no held-out member, "
+                             f">= {min_c3} tokens where all three fire; direction = unit(a_i col_i + a_j col_j + a_k col_k) at the joint token"}
+        log(f"triples: {n_cand} triangles in the strong-pair graph | {n_ho3} touch a held-out neuron (excluded) | {n_lowc} below C3 >= {min_c3} | "
+            f"{len(tr_triples)} all-train triples with a usable joint token")
+
     # ---- eval directions + cache v2 (today's build only) ----
     if write_eval_cache:
         mlp_dirs = torch.from_numpy(signed[eval_single]).float()
@@ -458,28 +511,43 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
         Wn = int(wrng.integers(w_lo, w_hi + 1)); start = max(0, p - Wn + 1)
         ids = ids_np[w, start:p + 1].tolist()
         return {"seq": int(sel[w]), "seq_off": int(off[w]), "window": w, "pos": p, "start": start, "n_tok": len(ids), "fire_from_end": 0,
-                "target_text": tok.decode(ids)}
-    recs, kind, n1, n2, a1, a2 = [], [], [], [], [], []
+                "peak_pos": len(ids) - 1, "target_text": tok.decode(ids)}
+    recs, kind, n1, n2, n3, a1, a2, a3 = [], [], [], [], [], [], [], []
     n_short_txt = 0
+    dup_win = {"mlp": 0, "mlp_pair": 0, "mlp_triple": 0}
+
+    def top_tokens(g_sorted, v_sorted, k, fam):
+        """(g, v) sorted by v desc -> up to k (g, v); distinct_windows keeps only the strongest token of every scan window."""
+        if not distinct_windows:
+            return list(zip(g_sorted[:k].tolist(), v_sorted[:k].tolist()))
+        out, seen = [], set()
+        for gg, vv in zip(g_sorted.tolist(), v_sorted.tolist()):
+            w = gg // win_len
+            if w in seen:
+                dup_win[fam] += 1; continue
+            seen.add(w); out.append((gg, vv))
+            if len(out) >= k:
+                break
+        return out
+
     for i in train.tolist():
         g, v = contexts(i)
-        for r, (gg, vv) in enumerate(zip(g[:k_single].tolist(), v[:k_single].tolist())):
+        for r, (gg, vv) in enumerate(top_tokens(g, v, k_single, "mlp")):
             rec = window(gg)
             if len(rec["target_text"].strip()) < 3:
                 n_short_txt += 1; continue
             rec.update({"family": "mlp", "neuron": i, "polarity": float(pol[i]), "corpus_max": float(max_abs[i]), "act": float(vv),
                         "norm_act": float(vv / max_abs[i]), "window_rank": r, "freq_rel": float(freq_rel[i]), "band": BAND_NAMES[band[i]],
                         "n_fire_scan": int(n_fire[i])})
-            recs.append(rec); kind.append(0); n1.append(i); n2.append(-1); a1.append(0.0); a2.append(0.0)
+            recs.append(rec); kind.append(0); n1.append(i); n2.append(-1); n3.append(-1); a1.append(0.0); a2.append(0.0); a3.append(0.0)
     n_single_rows = len(recs)
     for p in tr_pairs:
         i, j = p["i"], p["j"]
         strength = np.minimum(p["a_i"] / max_abs[i], p["a_j"] / max_abs[j])
         strength = np.where(p["usable_pos"], strength, -np.inf)
-        top = np.argsort(-strength)[:k_pair]
-        for r, q in enumerate(top.tolist()):
-            if not np.isfinite(strength[q]):
-                break
+        order_q = np.argsort(-strength); fin = np.isfinite(strength[order_q]); order_q = order_q[fin]
+        for r, (q, _) in enumerate(top_tokens(p["joint"][order_q], strength[order_q], k_pair, "mlp_pair")):
+            q = int(np.flatnonzero(p["joint"] == q)[0])
             rec = window(int(p["joint"][q]))
             if len(rec["target_text"].strip()) < 3:
                 n_short_txt += 1; continue
@@ -488,24 +556,47 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
                         "corpus_max": [float(max_abs[i]), float(max_abs[j])], "acts": [a_i, a_j],
                         "norm_acts": [a_i / float(max_abs[i]), a_j / float(max_abs[j])], "acts_co": [p["a_i_co"], p["a_j_co"]],
                         "C": p["C"], "lift": p["lift"], "window_rank": r, "band_min": BAND_NAMES[p["band_min"]]})
-            recs.append(rec); kind.append(1); n1.append(i); n2.append(j); a1.append(a_i); a2.append(a_j)
+            recs.append(rec); kind.append(1); n1.append(i); n2.append(j); n3.append(-1); a1.append(a_i); a2.append(a_j); a3.append(0.0)
     n_pair_rows = len(recs) - n_single_rows
-    kind = np.asarray(kind, np.int8); n1 = np.asarray(n1, np.int64); n2 = np.asarray(n2, np.int64)
-    a1 = np.asarray(a1, np.float64); a2 = np.asarray(a2, np.float64)
+    for p in tr_triples:
+        i, j, k = p["i"], p["j"], p["k"]
+        strength = np.minimum(np.minimum(p["a_i"] / max_abs[i], p["a_j"] / max_abs[j]), p["a_k"] / max_abs[k])
+        strength = np.where(p["usable_pos"], strength, -np.inf)
+        order_q = np.argsort(-strength); fin = np.isfinite(strength[order_q]); order_q = order_q[fin]
+        for r, (q, _) in enumerate(top_tokens(p["joint"][order_q], strength[order_q], k_triple, "mlp_triple")):
+            q = int(np.flatnonzero(p["joint"] == q)[0])
+            rec = window(int(p["joint"][q]))
+            if len(rec["target_text"].strip()) < 3:
+                n_short_txt += 1; continue
+            a_i, a_j, a_k = float(p["a_i"][q]), float(p["a_j"][q]), float(p["a_k"][q])
+            rec.update({"family": "mlp_triple", "neurons": [i, j, k], "polarity": [float(pol[i]), float(pol[j]), float(pol[k])],
+                        "corpus_max": [float(max_abs[i]), float(max_abs[j]), float(max_abs[k])], "acts": [a_i, a_j, a_k],
+                        "norm_acts": [a_i / float(max_abs[i]), a_j / float(max_abs[j]), a_k / float(max_abs[k])],
+                        "C": p["C"], "lift": p["lift"], "pair_C": p["pair_C"], "window_rank": r, "band_min": BAND_NAMES[p["band_min"]]})
+            recs.append(rec); kind.append(2); n1.append(i); n2.append(j); n3.append(k); a1.append(a_i); a2.append(a_j); a3.append(a_k)
+    n_triple_rows = len(recs) - n_single_rows - n_pair_rows
+    kind = np.asarray(kind, np.int8); n1 = np.asarray(n1, np.int64); n2 = np.asarray(n2, np.int64); n3 = np.asarray(n3, np.int64)
+    a1 = np.asarray(a1, np.float64); a2 = np.asarray(a2, np.float64); a3 = np.asarray(a3, np.float64)
+    FAM3 = ("mlp", "mlp_pair", "mlp_triple")
 
     def materialize(idx):
-        """Unit direction of staged rows idx: signed[i] for mlp, unit(a_i col_i + a_j col_j) for mlp_pair (== composite)."""
+        """Unit direction of staged rows idx: signed[i] for mlp, unit(a_i col_i + a_j col_j [+ a_k col_k]) for mlp_pair / mlp_triple."""
         idx = np.asarray(idx, np.int64)
         d = np.empty((len(idx), D_MODEL), np.float32)
         ms = kind[idx] == 0
         d[ms] = signed[n1[idx[ms]]]
-        mp = ~ms
+        mp = kind[idx] >= 1
         if mp.any():
             ii, jj = n1[idx[mp]], n2[idx[mp]]
             d[mp] = (a1[idx[mp]] * wnorm[ii])[:, None] * signed[ii] + (a2[idx[mp]] * wnorm[jj])[:, None] * signed[jj]
+        mt = kind[idx] == 2
+        if mt.any():
+            kk = n3[idx[mt]]
+            d[mt] += (a3[idx[mt]] * wnorm[kk])[:, None] * signed[kk]
         return F.normalize(torch.from_numpy(d), dim=-1)
-    log(f"staged {len(recs)} rows: mlp {n_single_rows} (from {len(train)} neurons), mlp_pair {n_pair_rows} (from {len(tr_pairs)} pairs); "
-        f"dropped short texts {n_short_txt} ({time.time() - T0:.0f}s)")
+    log(f"staged {len(recs)} rows: mlp {n_single_rows} (from {len(train)} neurons), mlp_pair {n_pair_rows} (from {len(tr_pairs)} pairs), "
+        f"mlp_triple {n_triple_rows} (from {len(tr_triples)} triples); dropped short texts {n_short_txt}; distinct_windows={distinct_windows} "
+        f"(same-window tokens skipped {dup_win}) ({time.time() - T0:.0f}s)")
 
     # ---- leak check vs EVERY v2 eval direction family + pool_heldout rows; drop leakers ----
     ref_names = sorted(k[:-5] for k in v2 if k.endswith("_dirs"))
@@ -516,7 +607,7 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
     ref = torch.cat(refs).to(dev)
     offs = np.cumsum([0] + [len(r) for r in refs])
     fam_arr = kind.astype(np.int64)
-    leak = np.full((2, len(ref_names)), -1.0)
+    leak = np.full((3, len(ref_names)), -1.0)
     n_staged = len(recs)
     maxcos = np.zeros(n_staged, np.float32); argref = np.zeros(n_staged, np.int64)
     for c0 in range(0, n_staged, 8192):
@@ -527,26 +618,51 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
         maxcos[c0:c1] = mx.cpu().numpy(); argref[c0:c1] = am.cpu().numpy()
         for ri in range(len(ref_names)):
             cm = cos[:, offs[ri]:offs[ri + 1]].max(1).values.cpu().numpy()
-            for fi in range(2):
+            for fi in range(3):
                 mm = fam_arr[c0:c1] == fi
                 if mm.any():
                     leak[fi, ri] = max(leak[fi, ri], float(cm[mm].max()))
     bad = maxcos > LEAK_COS
+    n_eval_cos = n_dom = 0
+    if eval_cos_max < LEAK_COS:
+        mlp_ref_idx = [ri for ri, n in enumerate(ref_names) if n in ("mlp", "mlp_pair")]
+        # (a) direction-level: max cos vs the eval mlp-family directions only
+        for c0 in range(0, n_staged, 8192):
+            c1 = min(c0 + 8192, n_staged)
+            x = materialize(np.arange(c0, c1)).to(dev)
+            for ri in mlp_ref_idx:
+                cm = (x @ ref[offs[ri]:offs[ri + 1]].T).max(1).values.cpu().numpy()
+                hit = cm > eval_cos_max
+                n_eval_cos += int((hit & ~bad[c0:c1]).sum()); bad[c0:c1] |= hit
+        # (b) neuron-level: train neurons dominating an eval pair direction
+        pd = F.normalize(v2["mlp_pair_dirs"].float(), dim=-1).numpy()
+        dom_neurons = set()
+        for (pi_, pj_), d_ in zip(v2["mlp_pair_neuron"].numpy().tolist(), pd):
+            for m in (int(pi_), int(pj_)):
+                if m not in ho_set and abs(float(d_ @ signed[m])) > eval_cos_max:
+                    dom_neurons.add(m)
+        if dom_neurons:
+            dn = np.array(sorted(dom_neurons), np.int64)
+            hit = np.isin(n1, dn) | np.isin(n2, dn) | np.isin(n3, dn)
+            n_dom = int((hit & ~bad).sum()); bad |= hit
+        log(f"eval-cos rule (cos > {eval_cos_max} vs eval mlp/mlp_pair dirs): +{n_eval_cos} rows; dominant-member rule: neurons {sorted(dom_neurons)} -> +{n_dom} rows")
     leak_examples = []
     for q in np.flatnonzero(bad)[:20].tolist():
         ri = int(np.searchsorted(offs, argref[q], side="right") - 1)
         leak_examples.append({"row": q, "family": recs[q]["family"], "ref": ref_names[ri], "cos": float(maxcos[q]),
                               "neuron": recs[q].get("neuron", recs[q].get("neurons"))})
     log(f"leak check: {int(bad.sum())} staged rows within cos>{LEAK_COS} of an eval/held-out direction -> dropped; examples {leak_examples[:5]}")
-    for fi, f in enumerate(("mlp", "mlp_pair")):
-        log(f"  max-cos {f:9s} " + " ".join(f"{n[:12]}={leak[fi, ri]:.3f}" for ri, n in enumerate(ref_names)))
+    for fi, f in enumerate(FAM3):
+        log(f"  max-cos {f:10s} " + " ".join(f"{n[:12]}={leak[fi, ri]:.3f}" for ri, n in enumerate(ref_names)))
     keep = ~bad
     recs = [r for r, k in zip(recs, keep) if k]
-    kind, n1, n2, a1, a2 = kind[keep], n1[keep], n2[keep], a1[keep], a2[keep]
+    kind, n1, n2, n3, a1, a2, a3 = kind[keep], n1[keep], n2[keep], n3[keep], a1[keep], a2[keep], a3[keep]
     Nb = len(recs)
     worst = max(float((materialize(np.arange(c0, min(c0 + 8192, Nb))).to(dev) @ ref.T).max()) for c0 in range(0, Nb, 8192))
     assert worst <= LEAK_COS, f"leak re-check failed: max cos {worst}"
     counts = {"mlp": int((kind == 0).sum()), "mlp_pair": int((kind == 1).sum())}
+    if k_triple > 0:
+        counts["mlp_triple"] = int((kind == 2).sum())
     rpn = np.bincount(n1[kind == 0], minlength=N)[train]                 # rows per TRAIN neuron after all filters
     rpn_hist = np.bincount(rpn, minlength=k_single + 1).tolist()
     n_uniq_win = len({(int(n1[q]), recs[q]["window"]) for q in np.flatnonzero(kind == 0).tolist()})
@@ -586,7 +702,11 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
     os.replace(f"{bank_out}/records.jsonl.tmp", wpath(f"{bank_out}/records.jsonl"))
     assert os.path.getsize(f"{bank_out}/vecs.f32") == Nb * D_MODEL * 4
     stats = {"kind": f"layer-42 MLP neuron directions: mlp = polarity*unit(down_proj col) x top-{k_single} firing windows (TRAIN neurons only); "
-                     "mlp_pair = unit(a_i col_i + a_j col_j) at joint-firing tokens of strong both-sparse co-firing pairs (both-train pairs)",
+                     "mlp_pair = unit(a_i col_i + a_j col_j) at joint-firing tokens of strong both-sparse co-firing pairs (both-train pairs)"
+                     + (f"; mlp_triple = unit(a_i col_i + a_j col_j + a_k col_k) at tokens where all three neurons of a strong-pair triangle fire "
+                        f"(top-{k_triple} per triple)" if k_triple > 0 else "")
+                     + (" — at most one row per (direction, scan window)" if distinct_windows else ""),
+             "acts_dir": acts_dir, "distinct_windows": bool(distinct_windows),
              "n_examples": Nb, "n_vecs": Nb, "families": counts, "layout": "seeded shuffle of all rows (records.jsonl line i == vec_idx i)",
              "seed": seed, "d_model": D_MODEL, "model": MODEL, "layer": READ_LAYER, "source": OUT, "eval_cache_v2": EVAL_CACHE_V2,
              "eval_cache_written": write_eval_cache, "scan_file": scan_file, "created": time.time()}
@@ -600,16 +720,20 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
                             "train_not_in_original_train": n_new_train},
                 "pairs": {"strong_total": int(len(pi)), "usable": int(len(pairs)), "heldout": int(len(ho_pairs)), "train_with_usable_token": int(len(tr_pairs)),
                           "rows_per_pair_max": k_pair, "rule": pair_rule},
+                "triples": ({**tri_stats, "rows_per_triple_max": k_triple} if k_triple > 0 else None),
+                "distinct_windows": {"enabled": bool(distinct_windows), "same_window_tokens_skipped": dup_win},
                 "eval": {"mlp": int(v2["mlp_dirs"].shape[0]), "mlp_pair": int(v2["mlp_pair_dirs"].shape[0]), "written": write_eval_cache},
-                "leak_check": {"threshold": LEAK_COS, "dropped_rows": int(bad.sum()), "examples": leak_examples,
-                               "max_cos_table": {f: {n: round(float(leak[fi, ri]), 4) for ri, n in enumerate(ref_names)} for fi, f in enumerate(("mlp", "mlp_pair"))}},
+                "leak_check": {"threshold": LEAK_COS, "dropped_rows": int(bad.sum()), "examples": leak_examples, "eval_cos_max": eval_cos_max,
+                               "dropped_by_eval_cos_rule": n_eval_cos, "dropped_by_dominant_member_rule": n_dom,
+                               "max_cos_table": {f: {n: round(float(leak[fi, ri]), 4) for ri, n in enumerate(ref_names)} for fi, f in enumerate(FAM3) if f in counts}},
                 "new_eval_dirs_vs_mix_1m_v2": mix_max, "dropped_short_text": n_short_txt, "scan": scan_desc, "created": time.time()}
     json.dump(stats, open(wpath(f"{bank_out}/build_stats.json"), "w"), indent=1)
     json.dump(meta_out, open(wpath(f"{bank_out}/meta.json"), "w"), indent=1)
     json.dump({"train_neurons": train.tolist(), "heldout_neurons": heldout.tolist(), "eval_single": eval_single.tolist(),
                "eval_pairs": [[p["i"], p["j"]] for p in eval_pairs] if write_eval_cache else ev_pair_neurons.tolist(),
                "train_pairs": [[p["i"], p["j"]] for p in tr_pairs],
-               "heldout_pairs": [[p["i"], p["j"]] for p in ho_pairs]}, open(wpath(selection_file), "w"))
+               "heldout_pairs": [[p["i"], p["j"]] for p in ho_pairs],
+               "train_triples": [[t["i"], t["j"], t["k"]] for t in tr_triples]}, open(wpath(selection_file), "w"))
     if cache_stat is not None:
         s1 = os.stat(EVAL_CACHE_V2)
         assert (s1.st_size, s1.st_mtime_ns) == cache_stat, f"{EVAL_CACHE_V2} changed during a write_eval_cache=False build!"
@@ -617,6 +741,7 @@ def run_build(tok, dev="cuda:0", seed=2026, heldout_frac=0.10, n_eval_single=512
     log(f"DONE -> {bank_out}: {Nb} rows {counts} | eval v2 {EVAL_CACHE_V2} ({'written' if write_eval_cache else 'read-only'}) | "
         f"{(time.time() - T0) / 60:.1f} min")
     return {"bank": bank_out, "n": Nb, "families": counts, "neurons": meta_out["neurons"], "pairs": meta_out["pairs"],
+            "triples": meta_out["triples"], "distinct_windows": meta_out["distinct_windows"],
             "eval": meta_out["eval"], "leak_dropped": int(bad.sum()), "leak_max_cos": meta_out["leak_check"]["max_cos_table"],
             "mix_check": mix_max, "minutes": round((time.time() - T0) / 60, 1)}
 
@@ -647,7 +772,8 @@ def run_verify(bank, ref_bank=BANK_OUT, dev="cuda:0", chunk=16384):
     ho = set(int(x) for x in m42["heldout_neurons"])
     eval_pairs = {tuple(sorted(map(int, p))) for p in v2["mlp_pair_neuron"].tolist()}
     eval_single = set(int(x) for x in v2["mlp_neuron"][:, 0].tolist())
-    fams, fields_ok, new_fields, rows_per_neuron, bank_pairs, n_ho_hit, n_eval_hit, n_lines = {}, {}, {}, {}, set(), 0, 0, 0
+    FAMS = ("mlp", "mlp_pair", "mlp_triple")
+    fams, fields_ok, new_fields, rows_per_neuron, bank_pairs, bank_triples, n_ho_hit, n_eval_hit, n_lines = {}, {}, {}, {}, set(), set(), 0, 0, 0
     fam_of = np.zeros(Nb, np.int8)
     with open(f"{bank}/records.jsonl") as fh:
         for i, line in enumerate(fh):
@@ -655,19 +781,22 @@ def run_verify(bank, ref_bank=BANK_OUT, dev="cuda:0", chunk=16384):
             assert int(r["vec_idx"]) == i, (i, r["vec_idx"])
             f = r["family"]; fams[f] = fams.get(f, 0) + 1
             fields_ok.setdefault(f, True); new_fields.setdefault(f, set(r))
-            fields_ok[f] &= ref_fields[f] <= set(r)
+            if f in ref_fields:
+                fields_ok[f] &= ref_fields[f] <= set(r)
             if f == "mlp":
                 n = int(r["neuron"]); rows_per_neuron[n] = rows_per_neuron.get(n, 0) + 1
                 n_ho_hit += n in ho; n_eval_hit += n in eval_single
             else:
-                fam_of[i] = 1
-                a, b = map(int, r["neurons"]); bank_pairs.add((min(a, b), max(a, b)))
-                n_ho_hit += (a in ho) + (b in ho); n_eval_hit += (min(a, b), max(a, b)) in eval_pairs
+                fam_of[i] = FAMS.index(f)
+                mem = tuple(sorted(map(int, r["neurons"])))
+                assert len(mem) == {"mlp_pair": 2, "mlp_triple": 3}[f] and len(set(mem)) == len(mem), (f, mem)
+                (bank_pairs if len(mem) == 2 else bank_triples).add(mem)
+                n_ho_hit += sum(m in ho for m in mem); n_eval_hit += (len(mem) == 2 and mem in eval_pairs)
     assert n_lines == Nb and fams == st["families"], (n_lines, Nb, fams, st["families"])
     ref_names = sorted(k[:-5] for k in v2 if k.endswith("_dirs"))
     ref = torch.cat([F.normalize(v2[f"{n}_dirs"].float(), dim=-1) for n in ref_names]).to(dev)
     offs = np.cumsum([0] + [int(v2[f"{n}_dirs"].shape[0]) for n in ref_names])
-    maxcos = np.full((2, len(ref_names)), -1.0); norm_min, norm_max = 9.0, 0.0
+    maxcos = np.full((3, len(ref_names)), -1.0); norm_min, norm_max = 9.0, 0.0
     for c0 in range(0, Nb, chunk):
         x = torch.from_numpy(np.ascontiguousarray(vecs[c0:c0 + chunk])).to(dev)
         nrm = x.norm(dim=-1); norm_min = min(norm_min, float(nrm.min())); norm_max = max(norm_max, float(nrm.max()))
@@ -675,17 +804,17 @@ def run_verify(bank, ref_bank=BANK_OUT, dev="cuda:0", chunk=16384):
         fa = fam_of[c0:c0 + chunk]
         for ri in range(len(ref_names)):
             cm = cos[:, offs[ri]:offs[ri + 1]].max(1).values.cpu().numpy()
-            for fi in range(2):
+            for fi in range(3):
                 mm = fa == fi
                 if mm.any():
                     maxcos[fi, ri] = max(maxcos[fi, ri], float(cm[mm].max()))
     rpn = np.array(list(rows_per_neuron.values()))
     out = {"bank": bank, "n_examples": Nb, "families": fams, "vecs": f"float32 [{Nb}, {D_MODEL}]", "norm_range": [norm_min, norm_max],
-           "record_fields_superset_of_ref": fields_ok, "extra_fields_vs_ref": {f: sorted(new_fields[f] - ref_fields[f]) for f in new_fields},
+           "record_fields_superset_of_ref": fields_ok, "extra_fields_vs_ref": {f: sorted(new_fields[f] - ref_fields.get(f, set())) for f in new_fields},
            "neurons_covered": int(len(rows_per_neuron)), "rows_per_neuron": {"mean": float(rpn.mean()), "min": int(rpn.min()), "max": int(rpn.max()),
                                                                              "hist": np.bincount(rpn).tolist()},
-           "distinct_pairs": len(bank_pairs), "heldout_neuron_hits": n_ho_hit, "eval_direction_hits": n_eval_hit,
-           "max_cos_vs_eval_dirs": {f: {n: round(float(maxcos[fi, ri]), 4) for ri, n in enumerate(ref_names)} for fi, f in enumerate(("mlp", "mlp_pair"))},
+           "distinct_pairs": len(bank_pairs), "distinct_triples": len(bank_triples), "heldout_neuron_hits": n_ho_hit, "eval_direction_hits": n_eval_hit,
+           "max_cos_vs_eval_dirs": {f: {n: round(float(maxcos[fi, ri]), 4) for ri, n in enumerate(ref_names)} for fi, f in enumerate(FAMS) if f in fams},
            "leak_threshold": LEAK_COS, "leak_ok": bool(maxcos.max() <= LEAK_COS), "seconds": round(time.time() - t0)}
     assert n_ho_hit == 0 and n_eval_hit == 0, out
     assert out["leak_ok"], out["max_cos_vs_eval_dirs"]

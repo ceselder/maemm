@@ -53,13 +53,24 @@ Run (MODAL_PROFILE=safety-sahan):
     modal run modal_bank_everything.py::run_peek                  # CPU: stats + sample rows
 Trainer: --data-dir /data/banks/everything --bank-file vecs.f32 --direction-source cluster
 Needs Modal secret `maemm-hf` (HF_TOKEN) for the one-time BSF download (cached to /data/bsf27b_1b).
+
+FRESH-STORE build for the 5M midtrain mix (bank-5m): deploy under a NEW app name and point the real-activation families at the
+fresh store (data/modal_acts27b_fresh.py) and the SAE family at the fresh max-acts (data/modal_sae_maxacts_fresh.py):
+    MAEMM_BANK_APP=maemm-bank-everything-5m modal deploy data/modal_bank_everything.py
+    build.spawn(out_name='banks/everything_5m_fresh', acts_dir='/data/acts27b_fresh', mu_path='/data/acts27b/whiten_mu.npy',
+                train_frac=1.0, eval_cache=EVAL_CACHE_V2, maxacts_path='/data/sae/maxacts_fresh.pt', sae_windows=9,
+                n_realact=0, n_realact_long=1_000_000, n_sae=1_000_000, n_bsf=1_000_000, n_cluster=1_000_000,
+                bsf_scan_seqs=80_000, bsf_cap=34, bsf_ranks=8, doc_cap=24, bsf_doc_cap=32, seed=5002)
+(n_realact=0: the short-context family of the 5M mix comes from the unused realact_short_20m_* parts instead, see
+data/modal_mix_5m_bank.py; per-family counts default to n_per_family; sae counts FEATURES, rows = features x sae_windows.)
 """
+import os
 from pathlib import Path
 
 import modal
 
 REPO = Path(__file__).resolve().parent.parent   # repo root (this launcher lives one level down)
-APP_NAME = "maemm-bank-everything"
+APP_NAME = os.environ.get("MAEMM_BANK_APP", "maemm-bank-everything")
 app = modal.App(APP_NAME)
 
 # same pins as modal_last5_bank.py / modal_acts27b.py (one environment across the suite)
@@ -77,6 +88,7 @@ PROBE_BANK = "/data/banks/last5_rp"                 # probe rows (family "cluste
 POOL_RL_MIX = "/data/pool_rl_mix"                   # indist_* eval reservation = last 2000 rows per family block
 POOL_HELDOUT = "/data/pool_heldout"                 # the eval's held-out pool (families bsf/realact/sae/jlens/cluster)
 EVAL_CACHE = "/data/eval_universal_ho/eval_sets_heldout.pt"
+EVAL_CACHE_V2 = "/data/eval_universal_ho/eval_sets_heldout_v2.pt"   # v1 + mlp / mlp_pair eval dirs (14 direction families)
 SAE_PT = "/data/sae/ae.pt"
 SAE_HF = ("ceselder/qwen36-27b-sae-l42", "saes_Qwen_Qwen3.6-27B_batch_top_k/resid_post_layer_42/trainer_0/ae.pt")
 SAE_HF_SIZE = 5369256453                            # byte size of that HF file (identity check of /data/sae/ae.pt)
@@ -85,7 +97,7 @@ BSF_HF = "ceselder/qwen36-27b-bsf-l42-1b"
 BSF_DIR = "/data/bsf27b_1b"                         # volume cache of the HF BSF files
 BSF_FILES = ("sasa.pt", "blocks_Q.pt", "whiten_mu.npy", "whiten_zca.npy", "meta.json")
 OUT_DEFAULT = "banks/everything"
-FAMILIES = ("realact", "realact_long", "sae", "bsf", "cluster")
+FAMILIES = ("realact", "realact_long", "sae", "sae_dec", "bsf", "cluster")   # sae_dec (decoder rows) only when n_sae_dec > 0
 N_TAIL_INDIST = 2000                                # eval/build_indist_eval.py N_TAIL
 NORM_FILTER_MULT = 10.0
 NORM_PRESAMPLE = 20_000
@@ -124,12 +136,23 @@ def _max_cos_vs(bank_rows_iter, ref, dev):
 BUILD_GPUS = ["H100", "A100-80GB", "L40S", "A100-40GB"]
 
 
-@app.function(image=image, gpu=BUILD_GPUS, cpu=8, memory=65536, ephemeral_disk=512 * 1024, volumes={"/data": vol},
-              secrets=[modal.Secret.from_name("maemm-hf")], timeout=8 * 3600)
+@app.function(image=image, gpu=BUILD_GPUS, cpu=8, memory=131072, ephemeral_disk=512 * 1024, volumes={"/data": vol},
+              secrets=[modal.Secret.from_name("maemm-hf")], timeout=14 * 3600)
 def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 7, threads: int = 48,
           chunk: int = 50_000, doc_cap: int = 8, bsf_scan_seqs: int = 30_000, bsf_cap: int = 4, bsf_ranks: int = 8,
           short_p_lo: int = 14, short_p_hi: int = 91, long_p_lo: int = 256, long_p_hi: int = 511,
-          w_lo: int = 16, w_hi: int = 64, overwrite_smoke: bool = False, sae_windows: int = 1):
+          w_lo: int = 16, w_hi: int = 64, overwrite_smoke: bool = False, sae_windows: int = 1,
+          acts_dir: str = ACTS, mu_path: str = "", train_frac: float = 0.95, eval_cache: str = EVAL_CACHE,
+          maxacts_path: str = MAXACTS_PT, n_realact: int = -1, n_realact_long: int = -1, n_sae: int = -1, n_bsf: int = -1,
+          n_cluster: int = -1, bsf_doc_cap: int = -1, sae_dedupe: bool = True, n_sae_dec: int = 0):
+    """acts_dir / mu_path / train_frac: the real-activation store (default /data/acts27b, centered with its own whiten_mu, first
+    95% of rows = train). A FRESH store (no eval rows inside) passes train_frac=1.0 and mu_path=/data/acts27b/whiten_mu.npy (the
+    suite's realact convention). eval_cache: v1 (11 cos families + sae) or v2 (+ mlp, mlp_pair). maxacts_path: max-acts file that
+    supplies the SAE targets (alive/corpus_peak always come from /data/sae/maxacts.pt); sae_dedupe drops identical windows of a
+    feature. n_<family> = -1 -> n_per_family; 0 -> family skipped. n_sae counts FEATURES (rows = features x sae_windows).
+    n_sae_dec > 0 adds the family "sae_dec": direction = unit(W_dec[f]) (the feature's DECODER row = its write direction into the
+    layer-42 residual; mxf.sae stores W_dec as [F, d]) for the SAME features and the SAME fresh windows as the encoder-column
+    rows (n_sae_dec caps the feature count, min(n_sae, n_sae_dec) features get both)."""
     import json, os, random, shutil, time
     from concurrent.futures import ThreadPoolExecutor
     import sys
@@ -155,9 +178,15 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
             shutil.rmtree(out)
         else:
             raise RuntimeError(f"{out}/build_stats.json exists — bank already built")
-    for p in (f"{ACTS}/acts.f16", f"{ACTS}/toks.i32", f"{ACTS}/whiten_mu.npy", f"{ACTS}/meta.json",
+    ACTS_D = acts_dir
+    mu_path = mu_path or f"{ACTS_D}/whiten_mu.npy"
+    n_fam = {"realact": n_realact, "realact_long": n_realact_long, "sae": n_sae, "sae_dec": n_sae_dec, "bsf": n_bsf, "cluster": n_cluster}
+    n_fam = {f: (n_per_family if n < 0 else int(n)) for f, n in n_fam.items()}
+    assert any(n > 0 for n in n_fam.values()), "every family has n=0"
+    log(f"targets {n_fam} | store {ACTS_D} (train_frac {train_frac}, mu {mu_path}) | eval cache {eval_cache} | maxacts {maxacts_path}")
+    for p in (f"{ACTS_D}/toks.i32", mu_path, f"{ACTS_D}/meta.json",
               f"{PROBE_BANK}/records.jsonl", f"{PROBE_BANK}/vecs.f32", f"{POOL_RL_MIX}/records.jsonl",
-              f"{POOL_HELDOUT}/records.jsonl", f"{POOL_HELDOUT}/vecs.f32", EVAL_CACHE, SAE_PT, MAXACTS_PT):
+              f"{POOL_HELDOUT}/records.jsonl", f"{POOL_HELDOUT}/vecs.f32", eval_cache, SAE_PT, MAXACTS_PT, maxacts_path):
         assert os.path.exists(p), f"missing input {p}"
     sae_size = os.path.getsize(SAE_PT)
     assert sae_size == SAE_HF_SIZE, (f"{SAE_PT} is {sae_size} B, expected {SAE_HF_SIZE} B (= HF {SAE_HF[0]} "
@@ -187,23 +216,51 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     bsf_meta = json.load(open(f"{BSF_DIR}/meta.json"))
     log(f"BSF meta: {bsf_meta}")
 
-    # ---- acts27b ----
-    meta = json.load(open(f"{ACTS}/meta.json"))
+    # ---- activation store (acts27b, or a fresh store) ----
+    meta = json.load(open(f"{ACTS_D}/meta.json"))
     NS, T = int(meta["n_seq"]), int(meta["seq_len"])
-    n_train = int(np.ceil(NS * 0.95))               # rows 0..n_train-1 train; last 5% held out (== eval convention)
-    mu_acts = np.load(f"{ACTS}/whiten_mu.npy").astype(np.float32)
-    toks = np.fromfile(f"{ACTS}/toks.i32", dtype=np.int32).reshape(NS, T)
-    afd = os.open(f"{ACTS}/acts.f16", os.O_RDONLY)
+    n_train = int(np.ceil(NS * train_frac))         # acts27b: rows 0..n_train-1 train; last 5% held out (== eval convention)
+    mu_acts = np.load(mu_path).astype(np.float32)
+    toks = np.fromfile(f"{ACTS_D}/toks.i32", dtype=np.int32).reshape(NS, T)
+    row_bytes_act = T * D_MODEL * 2
+    if meta.get("acts_complete", True) and os.path.exists(f"{ACTS_D}/acts.f16") and os.path.getsize(f"{ACTS_D}/acts.f16") == NS * row_bytes_act:
+        # single-file store (acts27b, or a finalized fresh store): row s at byte s * T * d * 2
+        afd = os.open(f"{ACTS_D}/acts.f16", os.O_RDONLY)
+        sh_start = np.array([0], np.int64); sh_fds = [afd]
+        acts_source = f"{ACTS_D}/acts.f16"
+    else:
+        # SHARDED store (a fresh store whose CPU finalize has not produced acts.f16 yet): rows are rank-major over the collect
+        # shards exactly as finalize concatenates them (data/modal_acts27b_fresh.py) -> row s lives in shard k at local row
+        # s - sh_start[k]. Same bytes, no 400 GB copy needed before building.
+        shards = f"{ACTS_D}/shards"
+        mans = [json.load(open(f"{shards}/manifest_r{r}.json")) for r in range(int(meta["world"]))]
+        assert all(m["done"] for m in mans), "collect manifests not done"
+        order = [(m["rank"], ch["c"], ch["n"]) for m in mans for ch in m["chunks"]]
+        assert sum(n for _, _, n in order) == NS, (sum(n for _, _, n in order), NS)
+        sh_fds, starts, off = [], [], 0
+        for r, c, n in order:
+            pth = f"{shards}/r{r}_c{c:04d}.acts.f16"
+            assert os.path.getsize(pth) == n * row_bytes_act, f"{pth}: size != {n} rows"
+            sh_fds.append(os.open(pth, os.O_RDONLY)); starts.append(off); off += n
+        sh_start = np.array(starts, np.int64)
+        acts_source = f"{shards}/r*_c*.acts.f16 ({len(order)} shards, rank-major == finalize order)"
+        log(f"store {ACTS_D}: acts.f16 not finalized -> reading the {len(order)} collect shards directly ({off} rows)")
     nrng = np.random.default_rng(seed)
     wrng = random.Random(seed)
     per_doc = np.zeros(n_train, np.int32)            # document cap shared by realact + realact_long (big_bank convention)
     per_doc_bsf = np.zeros(n_train, np.int32)        # bsf gets its OWN counter: a shared cap starved it (76k/100k in run 1)
 
+    def _loc(s):
+        k = int(np.searchsorted(sh_start, s, side="right") - 1)
+        return sh_fds[k], int(s - sh_start[k])
+
     def read_act(s, p, dst):
-        dst[:] = np.frombuffer(_pread_full(afd, D_MODEL * 2, ((s * T) + p) * D_MODEL * 2), np.float16)
+        fd, sl = _loc(s)
+        dst[:] = np.frombuffer(_pread_full(fd, D_MODEL * 2, ((sl * T) + p) * D_MODEL * 2), np.float16)
 
     def read_seq(s):
-        return np.frombuffer(_pread_full(afd, T * D_MODEL * 2, s * T * D_MODEL * 2), np.float16).reshape(T, D_MODEL)
+        fd, sl = _loc(s)
+        return np.frombuffer(_pread_full(fd, T * D_MODEL * 2, sl * T * D_MODEL * 2), np.float16).reshape(T, D_MODEL)
 
     def window_text(s, p):
         W = wrng.randint(w_lo, w_hi)
@@ -212,7 +269,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
         return start, ids, tok.decode(ids)
 
     # ---- eval sets + exclusion lists ----
-    es = torch.load(EVAL_CACHE, map_location="cpu", weights_only=False)
+    es = torch.load(eval_cache, map_location="cpu", weights_only=False)
     eval_dirs = {k[:-5]: F.normalize(es[k].float(), dim=-1) for k in es if k.endswith("_dirs")}
     eval_sae_feats = sorted(int(f) for f in es["sae_feats"])
     log(f"eval cache: dirs families {sorted(eval_dirs)} | sae_feats {len(eval_sae_feats)} | "
@@ -300,7 +357,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     n_drop_dir = int((dir_leak & keep_mask).sum())
     keep_mask &= ~dir_leak
     cand = np.flatnonzero(keep_mask)
-    n_probe = min(n_per_family, len(cand))
+    n_probe = min(n_fam["cluster"], len(cand))
     sel = np.sort(nrng.choice(cand, n_probe, replace=False))
     vec_cl = np.memmap("/root/bank/stage_cluster.f32", np.float32, "w+", shape=(n_probe, D_MODEL))
     vec_cl[:] = P[sel]
@@ -313,10 +370,10 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     stage["cluster"] = (vec_cl, rec_cl)
     fam_stats["cluster"] = {"source": PROBE_BANK, "available": n_probe_all, "dropped_indist_tail": n_drop_tail,
                             "dropped_dir_leak": n_drop_dir, "candidates": int(len(cand)), "taken": n_probe,
-                            "shortfall": n_per_family - n_probe, "max_cos_vs_eval_cluster_after": float(maxcos[sel].max()),
+                            "shortfall": n_fam["cluster"] - n_probe, "max_cos_vs_eval_cluster_after": float(maxcos[sel].max()),
                             "eval_dirs_with_exact_dup_in_source_bank": eval_dups, "probe_dup": 1}
     del P, ref_cl
-    log(f"cluster: {n_probe}/{n_per_family} (avail {n_probe_all}, drop tail {n_drop_tail}, drop dir-leak {n_drop_dir}, "
+    log(f"cluster: {n_probe}/{n_fam['cluster']} (avail {n_probe_all}, drop tail {n_drop_tail}, drop dir-leak {n_drop_dir}, "
         f"{time.time() - t0:.0f}s)")
 
     # ============================================================================================================
@@ -324,45 +381,124 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     # ============================================================================================================
     t0 = time.time()
     sae = load_sae(path=SAE_PT, device=dev, dtype=torch.float32)
-    ma = torch.load(MAXACTS_PT, map_location="cpu", weights_only=False)
+    ma0 = torch.load(MAXACTS_PT, map_location="cpu", weights_only=False)             # ORIGINAL max-acts: alive + corpus_peak
+    ma = ma0 if maxacts_path == MAXACTS_PT else torch.load(maxacts_path, map_location="cpu", weights_only=False)   # target windows
     Fd = sae.d_sae
-    assert Fd == es["meta"]["d_sae"] == ma["max_acts"].shape[0] == 131072
-    peak = ma["max_acts"].reshape(Fd, -1).max(1).values.float().numpy()
+    assert Fd == es["meta"]["d_sae"] == ma0["max_acts"].shape[0] == ma["max_acts"].shape[0] == 131072
+    peak = ma0["max_acts"].reshape(Fd, -1).max(1).values.float().numpy()
     alive = peak > 0
     excl_mask = np.zeros(Fd, bool)
     excl_mask[np.array(excl_sae, np.int64)] = True
     cand = np.flatnonzero(alive & ~excl_mask)
-    n_sae = min(n_per_family, len(cand))
-    feats = np.sort(nrng.choice(cand, n_sae, replace=False))
+    n_sae_feat = min(n_fam["sae"], len(cand))
+    feats = np.sort(nrng.choice(cand, n_sae_feat, replace=False))
     # sae_windows > 1: the same unit direction paired with its top-k max-activating corpus windows (k rows per feature),
-    # for SFT banks that need more SAE examples than there are alive non-eval features (~118k).
+    # for SFT banks that need more SAE examples than there are alive non-eval features (~118k). Windows come from
+    # maxacts_path (stored top-N per feature, N >= K); windows with no firing (peak <= 0) and, with sae_dedupe, windows whose
+    # token ids repeat an earlier kept window of the same feature are skipped.
     K = max(1, min(int(sae_windows), int(ma["max_tokens"].shape[1])))
-    dirs_f = np.concatenate([sae.enc_dirs(feats[c0:c0 + 8192].tolist()).float().cpu().numpy() for c0 in range(0, n_sae, 8192)])
+    N_stored = int(ma["max_tokens"].shape[1])
+    dirs_f = np.concatenate([sae.enc_dirs(feats[c0:c0 + 8192].tolist()).float().cpu().numpy() for c0 in range(0, n_sae_feat, 8192)])
+    ma_tok = ma["max_tokens"][feats].numpy(); ma_act = ma["max_acts"][feats].numpy()          # [n_feat, N, 32]
+    ma_peak = ma_act.max(2)                                                                   # [n_feat, N]
+    ma_src = ma["max_src"][feats].numpy() if "max_src" in ma else None
+    # END-ANCHORED targets (user rule: every target ends AT the token where the direction fires — the RL reward / evaluator take the
+    # max over the LAST 5 generated tokens): the window's peak token becomes the LAST target token; left context comes from the
+    # activation store row the window was cut from (max_src = (row, slot); slot*L .. slot*L+L-1 is the standalone window),
+    # W ~ U[w_lo, w_hi] tokens when available, >= SAE_MIN_TOK tokens else the window is dropped (never padded with a
+    # peak-in-the-middle window). Requires max_src (fresh max-acts); the legacy whole-window target is kept only for max-acts
+    # files without positions and is flagged in the stats.
+    SAE_MIN_TOK = 8
+    L_win = int(ma_tok.shape[2])
+    end_anchored = ma_src is not None
+    if end_anchored:
+        assert L_win * (T // L_win) == T, (L_win, T)
     rec_sae, rows_sae = [], []
-    for k in range(K):
-        win_tok, win_act = ma["max_tokens"][:, k], ma["max_acts"][:, k]      # k-th window per feature [F, 32]
-        for i, f in enumerate(feats.tolist()):
-            acts = win_act[f]
-            if k > 0 and float(acts.max()) <= 0:
-                continue                                                   # feature has no k-th firing window
-            ids = win_tok[f].tolist()
-            rows_sae.append(i)
-            rec_sae.append({"family": "sae", "feature": f, "window_rank": k, "target_text": tok.decode(ids), "n_tok": len(ids),
-                            "peak_idx": int(acts.argmax()), "corpus_peak": float(peak[f]), "window_peak": float(acts.max())})
+    n_dup = n_nofire = n_short = n_mismatch = 0
+    per_feat = np.zeros(n_sae_feat, np.int32)
+    for i, f in enumerate(feats.tolist()):
+        seen = set()
+        for k in range(N_stored):
+            if per_feat[i] >= K:
+                break
+            if ma_peak[i, k] <= 0:
+                n_nofire += N_stored - k; break                          # stored windows are sorted by peak: nothing below fires
+            pk = int(ma_act[i, k].argmax())
+            if end_anchored:
+                row, slot = int(ma_src[i, k, 0]), int(ma_src[i, k, 1])
+                w0 = slot * L_win
+                if not np.array_equal(toks[row, w0:w0 + L_win], ma_tok[i, k]):
+                    n_mismatch += 1; continue                            # store / max-acts disagreement: never emit
+                pos = w0 + pk                                            # absolute position of the peak token in the store row
+                Wt = min(wrng.randint(w_lo, w_hi), pos + 1)
+                if Wt < SAE_MIN_TOK:
+                    n_short += 1; continue                               # peak too close to the row start for >= 8 tokens of context
+                start = pos - Wt + 1
+                ids = toks[row, start:pos + 1].tolist()
+            else:
+                row = slot = -1; w0 = 0; pos = pk; start = 0
+                ids = ma_tok[i, k].tolist()
+            if sae_dedupe:
+                key = tuple(ids)
+                if key in seen:
+                    n_dup += 1; continue
+                seen.add(key)
+            txt = tok.decode(ids)
+            if len(txt.strip()) < 3:
+                n_short += 1; continue
+            rows_sae.append(i); per_feat[i] += 1
+            rec = {"family": "sae", "feature": f, "window_rank": k, "target_text": txt, "n_tok": len(ids), "peak_pos": len(ids) - 1,
+                   "fire_from_end": 0, "peak_idx_in_window": pk, "corpus_peak": float(peak[f]), "window_peak": float(ma_peak[i, k]),
+                   "src_row": row, "src_win": slot, "window_bounds": [w0, w0 + L_win - 1], "start": start, "pos": pos,
+                   "end_anchored": end_anchored}
+            rec_sae.append(rec)
     vec_sae = np.memmap("/root/bank/stage_sae.f32", np.float32, "w+", shape=(len(rows_sae), D_MODEL))
+    rows_sae = np.asarray(rows_sae, np.int64)
     for c0 in range(0, len(rows_sae), 8192):
-        vec_sae[c0:c0 + 8192] = dirs_f[np.array(rows_sae[c0:c0 + 8192])]
-    del dirs_f
-    n_sae = len(rows_sae)
+        vec_sae[c0:c0 + 8192] = dirs_f[rows_sae[c0:c0 + 8192]]
+    del dirs_f, ma_tok, ma_act
+    n_sae_rows = len(rows_sae)
     stage["sae"] = (vec_sae, rec_sae)
+    # sae_dec: the same features x the same windows, direction = unit(W_dec[f]) (decoder row = write direction)
+    n_dec_rows = 0
+    if n_fam["sae_dec"] > 0:
+        n_dec_feat = min(n_fam["sae_dec"], n_sae_feat)                # the FIRST n_dec_feat of the (sorted) encoder features
+        dec_dirs = np.concatenate([F.normalize(sae.W_dec[torch.as_tensor(feats[c0:c0 + 8192], device=dev)].float(), dim=-1).cpu().numpy()
+                                   for c0 in range(0, n_sae_feat, 8192)])
+        enc_dec_cos = np.concatenate([(F.normalize(sae.W_dec[torch.as_tensor(feats[c0:c0 + 8192], device=dev)].float(), dim=-1)
+                                       * sae.enc_dirs(feats[c0:c0 + 8192].tolist()).float()).sum(-1).cpu().numpy() for c0 in range(0, n_sae_feat, 8192)])
+        keep_dec = rows_sae < n_dec_feat
+        rows_dec = rows_sae[keep_dec]
+        rec_dec = [{**r, "family": "sae_dec", "enc_dec_cos": round(float(enc_dec_cos[i]), 4)} for r, i, k in zip(rec_sae, rows_sae.tolist(), keep_dec.tolist()) if k]
+        vec_dec = np.memmap("/root/bank/stage_sae_dec.f32", np.float32, "w+", shape=(len(rows_dec), D_MODEL))
+        for c0 in range(0, len(rows_dec), 8192):
+            vec_dec[c0:c0 + 8192] = dec_dirs[rows_dec[c0:c0 + 8192]]
+        n_dec_rows = len(rows_dec)
+        stage["sae_dec"] = (vec_dec, rec_dec)
+        fam_stats["sae_dec"] = {"source": SAE_PT, "hf": SAE_HF, "features_taken": int(n_dec_feat), "taken": n_dec_rows,
+                                "shortfall": n_fam["sae_dec"] - n_dec_feat, "dir": "unit(W_dec[f]) (decoder row = the feature's write direction; mxf.sae W_dec [F, d])",
+                                "target": "the SAME fresh max-activating windows as the feature's encoder-column (sae) rows", "windows_per_feature": K,
+                                "windows_per_feature_hist": np.bincount(per_feat[:n_dec_feat], minlength=K + 1).tolist(),
+                                "enc_dec_cos": {q: float(np.percentile(enc_dec_cos[:n_dec_feat], q)) for q in (5, 25, 50, 75, 95)} | {"mean": float(enc_dec_cos[:n_dec_feat].mean())},
+                                "excluded": len(excl_sae)}
+        del dec_dirs
+        log(f"sae_dec: {n_dec_rows} rows from {n_dec_feat} features (decoder rows; cos(enc, dec) median {np.median(enc_dec_cos[:n_dec_feat]):.3f})")
     fam_stats["sae"] = {"source": SAE_PT, "hf": SAE_HF, "d_sae": Fd, "dead": int((~alive).sum()),
-                        "excluded": len(excl_sae), "candidates": int(len(cand)), "taken": n_sae,
-                        "shortfall": n_per_family - n_sae, "dir": "unit(W_enc[:, f]) (mxf.sae.enc_dirs)",
-                        "target": f"top-{K} max-activating 32-token corpus window(s) from /data/sae/maxacts.pt", "windows_per_feature": K}
-    del sae, ma
+                        "excluded": len(excl_sae), "candidates": int(len(cand)), "features_taken": int(n_sae_feat), "taken": n_sae_rows,
+                        "shortfall": n_fam["sae"] - n_sae_feat, "dir": "unit(W_enc[:, f]) (mxf.sae.enc_dirs)",
+                        "target": f"top-{K} max-activating 32-token corpus window(s) from {maxacts_path} (stored top-{N_stored}); alive/corpus_peak from {MAXACTS_PT}",
+                        "maxacts_path": maxacts_path, "maxacts_meta": (ma.get("meta") if isinstance(ma.get("meta"), dict) else None),
+                        "windows_per_feature": K, "windows_per_feature_mean": float(per_feat.mean()),
+                        "windows_per_feature_hist": np.bincount(per_feat, minlength=K + 1).tolist(),
+                        "features_with_K_windows": int((per_feat == K).sum()), "dedupe": bool(sae_dedupe), "dropped_duplicate_windows": n_dup,
+                        "skipped_nonfiring_windows": n_nofire, "dropped_short_context_windows": n_short, "store_maxacts_token_mismatch": n_mismatch,
+                        "end_anchored": end_anchored, "min_tok": SAE_MIN_TOK,
+                        "target_rule": (f"W~U[{w_lo},{w_hi}]-token window of the store row ENDING at the max-acts window's peak token (peak = last token); "
+                                        f">= {SAE_MIN_TOK} tokens else dropped" if end_anchored else "legacy whole 32-token window (peak mid-window)")}
+    del sae, ma, ma0
     torch.cuda.empty_cache()
-    log(f"sae: {n_sae}/{n_per_family} (alive {int(alive.sum())}, excluded {len(excl_sae)}, cand {len(cand)}, "
-        f"{time.time() - t0:.0f}s)")
+    log(f"sae: {n_sae_rows} rows from {n_sae_feat}/{n_fam['sae']} features (alive {int(alive.sum())}, excluded {len(excl_sae)}, cand {len(cand)}, "
+        f"windows/feature mean {per_feat.mean():.2f}, hist {np.bincount(per_feat, minlength=K + 1).tolist()}, dup dropped {n_dup}, {time.time() - t0:.0f}s)")
 
     # ============================================================================================================
     # norm-filter threshold (10x median ||act - mu|| over a presample) — shared by every real-activation family
@@ -383,17 +519,20 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     # ============================================================================================================
     raw = np.empty((chunk, D_MODEL), np.float16)
     for fam, mode, lo, hi in (("realact", "prefix", short_p_lo, short_p_hi), ("realact_long", "window", long_p_lo, long_p_hi)):
+        n_target = n_fam[fam]
+        if n_target == 0:
+            log(f"{fam}: skipped (n=0)"); continue
         t0 = time.time()
         n_pos = hi - lo + 1
-        n_cand = min(int(n_per_family * 1.6) + 4096, n_train * n_pos)
+        n_cand = min(int(n_target * 1.6) + 4096, n_train * n_pos)
         flat = nrng.choice(n_train * n_pos, size=n_cand, replace=False)
         cand_s = (flat // n_pos).astype(np.int64); cand_p = (lo + flat % n_pos).astype(np.int64)
         del flat
-        vec = np.memmap(f"/root/bank/stage_{fam}.f32", np.float32, "w+", shape=(n_per_family, D_MODEL))
+        vec = np.memmap(f"/root/bank/stage_{fam}.f32", np.float32, "w+", shape=(n_target, D_MODEL))
         recs = []
         kept = drop_norm = drop_txt = drop_cap = 0
         for c0 in range(0, n_cand, chunk):
-            if kept >= n_per_family:
+            if kept >= n_target:
                 break
             c1 = min(c0 + chunk, n_cand); m = c1 - c0
             with ThreadPoolExecutor(threads) as ex:
@@ -401,7 +540,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
             d = raw[:m].astype(np.float32) - mu_acts
             norms = np.linalg.norm(d, axis=1)
             for k in range(m):
-                if kept >= n_per_family:
+                if kept >= n_target:
                     break
                 if not (1e-6 < norms[k] <= thr):
                     drop_norm += 1; continue
@@ -419,14 +558,14 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
                     drop_txt += 1; continue
                 vec[kept] = d[k] / norms[k]
                 recs.append({"family": fam, "target_text": txt, "harvest": mode, "seq": s, "pos": p, "start": start,
-                             "extra": extra, "n_tok": len(ids), "fire_from_end": end - 1 - p, "ctx_tokens": p + 1,
+                             "extra": extra, "n_tok": len(ids), "fire_from_end": end - 1 - p, "peak_pos": p - start, "ctx_tokens": p + 1,
                              "act_norm": round(float(norms[k]), 2)})
                 per_doc[s] += 1; kept += 1
-            log(f"{fam}/{mode} {kept}/{n_per_family} (cands {c1}/{n_cand}, {kept / max(time.time() - t0, 1):.0f}/s, "
+            log(f"{fam}/{mode} {kept}/{n_target} (cands {c1}/{n_cand}, {kept / max(time.time() - t0, 1):.0f}/s, "
                 f"drops norm={drop_norm} txt={drop_txt} cap={drop_cap})")
-        assert kept == n_per_family, f"{fam} quota missed: {kept} (drops norm={drop_norm} txt={drop_txt} cap={drop_cap})"
+        assert kept == n_target, f"{fam} quota missed: {kept} (drops norm={drop_norm} txt={drop_txt} cap={drop_cap})"
         stage[fam] = (vec, recs)
-        fam_stats[fam] = {"source": ACTS, "harvest": mode, "p_range": [lo, hi], "taken": kept, "shortfall": 0,
+        fam_stats[fam] = {"source": ACTS_D, "mu": mu_path, "harvest": mode, "p_range": [lo, hi], "taken": kept, "shortfall": 0,
                           "dir": "unit(act[s,p] - whiten_mu)", "train_rows": [0, n_train - 1],
                           "held_out_rows": [n_train, NS - 1], "drops": {"norm": drop_norm, "txt": drop_txt, "doc_cap": drop_cap},
                           "target": ("doc prefix [0, p+extra], extra~U[1,4]" if mode == "prefix"
@@ -438,6 +577,8 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     # family: bsf (SASA top-block subspace component of real activations, mapped back to residual space)
     # ============================================================================================================
     t0 = time.time()
+    n_bsf_target = n_fam["bsf"]
+    bsf_doc_cap = doc_cap if bsf_doc_cap < 0 else int(bsf_doc_cap)
     sasa = torch.load(f"{BSF_DIR}/sasa.pt", map_location="cpu", weights_only=False)
     G, b, k_bsf = int(sasa["G"]), int(sasa["b"]), int(sasa.get("k", bsf_meta.get("k", 32)))
     assert int(sasa["d"]) == D_MODEL and G * b == sasa["E"].shape[1]
@@ -518,11 +659,13 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     sel_tok, sel_rank = [], []
     total = 0
     for level in range(bsf_cap):
+        if n_bsf_target == 0:
+            break
         for r in range(bsf_ranks):
-            if total >= n_per_family:
+            if total >= n_bsf_target:
                 break
             bl = ti_flat[:, r]
-            cand = ok_flat & ~used & (block_cnt[bl] == level) & ~excl_blk[bl] & (per_doc_bsf[seq_of] < doc_cap)
+            cand = ok_flat & ~used & (block_cnt[bl] == level) & ~excl_blk[bl] & (per_doc_bsf[seq_of] < bsf_doc_cap)
             idx = np.flatnonzero(cand)
             if len(idx) == 0:
                 continue
@@ -536,18 +679,18 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
             starts = np.r_[0, np.flatnonzero(np.diff(s_sorted)) + 1]
             grp = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(s_sorted)]))
             within = np.arange(len(s_sorted)) - starts[grp]
-            keep = within < (doc_cap - per_doc_bsf[s_sorted])
+            keep = within < (bsf_doc_cap - per_doc_bsf[s_sorted])
             picks = picks[so[keep]]
-            if total + len(picks) > n_per_family:
-                picks = picks[: n_per_family - total]
+            if total + len(picks) > n_bsf_target:
+                picks = picks[: n_bsf_target - total]
             used[picks] = True
             np.add.at(block_cnt, bl[picks], 1)
             np.add.at(per_doc_bsf, seq_of[picks], 1)
             sel_tok.append(picks); sel_rank.append(np.full(len(picks), r + 1, np.int8))
             total += len(picks)
-            log(f"bsf select level {level + 1}/{bsf_cap} rank {r + 1}: +{len(picks)} -> {total}/{n_per_family} "
+            log(f"bsf select level {level + 1}/{bsf_cap} rank {r + 1}: +{len(picks)} -> {total}/{n_bsf_target} "
                 f"(blocks with rows: {int((block_cnt > 0).sum())})")
-        if total >= n_per_family:
+        if total >= n_bsf_target:
             break
     sel_tok = np.concatenate(sel_tok) if sel_tok else np.zeros(0, np.int64)
     sel_rank = np.concatenate(sel_rank) if sel_rank else np.zeros(0, np.int8)
@@ -556,7 +699,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     sel_s = seq_of[sel_tok].astype(np.int64); sel_p = (P0 + sel_tok % n_pos).astype(np.int64)
     assert not excl_blk[sel_blk].any() and (block_cnt.max() <= bsf_cap)
     del top_i, ok, ti_flat, seq_of, ok_flat, used
-    log(f"bsf selected {n_bsf}/{n_per_family}: {int((block_cnt > 0).sum())} blocks, rows/block max {int(block_cnt.max())}, "
+    log(f"bsf selected {n_bsf}/{n_bsf_target}: {int((block_cnt > 0).sum())} blocks, rows/block max {int(block_cnt.max())}, "
         f"rank hist {np.bincount(sel_rank, minlength=bsf_ranks + 1)[1:].tolist()}")
 
     # re-read the selected activations (random preads), mint the directions, verify
@@ -594,14 +737,15 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
         rec_bsf[j] = {"family": "bsf", "target_text": txt, "block": int(sel_blk[j]), "rank": int(sel_rank[j]),
                       "gnorm": round(float(gn_all[j]), 4), "cos_x": round(float(cos_x_all[j]), 4),
                       "whiten_frac": round(float(whiten_frac[j]), 4), "seq": s, "pos": p, "start": start,
-                      "n_tok": len(ids), "fire_from_end": 0, "ctx_tokens": p + 1}
-    stage["bsf"] = (vec_bsf, rec_bsf)
+                      "n_tok": len(ids), "fire_from_end": 0, "peak_pos": len(ids) - 1, "ctx_tokens": p + 1}
+    if n_bsf_target > 0:
+        stage["bsf"] = (vec_bsf, rec_bsf)
     rows_per_block = np.bincount(block_cnt[block_cnt > 0]) if n_bsf else np.zeros(1)
-    fam_stats["bsf"] = {"source": f"{BSF_HF} (cached {BSF_DIR}) on {ACTS} train sequences", "G": G, "b": b, "k": k_bsf,
+    fam_stats["bsf"] = {"source": f"{BSF_HF} (cached {BSF_DIR}) on {ACTS_D} train sequences", "G": G, "b": b, "k": k_bsf,
                         "scan_seqs": int(n_scan), "scan_tokens": int(n_tok), "pos_range": [P0, T - 1],
                         "distinct_top1_blocks_in_scan": int(len(top1_blocks)), "taken": n_bsf,
-                        "shortfall": n_per_family - n_bsf, "blocks_used": int((block_cnt > 0).sum()),
-                        "cap_per_block": bsf_cap, "rows_per_block_hist": rows_per_block.tolist(),
+                        "shortfall": n_bsf_target - n_bsf, "blocks_used": int((block_cnt > 0).sum()),
+                        "cap_per_block": bsf_cap, "doc_cap": bsf_doc_cap, "rows_per_block_hist": rows_per_block.tolist(),
                         "rank_hist": np.bincount(sel_rank, minlength=bsf_ranks + 1)[1:].tolist(),
                         "excluded_blocks": {"literal_old_ids": len(excl_bsf_old), "eval_dir_top1_under_this_bsf": len(eval_bsf_new),
                                             "total": len(excl_bsf_all)},
@@ -613,7 +757,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
                         "target": f"W~U[{w_lo},{w_hi}]-token window ending at p", "docs_used": int(len(set(sel_s.tolist())))}
     del E, Q, raw_b, zca, zca_inv
     torch.cuda.empty_cache()
-    log(f"bsf: {n_bsf}/{n_per_family} | cos(dir, x-mu) median {np.median(cos_x_all):.3f} mean {cos_x_all.mean():.3f} "
+    log(f"bsf: {n_bsf}/{n_bsf_target} | cos(dir, x-mu) median {np.median(cos_x_all):.3f} mean {cos_x_all.mean():.3f} "
         f"p10 {np.percentile(cos_x_all, 10):.3f} | whitened-norm fraction median {np.median(whiten_frac):.3f} | "
         f"block re-scan consistency {rank_ok}/{n_bsf} ({time.time() - t0:.0f}s)")
 
@@ -621,19 +765,20 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     # assemble: seeded shuffle of ALL rows -> vecs.f32 + records.jsonl (line i == vec_idx i)
     # ============================================================================================================
     t0 = time.time()
-    counts = {f: len(stage[f][1]) for f in FAMILIES}
+    FAM = tuple(f for f in FAMILIES if f in stage)
+    counts = {f: len(stage[f][1]) for f in FAM}
     N = sum(counts.values())
     perm = nrng.permutation(N)                        # staged global row g -> final row perm[g]
     inv = np.empty(N, np.int64); inv[perm] = np.arange(N)
-    fam_of = np.concatenate([np.full(counts[f], i, np.int8) for i, f in enumerate(FAMILIES)])
-    off = np.cumsum([0] + [counts[f] for f in FAMILIES])
+    fam_of = np.concatenate([np.full(counts[f], i, np.int8) for i, f in enumerate(FAM)])
+    off = np.cumsum([0] + [counts[f] for f in FAM])
     vecs = np.memmap("/root/bank/vecs.f32", np.float32, "w+", shape=(N, D_MODEL))
     recs_final = [None] * N
     for i in range(N):
         g = int(inv[i]); fi = int(fam_of[g]); j = g - int(off[fi])
-        r = dict(stage[FAMILIES[fi]][1][j]); r = {"vec_idx": i, **r}
+        r = dict(stage[FAM[fi]][1][j]); r = {"vec_idx": i, **r}
         recs_final[i] = r
-    for fi, f in enumerate(FAMILIES):
+    for fi, f in enumerate(FAM):
         v, _ = stage[f]
         rows = perm[off[fi]:off[fi + 1]]
         for c0 in range(0, counts[f], 8192):
@@ -643,7 +788,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     with open("/root/bank/records.jsonl", "w") as rf:
         for r in recs_final:
             rf.write(json.dumps(r) + "\n")
-    log(f"assembled {N} rows ({time.time() - t0:.0f}s): " + " ".join(f"{f}={counts[f]}" for f in FAMILIES))
+    log(f"assembled {N} rows ({time.time() - t0:.0f}s): " + " ".join(f"{f}={counts[f]}" for f in FAM))
 
     # ============================================================================================================
     # verification from the assembled files: unit norms, alignment, direction-level leakage vs eval + pool_heldout
@@ -660,8 +805,8 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
                     [F.normalize(torch.from_numpy(np.asarray(ho_vecs[np.array(ho_rows[f], np.int64)])).float(), dim=-1)
                      for f in sorted(ho_rows)]).to(dev)
     ref_off = np.cumsum([0] + [len(eval_dirs[f]) for f in sorted(eval_dirs)] + [len(ho_rows[f]) for f in sorted(ho_rows)])
-    fam_arr = np.array([FAMILIES.index(r["family"]) for r in recs_final], np.int8)
-    leak = np.zeros((len(FAMILIES), len(ref_names)), np.float32) - 1
+    fam_arr = np.array([FAM.index(r["family"]) for r in recs_final], np.int8)
+    leak = np.zeros((len(FAM), len(ref_names)), np.float32) - 1
     worst = []
     with torch.no_grad():
         for c0 in range(0, N, 8192):
@@ -669,7 +814,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
             cos = x @ ref.T                                                      # [c, M]
             for ri in range(len(ref_names)):
                 cm = cos[:, ref_off[ri]:ref_off[ri + 1]].max(1).values.cpu().numpy()
-                for fi in range(len(FAMILIES)):
+                for fi in range(len(FAM)):
                     m = fam_arr[c0:c0 + 8192] == fi
                     if m.any():
                         leak[fi, ri] = max(leak[fi, ri], float(cm[m].max()))
@@ -677,15 +822,15 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
             bad = (mx > LEAK_COS).nonzero().flatten().tolist()
             for j in bad:
                 worst.append((c0 + j, int(am[j]), float(mx[j])))
-    leak_tbl = {FAMILIES[fi]: {ref_names[ri]: round(float(leak[fi, ri]), 4) for ri in range(len(ref_names))}
-                for fi in range(len(FAMILIES))}
+    leak_tbl = {FAM[fi]: {ref_names[ri]: round(float(leak[fi, ri]), 4) for ri in range(len(ref_names))}
+                for fi in range(len(FAM))}
     log("leakage max-cos table (bank family x eval/held-out family):")
-    for f in FAMILIES:
+    for f in FAM:
         log(f"  {f:13s} " + " ".join(f"{n.split('/')[-1][:12]}={leak_tbl[f][n]:.3f}" for n in ref_names))
     assert not worst, f"{len(worst)} bank rows within cos>{LEAK_COS} of an eval/held-out direction: {worst[:5]}"
     # id-level asserts
     for r in recs_final:
-        if r["family"] == "sae":
+        if r["family"] in ("sae", "sae_dec"):
             assert not excl_mask[r["feature"]]
         elif r["family"] == "bsf":
             assert not excl_blk[r["block"]]
@@ -705,36 +850,38 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     stats = {"kind": "everything: even mix of realact (short-ctx prefix harvest) + realact_long (deep-position window "
                      "harvest) + sae (unit encoder cols) + bsf (top-block subspace component of real acts) + cluster (probes)",
              "n_examples": N, "n_vecs": N, "families": counts, "layout": "seeded shuffle of all families (records.jsonl line i == vec_idx i)",
-             "n_per_family_target": n_per_family, "seed": seed, "d_model": D_MODEL, "model": MODEL, "acts": ACTS,
-             "created": time.time()}
-    meta_out = {"bank": out, "n_rows": N, "families": counts, "n_per_family_target": n_per_family,
-                "shortfalls": {f: fam_stats[f]["shortfall"] for f in FAMILIES},
+             "n_per_family_target": n_per_family, "targets": n_fam, "seed": seed, "d_model": D_MODEL, "model": MODEL, "acts": ACTS_D,
+             "acts_mu": mu_path, "acts_train_frac": train_frac, "eval_cache": eval_cache, "maxacts": maxacts_path,
+             "fresh_store": (ACTS_D != ACTS), "created": time.time()}
+    meta_out = {"bank": out, "n_rows": N, "families": counts, "n_per_family_target": n_per_family, "targets": n_fam,
+                "shortfalls": {f: fam_stats[f]["shortfall"] for f in FAM},
                 "row_order": "np.random.default_rng(seed).permutation over all staged rows (families interleaved)",
                 "seed": seed, "d_model": D_MODEL, "model": MODEL, "layer": 42,
                 "trainer_args": {"--data-dir": out, "--bank-file": "vecs.f32", "--direction-source": "cluster"},
-                "family_recipes": fam_stats,
-                "whitening_mu": {"realact/realact_long": f"{ACTS}/whiten_mu.npy", "bsf": f"{BSF_DIR}/whiten_mu.npy (+ whiten_zca.npy)"},
+                "family_recipes": fam_stats, "acts_store": {"dir": ACTS_D, "n_seq": NS, "seq_len": T, "train_frac": train_frac,
+                                                            "acts_source": acts_source, "store_meta_fresh": meta.get("fresh")},
+                "whitening_mu": {"realact/realact_long": mu_path, "bsf": f"{BSF_DIR}/whiten_mu.npy (+ whiten_zca.npy)"},
                 "norm_filter": {"mult": NORM_FILTER_MULT, "median": med, "thr": thr, "presample": NORM_PRESAMPLE},
                 "doc_cap": {"value": doc_cap, "counters": "realact+realact_long shared; bsf separate"},
                 "acts_train_rows": [0, n_train - 1], "acts_held_out_rows": [n_train, NS - 1],
                 "exclusions_summary": {
                     "sae_features": {"n": len(excl_sae), "sources": [f"{POOL_HELDOUT}/records.jsonl family=sae 'feature' (13107)",
-                                                                    f"{EVAL_CACHE} sae_feats (512, subset)",
+                                                                    f"{eval_cache} sae_feats (512, subset)",
                                                                     "dead features (corpus peak <= 0 in /data/sae/maxacts.pt)"],
                                      "dead": int((~alive).sum())},
                     "bsf_blocks": {"literal_old_ids": len(excl_bsf_old), "eval_dir_top1_under_this_bsf": len(eval_bsf_new),
                                    "total": len(excl_bsf_all),
                                    "sources": [f"{POOL_HELDOUT}/records.jsonl family=bsf 'block' (ids of the ORIGINAL Aug-21 BSF)",
-                                               f"{EVAL_CACHE} bsf_dirs -> argmax block under {BSF_HF}"]},
+                                               f"{eval_cache} bsf_dirs -> argmax block under {BSF_HF}"]},
                     "probe_rows": {"n": len(excl_probe_src), "range": [excl_probe_src[0], excl_probe_src[-1]],
                                    "sources": [f"{POOL_RL_MIX} cluster tail (last {N_TAIL_INDIST} rows) = indist_probe reservation "
                                                "(eval/build_indist_eval.py N_TAIL)",
                                                f"direction-level: cos > {LEAK_COS} vs pool_heldout cluster dirs + eval cluster_dirs + indist_probe_dirs"],
                                    "dropped_indist_tail": n_drop_tail, "dropped_dir_leak": n_drop_dir},
-                    "realact": {"rule": f"acts27b seq rows < {n_train} only (last 5% held out); eval realact/indist/ctx families come from other acts dumps"},
+                    "realact": {"rule": f"{ACTS_D} seq rows < {n_train} only (train_frac {train_frac}); eval realact/indist/ctx families come from other acts dumps"},
                     "jlens": "no J-lens rows in the bank (fully held-out family)"},
                 "leakage_check": {"threshold": LEAK_COS, "max_cos_table": leak_tbl, "refs": ref_names},
-                "unit_norm_range": [nrm_min, nrm_max], "eval_cache": EVAL_CACHE,
+                "unit_norm_range": [nrm_min, nrm_max], "eval_cache": eval_cache,
                 "eval_cache_cos_families": es["meta"].get("cos_families")}
     excl_out = {"sae_features": excl_sae, "bsf_blocks_literal_old_ids": excl_bsf_old,
                 "bsf_blocks_eval_dir_top1_under_this_bsf": eval_bsf_new, "bsf_blocks_all": excl_bsf_all,
@@ -749,9 +896,10 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     vol.commit()
     vsize = os.path.getsize(f"{out}/vecs.f32")
     assert vsize == N * row_b, f"vecs.f32 {vsize} B != {N} x {row_b}"
-    log(f"DONE -> {out}: {N} rows ({vsize / 2**30:.1f} GB) " + " ".join(f"{f}={counts[f]}" for f in FAMILIES)
+    log(f"DONE -> {out}: {N} rows ({vsize / 2**30:.1f} GB) " + " ".join(f"{f}={counts[f]}" for f in FAM)
         + f" | published in {time.time() - t0:.0f}s | total {(time.time() - T0) / 60:.1f} min")
-    return {"out": out, "n": N, "families": counts, "shortfalls": meta_out["shortfalls"], "bsf_cos_x": fam_stats["bsf"]["cos_x"]}
+    return {"out": out, "n": N, "families": counts, "shortfalls": meta_out["shortfalls"], "bsf_cos_x": fam_stats["bsf"]["cos_x"],
+            "sae_windows_hist": fam_stats.get("sae", {}).get("windows_per_feature_hist"), "minutes": (time.time() - T0) / 60}
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -788,7 +936,7 @@ def verify(out_name: str = OUT_DEFAULT):
     n_train = mt["acts_train_rows"][1] + 1
     for r in recs:
         f = r["family"]
-        if f == "sae":
+        if f in ("sae", "sae_dec"):
             assert r["feature"] not in excl_sae
         elif f == "bsf":
             assert r["block"] not in excl_blk
@@ -797,7 +945,7 @@ def verify(out_name: str = OUT_DEFAULT):
         else:
             assert 0 <= r["seq"] < n_train
     # unit norms + direction-level leakage vs eval cache + pool_heldout
-    es = torch.load(EVAL_CACHE, map_location="cpu", weights_only=False)
+    es = torch.load(mt.get("eval_cache", EVAL_CACHE), map_location="cpu", weights_only=False)
     names = sorted(k[:-5] for k in es if k.endswith("_dirs"))
     ho_sz = os.path.getsize(f"{POOL_HELDOUT}/vecs.f32")
     ho = np.memmap(f"{POOL_HELDOUT}/vecs.f32", np.float32, "r", shape=(ho_sz // row_b, D_MODEL))
