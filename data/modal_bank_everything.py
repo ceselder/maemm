@@ -184,7 +184,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     n_fam = {f: (n_per_family if n < 0 else int(n)) for f, n in n_fam.items()}
     assert any(n > 0 for n in n_fam.values()), "every family has n=0"
     log(f"targets {n_fam} | store {ACTS_D} (train_frac {train_frac}, mu {mu_path}) | eval cache {eval_cache} | maxacts {maxacts_path}")
-    for p in (f"{ACTS_D}/acts.f16", f"{ACTS_D}/toks.i32", mu_path, f"{ACTS_D}/meta.json",
+    for p in (f"{ACTS_D}/toks.i32", mu_path, f"{ACTS_D}/meta.json",
               f"{PROBE_BANK}/records.jsonl", f"{PROBE_BANK}/vecs.f32", f"{POOL_RL_MIX}/records.jsonl",
               f"{POOL_HELDOUT}/records.jsonl", f"{POOL_HELDOUT}/vecs.f32", eval_cache, SAE_PT, MAXACTS_PT, maxacts_path):
         assert os.path.exists(p), f"missing input {p}"
@@ -219,23 +219,48 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
     # ---- activation store (acts27b, or a fresh store) ----
     meta = json.load(open(f"{ACTS_D}/meta.json"))
     NS, T = int(meta["n_seq"]), int(meta["seq_len"])
-    if "acts_complete" in meta:
-        assert meta["acts_complete"], f"{ACTS_D}: acts.f16 not complete yet"
-    assert os.path.getsize(f"{ACTS_D}/acts.f16") == NS * T * D_MODEL * 2, f"{ACTS_D}/acts.f16 size != n_seq x seq_len x d x 2"
     n_train = int(np.ceil(NS * train_frac))         # acts27b: rows 0..n_train-1 train; last 5% held out (== eval convention)
     mu_acts = np.load(mu_path).astype(np.float32)
     toks = np.fromfile(f"{ACTS_D}/toks.i32", dtype=np.int32).reshape(NS, T)
-    afd = os.open(f"{ACTS_D}/acts.f16", os.O_RDONLY)
+    row_bytes_act = T * D_MODEL * 2
+    if meta.get("acts_complete", True) and os.path.exists(f"{ACTS_D}/acts.f16") and os.path.getsize(f"{ACTS_D}/acts.f16") == NS * row_bytes_act:
+        # single-file store (acts27b, or a finalized fresh store): row s at byte s * T * d * 2
+        afd = os.open(f"{ACTS_D}/acts.f16", os.O_RDONLY)
+        sh_start = np.array([0], np.int64); sh_fds = [afd]
+        acts_source = f"{ACTS_D}/acts.f16"
+    else:
+        # SHARDED store (a fresh store whose CPU finalize has not produced acts.f16 yet): rows are rank-major over the collect
+        # shards exactly as finalize concatenates them (data/modal_acts27b_fresh.py) -> row s lives in shard k at local row
+        # s - sh_start[k]. Same bytes, no 400 GB copy needed before building.
+        shards = f"{ACTS_D}/shards"
+        mans = [json.load(open(f"{shards}/manifest_r{r}.json")) for r in range(int(meta["world"]))]
+        assert all(m["done"] for m in mans), "collect manifests not done"
+        order = [(m["rank"], ch["c"], ch["n"]) for m in mans for ch in m["chunks"]]
+        assert sum(n for _, _, n in order) == NS, (sum(n for _, _, n in order), NS)
+        sh_fds, starts, off = [], [], 0
+        for r, c, n in order:
+            pth = f"{shards}/r{r}_c{c:04d}.acts.f16"
+            assert os.path.getsize(pth) == n * row_bytes_act, f"{pth}: size != {n} rows"
+            sh_fds.append(os.open(pth, os.O_RDONLY)); starts.append(off); off += n
+        sh_start = np.array(starts, np.int64)
+        acts_source = f"{shards}/r*_c*.acts.f16 ({len(order)} shards, rank-major == finalize order)"
+        log(f"store {ACTS_D}: acts.f16 not finalized -> reading the {len(order)} collect shards directly ({off} rows)")
     nrng = np.random.default_rng(seed)
     wrng = random.Random(seed)
     per_doc = np.zeros(n_train, np.int32)            # document cap shared by realact + realact_long (big_bank convention)
     per_doc_bsf = np.zeros(n_train, np.int32)        # bsf gets its OWN counter: a shared cap starved it (76k/100k in run 1)
 
+    def _loc(s):
+        k = int(np.searchsorted(sh_start, s, side="right") - 1)
+        return sh_fds[k], int(s - sh_start[k])
+
     def read_act(s, p, dst):
-        dst[:] = np.frombuffer(_pread_full(afd, D_MODEL * 2, ((s * T) + p) * D_MODEL * 2), np.float16)
+        fd, sl = _loc(s)
+        dst[:] = np.frombuffer(_pread_full(fd, D_MODEL * 2, ((sl * T) + p) * D_MODEL * 2), np.float16)
 
     def read_seq(s):
-        return np.frombuffer(_pread_full(afd, T * D_MODEL * 2, s * T * D_MODEL * 2), np.float16).reshape(T, D_MODEL)
+        fd, sl = _loc(s)
+        return np.frombuffer(_pread_full(fd, T * D_MODEL * 2, sl * T * D_MODEL * 2), np.float16).reshape(T, D_MODEL)
 
     def window_text(s, p):
         W = wrng.randint(w_lo, w_hi)
@@ -834,7 +859,7 @@ def build(out_name: str = OUT_DEFAULT, n_per_family: int = 100_000, seed: int = 
                 "seed": seed, "d_model": D_MODEL, "model": MODEL, "layer": 42,
                 "trainer_args": {"--data-dir": out, "--bank-file": "vecs.f32", "--direction-source": "cluster"},
                 "family_recipes": fam_stats, "acts_store": {"dir": ACTS_D, "n_seq": NS, "seq_len": T, "train_frac": train_frac,
-                                                            "store_meta_fresh": meta.get("fresh")},
+                                                            "acts_source": acts_source, "store_meta_fresh": meta.get("fresh")},
                 "whitening_mu": {"realact/realact_long": mu_path, "bsf": f"{BSF_DIR}/whiten_mu.npy (+ whiten_zca.npy)"},
                 "norm_filter": {"mult": NORM_FILTER_MULT, "median": med, "thr": thr, "presample": NORM_PRESAMPLE},
                 "doc_cap": {"value": doc_cap, "counters": "realact+realact_long shared; bsf separate"},

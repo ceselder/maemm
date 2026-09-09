@@ -196,9 +196,12 @@ def collect(n_seq: int = 80_000, out_name: str = OUT_DEFAULT, batch: int = 64, c
     return {"out": out, "world": world, "wall_s": wall}
 
 
-@app.function(image=image, cpu=16, memory=64 * 1024, volumes={"/data": vol}, timeout=8 * 3600)
-def finalize(out_name: str = OUT_DEFAULT, keep_shards: bool = False):
-    """CPU: shards -> toks.i32 + whiten_mu.npy + meta.json (acts_complete=false) FIRST, then acts.f16, then meta acts_complete=true."""
+@app.function(image=image, cpu=16, memory=64 * 1024, ephemeral_disk=1024 * 1024, volumes={"/data": vol}, timeout=12 * 3600)
+def finalize(out_name: str = OUT_DEFAULT, keep_shards: bool = True):
+    """CPU: shards -> toks.i32 + whiten_mu.npy + meta.json (acts_complete=false) FIRST, then acts.f16, then meta acts_complete=true.
+    ephemeral_disk 1 TB: Modal stages volume writes on local disk before commit — the first run (default disk) died with
+    'not enough local disk space to stage volume data for commit' after assembling the 419 GB file. keep_shards=True so a
+    concurrent bank build that reads the shards (modal_bank_everything sharded-store path) is never cut off; delete manually."""
     import json
     import shutil
     import sys
