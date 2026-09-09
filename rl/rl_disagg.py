@@ -2153,8 +2153,9 @@ def find_micro_batch_fullparam(actor, opt, submodule, prompt_ids, marker, a, dev
     gc.collect(); torch.cuda.empty_cache()
     base = torch.cuda.memory_allocated()
     reserve = 0 if len(opt.state) else 2 * sum((p.to_local().numel() if fp.FP.is_dtensor(p) else p.numel()) * 4 for p in actor.parameters())
-    budget = frac * total - reserve
     world = fp.world
+    reserve = fp.FP.all_reduce_max(reserve, device)      # shard padding differs per rank: ONE budget everywhere (identical probe decisions)
+    budget = frac * total - reserve
     _log(tag, f"micro-batch probe (full-param) @ L={L}: resident {base / GB:.1f} GB, AdamW reserve {reserve / GB:.1f} GB, budget for the measured "
               f"fwd/bwd peak {budget / GB:.1f} GB ({frac:.0%} of {total / GB:.0f} GB minus the reserve)")
 
