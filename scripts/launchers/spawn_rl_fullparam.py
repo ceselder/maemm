@@ -25,7 +25,7 @@ P = "/home/celeste/shared/overnight/rl_ablation_ids.json"
 IDS_FULLRL = "/home/celeste/shared/overnight/rl_fullparam_ids.json"
 POOL = "/data/banks/mix_eq_1p45m"
 POLICY_BASE = "/data/sft_mix/mixeq_midtrain_fft_from_fft23m_v2/final"
-APP, EVAL_APP = "maemm-rl-disagg-fullparam", "maemm-eval-ckpt-fullrl"
+APP, EVAL_APP = os.environ.get("RL_FULLPARAM_APP", "maemm-rl-disagg-fullparam"), "maemm-eval-ckpt-fullrl"   # RL_FULLPARAM_APP=maemm-rl-disagg-fullparam2 = the deployment with reward/peak_last_frac
 RECIPE = ("--recipe scalerl --loss cispo --cispo-eps-max 5 --loss-agg prompt --adv-mode batch --zero-var-filter --npr-threshold 0.9 --npr-pass-cos 0.7 "
           "--max-lag 2 --fp32-head --autocast-bf16 --length-control penalty --kl-coef 0 --entropy-coef 0 --entropy-target 0 --groups-per-step 512 "
           "--group-size 8 --warmup-steps 25 --len-penalty-start 8 --len-penalty-per-tok 0.00025 --max-new-tokens 192 --reward-window-last 5 "

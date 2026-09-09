@@ -1296,6 +1296,7 @@ def main():
         if SCORE_STATS.get("peak_dist"):
             _pd = torch.cat(SCORE_STATS["peak_dist"]); log["reward/peak_dist_mean"] = _pd.mean().item()
             log["reward/peak_in_last5_frac"] = (_pd <= 4).float().mean().item()
+            log["reward/peak_last_frac"] = (_pd == 0).float().mean().item()      # reward argmax exactly at the last token
         log.update({"var/within_group_std_raw": float(var_stats[0]), "var/between_group_std_raw": float(var_stats[1]),
                     "var/zero_var_group_frac": float(var_stats[2]), "var/adv_std": float(var_stats[3]),
                     "var/adv_abs_mean": float(var_stats[4]), "var/group_std_min": float(var_stats[5]),

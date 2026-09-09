@@ -2890,6 +2890,7 @@ def run_trainer(a):
         if R.SCORE_STATS.get("peak_dist"):
             _pd = torch.cat(R.SCORE_STATS["peak_dist"]); log["reward/peak_dist_mean"] = _pd.mean().item()
             log["reward/peak_in_last5_frac"] = (_pd <= 4).float().mean().item()
+            log["reward/peak_last_frac"] = (_pd == 0).float().mean().item()      # reward argmax exactly at the last token
         w_std = float(loc[4] / n_groups_all)
         b_std = float(gmeans.std().item()) if len(gmeans) > 1 else 0.0
         log.update({"var/within_group_std_raw": w_std, "var/between_group_std_raw": b_std,
