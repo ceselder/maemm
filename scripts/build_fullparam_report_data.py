@@ -154,10 +154,25 @@ def main():
                      f"<tr><td>first publish incl. NCCL group creation</td><td class='num'>{pubsum['first_publish_total_s']:.1f} s (comm init {pubsum['first_publish_comm_init_s']:.1f} s)</td></tr>"
                      f"<tr><td>checksum mismatches (6 tensors × 50 publishes × 3 engines)</td><td class='num good'>0</td></tr>"
                      f"<tr><td>LoRA path publish (adapter files) for comparison</td><td class='num'>{mean([r['t_pub'] for r in L.get('initboth', []) if r['step'] >= 2]):.2f} s</td></tr></table>")
+    K = load("bench_gpu2_knobs.json", {})
+    knob_table = ""
+    if K.get("runs"):
+        knob_table = ("<p><b>Knob isolation on a 2-GPU trainer-only harness</b> (<code>rl/fullparam_update_bench.py</code>: same FSDP2 policy sharded over 2 B200, "
+                      "56 vs 48 synthetic rollouts on the two ranks so the dummy-micro-batch path runs, 2 reps each, no optimizer state; times are the 2nd rep, "
+                      "the 1st includes the fla Triton autotune for new shapes). Before the dummy-micro-batch fix the <code>head</code> config hung here exactly like "
+                      "the 8-GPU bench (<code>data/bench_gpu2_knobs_hang.json</code>); after it every config completes.</p>"
+                      "<table><tr><th>knobs</th><th class='num'>micro-batch</th><th class='num'>prefetch</th><th class='num'>update s (rep 2)</th><th class='num'>peak GB (2 ranks)</th><th class='num'>micro-batches</th></tr>"
+                      "<tr><td class='baseline'>base (fp32-head hook, no recompute)</td><td class='num'>8</td><td class='num'>0</td><td class='num'>13.1</td><td class='num'>164.6</td><td class='num'>7</td></tr>")
+        for run in K["runs"]:
+            for r in run["results"]:
+                knob_table += (f"<tr><td>{'+'.join(r['knobs']) or 'base'}</td><td class='num'>{r['mb']}</td><td class='num'>{run['prefetch']}</td>"
+                               f"<td class='num'>{r['update_s'][-1]:.1f}</td><td class='num {'good' if r['peak_gb'] < 140 else ''}'>{r['peak_gb']:.1f}</td><td class='num'>{r['n_micro_batches']}</td></tr>")
+        knob_table += "</table>"
     bench_rows = B.get("configs", [])
-    bench_table = ""
+    bench_table = knob_table
     if bench_rows:
-        bench_table = ("<table><tr><th>config</th><th class='num'>micro-batch</th><th class='num'>s/step</th><th class='num'>update s</th><th class='num'>tok/s/rank</th>"
+        bench_table += ("<p><b>8×B200 (3 vLLM + 5 trainer), 512 × 8 rollouts per step, means over the bench steps ≥ 1.</b></p>"
+                        "<table><tr><th>config</th><th class='num'>micro-batch</th><th class='num'>s/step</th><th class='num'>update s</th><th class='num'>tok/s/rank</th>"
                        "<th class='num'>peak GB</th><th class='num'>|Δlogp|</th></tr>" + "".join(
                            f"<tr><td>{r['label']}</td><td class='num'>{r['micro_batch']}</td><td class='num'>{r['step_s']:.0f}</td><td class='num'>{r['update_s']:.0f}</td>"
                            f"<td class='num'>{r['tok_s_rank']:.0f}</td><td class='num'>{r['peak_gb']:.0f}</td><td class='num'>{r['dlogp']:.4f}</td></tr>" for r in bench_rows) + "</table>")
@@ -212,12 +227,12 @@ def main():
                                 f"the all-gather + broadcast ({pubsum['t_transfer_mean']:.2f} s, {pubsum['gbps_mean']:.0f} GB/s), and the engines' extra load time "
                                 f"beyond the transfer. The first publish (step 1) includes the 3.1 s NCCL group creation."),
             "publish_table": publish_table,
-            "bench": ("5-step benches of the step-time configurations (trainer-side means over steps ≥ 1; 512 × 8 rollouts per step). "
-                      "<b>Only the baseline configuration completed a step</b>; see §6 for the fast configuration's status."),
-            "bench_table": bench_table or "<p class='noise'>The fast configuration (--suffix-ckpt --chunked-head --fsdp-prefetch 2, micro-batch 24) hung in step 0 of its "
-                                          "5-step bench (all five trainer ranks' NCCL watchdogs stuck 8 min after the probe; its probe alone ran 5 forward/backward passes "
-                                          "at micro-batch 4–24 without issue). Root-causing it needs a trainer-only run (rl/fullparam_update_bench.py, 2 GPUs); the "
-                                          "production arm therefore runs the validated micro-batch-8 configuration (68 s/step).</p>",
+            "bench": ("Step-time configurations. The first 8-GPU bench of the fast configuration (--suffix-ckpt --chunked-head --fsdp-prefetch 2, probe → micro-batch 24) "
+                      "hung in step 0: FSDP2 reduce-scatters only the parameters that have a gradient, as one flat collective per group, and the zero-weight dummy "
+                      "micro-batch that equalizes the micro-batch count across uneven shards bypassed lm_head under the chunked head → one rank's root reduce-scatter "
+                      "was shorter than the others' → all five NCCL watchdogs stuck. Reproduced and fixed on a 2-GPU trainer-only harness (table 1); the 8-GPU numbers "
+                      "of the fixed configuration are in table 2 when its bench has run."),
+            "bench_table": bench_table,
             "eval": eval_table + (f"<p>Step 25 of the full-parameter run scores <b>{fmt(evrow(ev_fp, 25), 4)}</b> mean_all vs {fmt(evrow(ev_if, 25), 4)} for the LoRA "
                                   f"arm on the same init and {fmt(evrow(ev_ib, 25), 4)} for the LoRA arm on the base + SFT adapter; SAE fired {fmt(evrow(ev_fp, 25, 'eval/sae/fired'))} "
                                   f"vs {fmt(evrow(ev_if, 25, 'eval/sae/fired'))}. At step 50 (the final checkpoint of the validation run) the full-parameter policy reaches "
@@ -225,11 +240,11 @@ def main():
                                   f"+{100 * (evrow(ev_fp, 50) - evrow(ev_if, 50)):.1f} pp over the LoRA arm that started from the same weights, at a 7× lower learning rate "
                                   f"(eval run <code>rl_fullparam_val50_lr1e-6_eval</code>). Same eval protocol, same clean scorer; one seed each, so treat ~0.5 pp as noise.</p>"),
             "limits": ("<ul>"
-                       "<li><b>Step time.</b> 68 s/step at micro-batch 8 vs 30 s for the LoRA arm — the FSDP2 traffic per micro-batch. The knobs that fix it "
-                       "(--suffix-ckpt: exact per-layer recompute of the suffix forward; --chunked-head: no full logits; --fsdp-prefetch 2) are implemented, unit-tested "
-                       "for gradient equality on CPU, and their probe reached micro-batch 24 at 106 GB on the GPUs — but the first training step with them hung "
-                       "(all five ranks' NCCL watchdogs stuck, rc −6). Not root-caused within the budget; a 2-GPU trainer-only bench harness "
-                       "(rl/fullparam_update_bench.py) is in the branch to bisect the three knobs.</li>"
+                       "<li><b>Step time.</b> The production arm runs 68 s/step at micro-batch 8 vs 30 s for the LoRA arm — the FSDP2 traffic per micro-batch. The knobs "
+                       "that lift the micro-batch (--suffix-ckpt: exact per-layer recompute of the suffix forward; --chunked-head: no full logits; --fsdp-prefetch 2) are "
+                       "implemented, unit-tested for gradient equality on CPU, their probe reached micro-batch 24 at 106 GB, and the hang their first 8-GPU bench hit is "
+                       "root-caused and fixed (§2b). The production arm was launched before that fix on the validated micro-batch-8 configuration and is NOT hot-swapped: "
+                       "a mid-run switch would restart the AdamW moments (no --save-optim) and blur the ablation. Use the fast configuration for the next runs.</li>"
                        "<li><b>Budget.</b> Development used ≈ 22 GPU-hours on 8×B200 (two failed smokes: probe fit + uneven-shard deadlock; the 50-step validation; one "
                        "failed fast-config bench) against the ≈ 12 asked for; the production arm is on top.</li>"
                        "<li><b>fs publish mode</b> implemented and CPU-tested, not exercised on the GPUs (the NCCL path met the target immediately).</li>"
