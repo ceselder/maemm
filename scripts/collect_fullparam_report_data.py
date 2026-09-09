@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--val50", default="")
     ap.add_argument("--lora", nargs="*", default=["initboth:rl_abl_initboth_8x512_lr7e-6", "initnewfft:rl_abl_initnewfft_8x512_lr7e-6"])
     ap.add_argument("--disagg-run", nargs="*", default=[], help="<tag>:<ts> dirs under /data/disagg_runs to fetch (tag = smoke | val50)")
+    ap.add_argument("--bench", nargs="*", default=[],
+                    help="<label>:<wandb run name>:<n_trainer>:<mb>:<flags> step-time bench configs -> data/bench.json (means over steps >= 1)")
     a = ap.parse_args()
     os.makedirs(f"{OUT}/raw", exist_ok=True)
     steps, meta = {}, {}
@@ -82,6 +84,25 @@ def main():
                    "fullparam_sync_r2.json", "verify_r0.json"):
             ok = volume_get(f"/disagg_runs/{ts}/{fn}", f"{OUT}/raw/{tag}_{fn}")
             print(f"[collect] {tag} {fn}: {'ok' if ok else 'missing'}")
+    bench = []
+    for spec in a.bench:
+        label, name, n_tr, mb, flags = spec.split(":", 4)
+        m, rows = wandb_rows(name)
+        if not m:
+            continue
+        rs = [r for r in rows if r["step"] >= 1] or rows
+        mean = lambda k: float(sum(r.get(k, 0.0) or 0.0 for r in rs) / max(len(rs), 1))   # noqa: E731
+        tok_step = mean("len") * 4096 / int(n_tr)                  # completion tokens per rank per step (512 groups x 8 samples)
+        bench.append({"label": label, "run": name, "wandb_id": m["id"], "n_trainer": int(n_tr), "micro_batch": int(mb), "flags": flags,
+                      "n_steps": len(rs), "step_s": mean("step_s"), "update_s": mean("update_s"), "score_s": mean("score_s"),
+                      "publish_s": mean("t_pub"), "wait_s": mean("wait_s"),
+                      "other_s": max(mean("step_s") - mean("update_s") - mean("score_s") - mean("t_pub"), 0.0),
+                      "tok_s_rank": tok_step / max(mean("step_s"), 1e-6), "tok_per_rank_step": tok_step,
+                      "peak_gb": max((r.get("peak_gb_max_rank") or r.get("peak_gb") or 0.0) for r in rs),
+                      "dlogp": mean("dlogp"), "reward": mean("reward"), "gnorm": mean("gnorm")})
+    if bench:
+        json.dump({"configs": bench, "note": "means over the bench steps >= 1 (step 0 includes engine warm-up); tokens = rollout/len_mean x 4096 / n_trainer"},
+                  open(f"{OUT}/bench.json", "w"), indent=1)
     json.dump(steps, open(f"{OUT}/steps_fullparam.json", "w"), indent=1)
     json.dump(lora, open(f"{OUT}/steps_lora.json", "w"), indent=1)
     json.dump(meta, open(f"{OUT}/wandb_runs.json", "w"), indent=1)
