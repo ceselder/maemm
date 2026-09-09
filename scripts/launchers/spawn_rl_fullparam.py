@@ -10,7 +10,9 @@ ScaleRL/CISPO, pool mix_eq_1p45m), policy = the new-pretrain + full-fine-tune mi
 Extra rl_disagg flags after `--`, e.g. `python3 spawn_rl_fullparam.py smoke 1e-6 -- --publish-mode fs`; the split with
 `--split 2+6` (n_rollout+n_trainer, default 3+5). The FAST step-time knobs (--suffix-ckpt --chunked-head --fsdp-prefetch 2; 68 -> 44 s/step)
 are rl_disagg's DEFAULT for --full-param since 2026-09-09; the production arm rl_abl_initnewfft_fullparam_8x512 (launched 00:30Z that day)
-runs the first validated configuration (= `-- --no-suffix-ckpt --no-chunked-head --fsdp-prefetch 0`)."""
+runs the first validated configuration (= `-- --no-suffix-ckpt --no-chunked-head --fsdp-prefetch 0`). Recommended for FUTURE runs:
+`--split 2+6` (fast default reaches micro-batch 32 there: 35 s/step vs 44 s on 3+5 vs 68 s for the production configuration; the two
+engines still keep the 32-block rollout queue full)."""
 import json
 import os
 import sys

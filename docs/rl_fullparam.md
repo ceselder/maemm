@@ -161,15 +161,22 @@ per-parameter step applied to every weight).
 
 ## 7. Known limits
 
-- **Step time**: the production arm runs 68 s/step at micro-batch 8 (first validated configuration, launched before the fix of
-  lesson 4). The fast configuration (now the default: `--suffix-ckpt --chunked-head --fsdp-prefetch 2`, probe → micro-batch 24)
-  measured **43–45 s/step** on 8×B200 (`rl_fullparam_bench5_fast35b`: update 40–41 s, scoring 2–3 s, publish 0.6 s; peak 136–139
-  GB/rank; |Δlogp| 0.021; identical rewards to the baseline steps at the same seed, gradient norm 0.753 vs 0.757). Still
-  communication-bound: 35 micro-batches × (2 × 54 GB all-gather + 108 GB fp32 reduce-scatter) ≈ 7.6 TB per rank per step ≈ 30 s
-  of the 40 s. Levers not yet tried: `reduce_dtype=bf16` for the gradient reduce-scatter (−54 GB per micro-batch), `--fsdp-keep-unsharded N`
-  (fullft: keep N layers' bf16 params resident across the step, +0.84 GB/layer, saves their all-gathers), micro-batch 32 with
-  `--mb-target-frac 0.9` (the measured training peak at mb 24 is ~7 GB below probe + reserve). The production arm is not
-  hot-swapped mid-run (no `--save-optim` → an AdamW restart would confound the ablation).
+- **Step time** (8×B200, 512 × 8 rollouts per step; means of the 5-step benches, steady state in parentheses):
+
+  | configuration | split | micro-batch | s/step | update s | tok/s/rank | peak GB/rank | |Δlogp| |
+  |---|---|---|---|---|---|---|---|
+  | production arm (first validated: `--no-suffix-ckpt --no-chunked-head --fsdp-prefetch 0`) | 3 vLLM + 5 trainer | 8 | 67.8 (67–68) | 64.0 | 462 | 151 | 0.026 |
+  | fast default (`--suffix-ckpt --chunked-head --fsdp-prefetch 2`), run `rl_fullparam_bench5_fast35b` | 3 + 5 | 24 (probe) | 49.6 (43–45) | 40.9 | 631 | 139–148 | 0.022 |
+  | fast default, run `rl_fullparam_bench5_fast26` | **2 + 6** | 32 (probe) | 37.4 (**35–36**) | 31.1 | 697 | 129–138 | 0.022 |
+  | fast default, explicit `--micro-batch 32` (probe skipped) | 3 + 5 | 32 | OOM in step 0 (174 GB live during a forward) | | | | |
+
+  Every fast-config bench step reproduces the baseline's reward / gradient norm at the same seed (exact recompute). With 2 vLLM
+  engines the 32-block queue stays full (16 blocks × 4.4 s / 2 = 35 s of generation per step ≈ the step), so 2 + 6 is the
+  recommended split for future full-parameter runs (`spawn_rl_fullparam.py ... --split 2+6`). The ≤ 30 s target is not met:
+  the update is still the per-micro-batch all-gather (2 × 54 GB) + fp32 reduce-scatter (108 GB). Levers not yet tried:
+  `reduce_dtype=bf16` for the gradient reduce-scatter, `--fsdp-keep-unsharded N` (fullft: keep N layers' bf16 params resident
+  across the step, +0.84 GB/layer), micro-batch 48 on 2 + 6. The production arm (launched before the lesson-4 fix) is
+  deliberately not hot-swapped (no `--save-optim` → an AdamW restart would confound the ablation).
 - `--kl-coef > 0` with a non-MODEL policy base loads a second frozen sharded copy (+~11 GB/rank at Y=5); its head is bf16 (no
   fp32 head hook on the reference). Not exercised (the recipe has kl 0).
 - Inline eval is not supported in full-param mode (use the full-model checkpoint daemon — exercised: step 25 + final of the validation run).
@@ -180,5 +187,6 @@ per-parameter step applied to every weight).
   target immediately: 0.6 s per 50 GB publish).
 - The per-step publish waits for every engine's block boundary (≤ 1 block ≈ 4.4 s here, measured 0.15–0.35 s); much longer
   blocks would call for a double-buffered asynchronous variant.
-- Budget: development used ≈ 24 GPU-hours on 8×B200 (two failed smokes, the 50-step validation, two fast-config benches) plus
-  ~1 GPU-hour of 2-GPU harness runs, against the ≈ 12 asked for; the production arm (≈ 6 h × 8 GPUs) is on top.
+- Budget: development used ≈ 30 GPU-hours on 8×B200 (two failed smokes, the 50-step validation, one hung + three 5-step
+  fast-config benches incl. the mb-32 OOM) plus ~1.5 GPU-hours of 2-GPU harness runs, against the ≈ 12 asked for; the
+  production arm (≈ 6 h × 8 GPUs) and its 1-GPU evaluator are on top.
