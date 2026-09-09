@@ -13,8 +13,17 @@ import os
 import sys
 import time
 
-import torch
-import torch.distributed as dist
+# ONE visible GPU per rank, set BEFORE torch is imported (rl/rl.py does the same at import; narrowing after CUDA init fails)
+if "LOCAL_RANK" in os.environ:
+    _lr = int(os.environ["LOCAL_RANK"])
+    _cvd = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+    if not _cvd:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(_lr)
+    elif len(_cvd) > 1:
+        os.environ["CUDA_VISIBLE_DEVICES"] = _cvd[_lr]
+
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
 
 
 def main():
@@ -41,9 +50,8 @@ def main():
     from mxf.prompts import build_prompt_ids
 
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-    local = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local)
-    device = f"cuda:{local}"
+    torch.cuda.set_device(0)          # the one visible GPU of this rank
+    device = "cuda:0"
     dist.init_process_group("cpu:gloo,cuda:nccl")
     tag = f"B{rank}"
 
