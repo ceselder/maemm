@@ -24,8 +24,11 @@ filled from that report; `[measured]` marks values that come from the 8xB200 run
 
 | step-time knobs | — | `--suffix-ckpt`: exact per-layer activation checkpointing of the suffix forward (`sft/prefix_cache.SuffixCheckpointer`, FSDP2-tested in `sft/fullft_smoke.py`; the prefix / no-grad forwards stay un-checkpointed). `--chunked-head`: `rl_fullparam.ChunkedHead` swaps `lm_head.forward` for a capture of the final hidden states and computes fp32 logits → log-softmax → gather/entropy per `--vocab-chunk` positions under `torch.utils.checkpoint`, so no micro-batch ever holds `[tokens × 248 320]` logits (grad-identical to the fp32-head hook + `_chunked_logp`: unit test). `--fsdp-prefetch 2`: explicit next-layer all-gather prefetch. Together they lift the micro-batch from 8 to 32–64 and cut the per-micro-batch FSDP traffic (2 × 54 GB all-gather + 108 GB fp32 reduce-scatter per micro-batch) 4–8× |
 
-Flags: `--full-param`, `--publish-mode {nccl,fs}`, `--wu-port`, `--fs-keep-steps`, `--fsdp-prefetch`, `--no-scorer-shard`,
-`--mb-target-frac`, `--suffix-ckpt`, `--chunked-head`, `--save-optim`, `--load-optim`. `--autocast-bf16` is ignored (FSDP2 already computes in bf16). Inline
+Flags: `--full-param`, `--publish-mode {nccl,fs}`, `--wu-port`, `--fs-keep-steps`, `--fsdp-prefetch` (default 2), `--no-scorer-shard`,
+`--mb-target-frac`, `--suffix-ckpt` / `--no-suffix-ckpt` (default ON with `--prefix-cache`), `--chunked-head` / `--no-chunked-head`
+(default ON), `--save-optim`, `--load-optim`. **The fast configuration is the default since 2026-09-09**; the production arm
+`rl_abl_initnewfft_fullparam_8x512` (launched 00:30Z, before the fix of lesson 4) runs the first validated configuration
+(`--no-suffix-ckpt --no-chunked-head --fsdp-prefetch 0`, micro-batch 8, 68 s/step) and is deliberately not swapped mid-run. `--autocast-bf16` is ignored (FSDP2 already computes in bf16). Inline
 eval (`--inline-eval-every > 0`) is refused. With the flag off no code path changes (all `fp is None` branches are the
 previous code; `rl/test_rl_disagg_{queue,scalerl,policy_base}.py` still pass).
 
@@ -158,11 +161,15 @@ per-parameter step applied to every weight).
 
 ## 7. Known limits
 
-- **Step time of the production arm**: 68 s/step at micro-batch 8 (validated configuration; launched before the fast-config fix).
-  The fast configuration `--suffix-ckpt --chunked-head --fsdp-prefetch 2` (micro-batch 24 from the probe; 2-GPU harness: update
-  peak 130 GB vs 165 GB at micro-batch 8, no hang after lesson 4) is the recommended configuration for the next runs; its
-  8×B200 step time is in the report's bench table once `rl_fullparam_bench5_fast35b` has run. The production arm is not
-  hot-swapped mid-run (no `--save-optim` → an AdamW restart would perturb the ablation).
+- **Step time**: the production arm runs 68 s/step at micro-batch 8 (first validated configuration, launched before the fix of
+  lesson 4). The fast configuration (now the default: `--suffix-ckpt --chunked-head --fsdp-prefetch 2`, probe → micro-batch 24)
+  measured **43–45 s/step** on 8×B200 (`rl_fullparam_bench5_fast35b`: update 40–41 s, scoring 2–3 s, publish 0.6 s; peak 136–139
+  GB/rank; |Δlogp| 0.021; identical rewards to the baseline steps at the same seed, gradient norm 0.753 vs 0.757). Still
+  communication-bound: 35 micro-batches × (2 × 54 GB all-gather + 108 GB fp32 reduce-scatter) ≈ 7.6 TB per rank per step ≈ 30 s
+  of the 40 s. Levers not yet tried: `reduce_dtype=bf16` for the gradient reduce-scatter (−54 GB per micro-batch), `--fsdp-keep-unsharded N`
+  (fullft: keep N layers' bf16 params resident across the step, +0.84 GB/layer, saves their all-gathers), micro-batch 32 with
+  `--mb-target-frac 0.9` (the measured training peak at mb 24 is ~7 GB below probe + reserve). The production arm is not
+  hot-swapped mid-run (no `--save-optim` → an AdamW restart would confound the ablation).
 - `--kl-coef > 0` with a non-MODEL policy base loads a second frozen sharded copy (+~11 GB/rank at Y=5); its head is bf16 (no
   fp32 head hook on the reference). Not exercised (the recipe has kl 0).
 - Inline eval is not supported in full-param mode (use the full-model checkpoint daemon — exercised: step 25 + final of the validation run).
