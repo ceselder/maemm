@@ -91,7 +91,10 @@ def _scan_records(bank, all_one_family=None):
 
 
 @app.function(image=image, gpu=SMALL_GPUS, cpu=16, memory=131072, ephemeral_disk=512 * 1024, volumes={"/data": vol}, timeout=8 * 3600)
-def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overwrite: bool = False, threads: int = 48):
+def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overwrite: bool = False, threads: int = 48, exclude_json: str = ""):
+    """exclude_json: JSON dict {source bank: path of an end_anchor_rows.json} — rows listed under families[*].fail_vec_idx of that file
+    are removed from the selection pool of that bank (the SAE end-anchor filter: rows whose feature does not peak within the last 2
+    tokens when the target is re-tokenized standalone)."""
     import shutil
     import time
     from concurrent.futures import ThreadPoolExecutor
@@ -108,6 +111,14 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
     rng = np.random.default_rng(seed)
     stage = "/root/mix"; os.makedirs(stage, exist_ok=True)
 
+    # ---- optional per-bank row exclusions (end-anchor filter) ----
+    excl_rows, excl_info = {}, {}
+    for bank_p, fpath in (json.loads(exclude_json) if exclude_json else {}).items():
+        ea = json.load(open(fpath))
+        excl_rows[bank_p] = np.unique(np.concatenate([np.array(d["fail_vec_idx"], np.int64) for d in ea["families"].values()] or [np.zeros(0, np.int64)]))
+        excl_info[bank_p] = {"file": fpath, "rule": ea.get("rule"), "n_excluded_rows": int(len(excl_rows[bank_p])),
+                             "families": {f: {k: v for k, v in d.items() if k != "fail_vec_idx"} for f, d in ea["families"].items()}}
+        _log(f"exclusions for {bank_p}: {len(excl_rows[bank_p])} rows ({ea.get('rule')})")
     # ---- sources: per-bank row lists per family, caps ----
     picks_bank, picks_row, picks_fam = [], [], []            # parallel lists -> arrays
     bank_ids, bank_info, src_lines, src_line_of_vec, per_source = [], {}, {}, {}, {}
@@ -128,6 +139,10 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
                 src_line_of_vec[bid] = line_of_vec
             for f in fams:
                 rows = np.arange(n) if fam_arr is None else np.flatnonzero(fam_arr == f)
+                if bank in excl_rows and len(excl_rows[bank]):
+                    n_before = len(rows); rows = rows[~np.isin(rows, excl_rows[bank])]
+                    if n_before != len(rows):
+                        _log(f"  {bank} {f}: {n_before - len(rows)} rows excluded by the end-anchor filter -> {len(rows)}")
                 rows_by_fam[f].append((bid, rows))
             _log(f"source {bank}: {n} rows, families {({f: sum(len(r) for b, r in rows_by_fam[f] if b == bid) for f in fams})} ({time.time() - t0:.0f}s)")
         for f in fams:
@@ -283,6 +298,7 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
              "leak_check": {"threshold": LEAK_COS, "reference_sets": ref_names, "n_reference_dirs": int(offs[-1]), "rows_dropped": n_bad,
                             "rows_dropped_by_family": dropped, "max_cos_table": leak_tbl, "eval_cache": EVAL_CACHE_V2, "pool_heldout": POOL_HELDOUT},
              "source_norm_range": norm_stats, "pretrain_corpus_parts_excluded": PRETRAIN_PARTS, "unused_parts_used": UNUSED_PARTS,
+             "end_anchor_exclusions": excl_info,
              "source_meta": src_meta, "d_model": D, "model": "Qwen/Qwen3.6-27B", "layer": 42, "created": time.time(), "wall_s": time.time() - T0}
     json.dump(stats, open(f"{out}/build_stats.json", "w"), indent=1)
     json.dump({**stats, "trainer_args": {"--data-dir": out, "--bank-file": "vecs.f32"}}, open(f"{out}/meta.json", "w"), indent=1)

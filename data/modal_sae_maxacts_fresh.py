@@ -248,3 +248,102 @@ def verify_end_anchor(bank: str = "/data/banks/everything_5m_fresh", families: s
     bad = {f: r["pass_last2"] for f, r in out.items() if r["pass_last2"] < min_pass}
     assert not bad, f"end-anchor check below {min_pass}: {bad}"
     return out
+
+
+@app.function(image=image, gpu=GPUS, cpu=8, memory=98304, volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")],
+              timeout=4 * 3600)
+def filter_end_anchor(bank: str = "/data/banks/everything_5m_fresh", families: str = "sae,sae_dec", rule: str = "last2", batch: int = 96,
+                      write: bool = True):
+    """FULL end-anchor pass (not a sample): re-tokenizes EVERY distinct (feature, target_text) of the given families standalone, runs
+    layer 42 + the SAE encoder, and records per row whether the feature's activation peaks in the last token ('last') or within the
+    last 2 ('last2'). Writes <bank>/end_anchor_rows.json = {rule, families: {fam: {n, pass_last, pass_last2, fail_vec_idx: [...]}}, ...}
+    (the compositor excludes fail_vec_idx via exclude_json) and a list-free summary into build_stats.json / meta.json
+    ["end_anchor_filter"]. sae and sae_dec rows share texts, so each text is scored once."""
+    import json
+    import sys
+    import time
+    import numpy as np
+    import torch
+    sys.path.insert(0, "/pmx/helpers")
+    from mxf.config import D_MODEL, MODEL, READ_LAYER
+    from mxf.inject import read_resid
+    os.environ["HF_HOME"] = "/data/hf_cache"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    dev = "cuda:0"
+    T0 = time.time()
+    vol.reload()
+    fams = [f for f in families.split(",") if f]
+    rows = {f: [] for f in fams}                       # (vec_idx, key)
+    keys, texts, feats = {}, [], []
+    with open(f"{bank}/records.jsonl") as fh:
+        for i, line in enumerate(fh):
+            r = json.loads(line)
+            if r["family"] in rows:
+                assert int(r["vec_idx"]) == i
+                k = (int(r["feature"]), r["target_text"])
+                if k not in keys:
+                    keys[k] = len(texts); texts.append(r["target_text"]); feats.append(int(r["feature"]))
+                rows[r["family"]].append((i, keys[k]))
+    n_u = len(texts)
+    print(f"[anchor-full] {bank}: " + " ".join(f"{f}={len(rows[f])}" for f in fams) + f" | {n_u} unique (feature, text) ({time.time() - T0:.0f}s)", flush=True)
+    params = torch.load(SAE_PT, map_location="cpu", weights_only=False)
+    W_enc = params["encoder.weight"].to(dev, torch.float32); b_enc = params["encoder.bias"].to(dev, torch.float32)
+    b_dec = (params.get("b_dec", params.get("bias"))).to(dev, torch.float32)
+    thr = float(params["threshold"].item()) if "threshold" in params else 0.0
+    del params
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    tok = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
+    bos = tok.bos_token_id if tok.bos_token_id is not None else 248044
+    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", local_files_only=True,
+                                                 device_map={"": dev}).eval()
+    enc = tok(texts, add_special_tokens=False)["input_ids"]
+    lens = np.array([len(e) for e in enc]); order = np.argsort(lens, kind="stable")
+    argpos = np.full(n_u, -1); act_last = np.zeros(n_u, np.float32); act_max = np.zeros(n_u, np.float32)
+    t0 = time.time(); done = 0
+    with torch.no_grad():
+        i0 = 0
+        while i0 < n_u:
+            L = int(lens[order[i0]])
+            i1 = i0
+            while i1 < n_u and i1 - i0 < batch and int(lens[order[i1]]) == L:
+                i1 += 1
+            kb = order[i0:i1]; i0 = i1
+            if L < 1:
+                continue
+            ids = torch.tensor([[bos] + enc[k] for k in kb], device=dev)
+            h, _ = read_resid(model, READ_LAYER, {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, pool="all")
+            a = h[:, 1:, :]
+            fidx = torch.tensor([feats[k] for k in kb], device=dev)
+            pre = torch.relu(((a - b_dec) * W_enc[fidx][:, None, :]).sum(-1) + b_enc[fidx][:, None])
+            argpos[kb] = pre.argmax(1).cpu().numpy(); act_last[kb] = pre[:, -1].cpu().numpy(); act_max[kb] = pre.max(1).values.cpu().numpy()
+            done += len(kb)
+            if done % 50000 < len(kb):
+                el = time.time() - t0
+                print(f"[anchor-full] {done}/{n_u} texts ({done / max(el, 1):.0f} texts/s, ETA {(n_u - done) / max(done / max(el, 1), 1) / 60:.0f} min)", flush=True)
+    ok = argpos >= 0
+    off = lens - 1 - argpos
+    pass_last = ok & (off == 0); pass_last2 = ok & (off <= 1)
+    keep_key = pass_last2 if rule == "last2" else pass_last
+    out = {"rule": rule, "n_unique_texts": int(n_u), "threshold": thr, "families": {}, "seconds": time.time() - T0,
+           "unique_text_stats": {"pass_last": float(pass_last.sum() / max(ok.sum(), 1)), "pass_last2": float(pass_last2.sum() / max(ok.sum(), 1)),
+                                 "fire_last_rate(>thr)": float(((act_last > thr) & ok).sum() / max(ok.sum(), 1)),
+                                 "act_last_over_act_max_median": float(np.median((act_last / np.maximum(act_max, 1e-9))[ok])),
+                                 "peak_offset_from_end_hist": {str(int(d)): int(c) for d, c in zip(*np.unique(off[ok], return_counts=True)) if d <= 10}}}
+    for f in fams:
+        vi = np.array([v for v, _ in rows[f]], np.int64); kk = np.array([k for _, k in rows[f]], np.int64)
+        fail = vi[~keep_key[kk]]
+        out["families"][f] = {"n": int(len(vi)), "pass_last": float(pass_last[kk].mean()), "pass_last2": float(pass_last2[kk].mean()),
+                              "n_fail": int(len(fail)), "n_keep": int(len(vi) - len(fail)), "fail_vec_idx": sorted(fail.tolist())}
+        print(f"[anchor-full] {f}: n {len(vi)} pass_last {pass_last[kk].mean():.4f} pass_last2 {pass_last2[kk].mean():.4f} -> keep {len(vi) - len(fail)} drop {len(fail)}", flush=True)
+    if write:
+        json.dump(out, open(f"{bank}/end_anchor_rows.json.tmp", "w")); os.replace(f"{bank}/end_anchor_rows.json.tmp", f"{bank}/end_anchor_rows.json")
+        summ = {**out, "families": {f: {k: v for k, v in d.items() if k != "fail_vec_idx"} for f, d in out["families"].items()}, "rows_file": f"{bank}/end_anchor_rows.json"}
+        for fn in ("build_stats.json", "meta.json"):
+            d = json.load(open(f"{bank}/{fn}")); d["end_anchor_filter"] = summ
+            if fn == "meta.json":
+                for f in fams:
+                    d.setdefault("family_recipes", {}).setdefault(f, {})["end_anchor_filter"] = summ["families"][f]
+            json.dump(d, open(f"{bank}/{fn}.tmp", "w"), indent=1); os.replace(f"{bank}/{fn}.tmp", f"{bank}/{fn}")
+        vol.commit()
+        print(f"[anchor-full] written {bank}/end_anchor_rows.json + summaries ({(time.time() - T0) / 60:.1f} min)", flush=True)
+    return {**out, "families": {f: {k: v for k, v in d.items() if k != "fail_vec_idx"} for f, d in out["families"].items()}}
