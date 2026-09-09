@@ -158,9 +158,20 @@ per-parameter step applied to every weight).
 
 ## 7. Known limits
 
+- **Step time of the production arm**: 68 s/step at micro-batch 8 (validated configuration; launched before the fast-config fix).
+  The fast configuration `--suffix-ckpt --chunked-head --fsdp-prefetch 2` (micro-batch 24 from the probe; 2-GPU harness: update
+  peak 130 GB vs 165 GB at micro-batch 8, no hang after lesson 4) is the recommended configuration for the next runs; its
+  8×B200 step time is in the report's bench table once `rl_fullparam_bench5_fast35b` has run. The production arm is not
+  hot-swapped mid-run (no `--save-optim` → an AdamW restart would perturb the ablation).
 - `--kl-coef > 0` with a non-MODEL policy base loads a second frozen sharded copy (+~11 GB/rank at Y=5); its head is bf16 (no
-  fp32 head hook on the reference).
-- Inline eval is not supported in full-param mode (use the full-model checkpoint daemon).
+  fp32 head hook on the reference). Not exercised (the recipe has kl 0).
+- Inline eval is not supported in full-param mode (use the full-model checkpoint daemon — exercised: step 25 + final of the validation run).
 - The micro-batch probe never retries after an OOM under FSDP2 (fatal with a clear message; pass `--micro-batch`).
-- `--save-optim` writes ~2× the model per checkpoint (fp32 AdamW) and is untested end-to-end on the GPU runs.
-- `publish-mode fs` needs ≥ 2 × 54 GB of RAM-backed work dir.
+- `--save-optim` / `--load-optim` (torch.distributed.checkpoint, fp32 AdamW state ≈ 2× the model per checkpoint) are implemented
+  but not exercised on the GPU runs.
+- `publish-mode fs` (RAM-disk shard files) is implemented and CPU-tested, not exercised on the GPU runs (the NCCL path met the
+  target immediately: 0.6 s per 50 GB publish).
+- The per-step publish waits for every engine's block boundary (≤ 1 block ≈ 4.4 s here, measured 0.15–0.35 s); much longer
+  blocks would call for a double-buffered asynchronous variant.
+- Budget: development used ≈ 24 GPU-hours on 8×B200 (two failed smokes, the 50-step validation, two fast-config benches) plus
+  ~1 GPU-hour of 2-GPU harness runs, against the ≈ 12 asked for; the production arm (≈ 6 h × 8 GPUs) is on top.
