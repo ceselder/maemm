@@ -174,7 +174,7 @@ def _trim_plan(tok, texts, peak_idx, n_tok, min_tok=TRIM_MIN_TOK, batch=4096):
 
 @app.function(image=image, gpu=SMALL_GPUS, cpu=16, memory=131072, ephemeral_disk=512 * 1024, volumes={"/data": vol}, timeout=8 * 3600)
 def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overwrite: bool = False, threads: int = 48, exclude_json: str = "",
-          trim_to_peak: str = "", trim_min_tok: int = TRIM_MIN_TOK):
+          trim_to_peak: str = "", trim_min_tok: int = TRIM_MIN_TOK, dense_frac: float = 0.5):
     """exclude_json: JSON dict {source bank: path of a rows file} — rows listed under families[*].fail_vec_idx of that file are removed from
     the selection pool of that bank. Used for (a) the SAE end-anchor filter (end_anchor_rows.json: rows whose feature does not peak within
     the last 2 tokens when the target is re-tokenized standalone) and (b) the MLP eval-pair exclusion (eval_cos_rows.json: rows whose
@@ -290,7 +290,7 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
         row_b = D * (2 if info["dtype"] == "f16" else 4)
         dt = np.float16 if info["dtype"] == "f16" else np.float32
         fd = os.open(f"{bank}/vecs.{info['dtype']}", os.O_RDONLY)
-        dense = len(src_rows) > 0.5 * info["n"]                  # dense selection: stream contiguous ranges; sparse: random preads
+        dense = len(src_rows) > dense_frac * info["n"]           # dense selection: stream contiguous ranges; sparse: random preads (dense_frac=0 -> always stream: volume random reads crawled 2026-09-10)
         CH = 32768
         for c0 in range(0, len(src_rows), CH):
             rs = src_rows[c0:c0 + CH]; outs = order[c0:c0 + CH]
