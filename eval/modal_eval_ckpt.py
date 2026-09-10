@@ -223,8 +223,9 @@ def list_pending(ckpt_dir: str, tag: str, final_step: int = 1000, full_model: bo
                        modal.Secret.from_name("maemm-anthropic"), modal.Secret.from_name("maemm-openrouter")],
               timeout=24 * 3600)
 def fullmodel_daemon(ckpt_dir: str, tag: str, wandb_name: str = "", final_step: int = 1000, poll_s: int = 120,
-                     vllm_gpu_mem: float = 0.5, extra_args: str = "", idle_exit_s: int = 6 * 3600, once_all: bool = False):
-    """FULL-model checkpoints (sft/fullft.py layout): one eval_ckpt_daemon.py PROCESS per checkpoint (`--full-model --once
+                     vllm_gpu_mem: float = 0.5, extra_args: str = "", idle_exit_s: int = 6 * 3600, once_all: bool = False, steer_coeff: float = 1.0):
+    """steer_coeff: evaluate with injection h + coeff*||h||*unit(v) (env MAEMM_STEER_COEFF; default 1.0 = the standard held-out metric).
+    FULL-model checkpoints (sft/fullft.py layout): one eval_ckpt_daemon.py PROCESS per checkpoint (`--full-model --once
     --only-step k`, its vLLM engine loads that checkpoint), looping latest-first over every <ckpt_dir>/step_* + examples_<M>
     (--save-examples points, ckpt_step = recorded optimizer step - 1, logged with `examples` = M) + final that carries SAVE_DONE,
     until `final` (logged as final_step) is evaluated (or nothing new for idle_exit_s). State (a set of ckpt_steps, examples_* included):
@@ -241,6 +242,8 @@ def fullmodel_daemon(ckpt_dir: str, tag: str, wandb_name: str = "", final_step: 
     env["WANDB_DIR"] = "/tmp/wandb"
     env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    if steer_coeff != 1.0:
+        env["MAEMM_STEER_COEFF"] = str(steer_coeff); print(f"[eval-ckpt] STEER_COEFF override = {steer_coeff}", flush=True)
     os.makedirs("/tmp/wandb", exist_ok=True)
     state = f"/data/eval_state/evaled_ckpt_{tag}.json"
     os.makedirs(os.path.dirname(state), exist_ok=True)

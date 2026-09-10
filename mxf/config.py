@@ -1,3 +1,4 @@
+import os
 """Central config. Scales from K=10k (pilot) to K=1,000,000 clusters by changing CLUSTERS."""
 from dataclasses import dataclass, field
 
@@ -5,7 +6,7 @@ MODEL = "Qwen/Qwen3.6-27B"
 D_MODEL = 5120
 READ_LAYER = 42        # 27B: layer the direction is read/maximized at (matches the SAE)
 INJECT_LAYER = 1       # activation-oracle injection site
-STEER_COEFF = 1.0      # norm-matched addition scale
+STEER_COEFF = float(os.environ.get("MAEMM_STEER_COEFF", "1.0"))      # norm-matched addition scale: h + STEER_COEFF*||h||*unit(v); env override for injection-strength arms
 EMBED_MODEL = "BAAI/bge-large-en-v1.5"   # fast clusterer; swap to bge-small for max speed
 CORPUS = "openbmb/Ultra-FineWeb"         # HF streaming; en subset
 

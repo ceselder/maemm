@@ -25,7 +25,7 @@ P = "/home/celeste/shared/overnight/rl_ablation_ids.json"
 IDS_FULLRL = "/home/celeste/shared/overnight/rl_fullparam_ids.json"
 POOL = "/data/banks/mix_eq_1p45m"
 POLICY_BASE = "/data/sft_mix/mixeq_midtrain_fft_from_fft23m_v2/final"
-APP, EVAL_APP = os.environ.get("RL_FULLPARAM_APP", "maemm-rl-disagg-fullparam"), "maemm-eval-ckpt-fullrl"   # RL_FULLPARAM_APP=maemm-rl-disagg-fullparam2 = the deployment with reward/peak_last_frac
+APP, EVAL_APP = os.environ.get("RL_FULLPARAM_APP", "maemm-rl-disagg-fullparam"), os.environ.get("RL_FULLPARAM_EVAL_APP", "maemm-eval-ckpt-fullrl")   # RL_FULLPARAM_APP=maemm-rl-disagg-fullparam2 = the deployment with reward/peak_last_frac
 RECIPE = ("--recipe scalerl --loss cispo --cispo-eps-max 5 --loss-agg prompt --adv-mode batch --zero-var-filter --npr-threshold 0.9 --npr-pass-cos 0.7 "
           "--max-lag 2 --fp32-head --autocast-bf16 --length-control penalty --kl-coef 0 --entropy-coef 0 --entropy-target 0 --groups-per-step 512 "
           "--group-size 8 --warmup-steps 25 --len-penalty-start 8 --len-penalty-per-tok 0.00025 --max-new-tokens 192 --reward-window-last 5 "
@@ -42,7 +42,7 @@ if "--split" in rest:
     i = rest.index("--split"); split = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
 # Optional overrides (keyed, anywhere before `--`): --policy-base <full-model dir> --pool <bank dir> --name <run name> --ids-key <key>
 OVR = {}
-for k in ("--policy-base", "--pool", "--name", "--ids-key", "--steps", "--saves"):
+for k in ("--policy-base", "--pool", "--name", "--ids-key", "--steps", "--saves", "--steer-coeff"):
     if k in rest:
         i = rest.index(k); OVR[k] = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
 POOL = OVR.get("--pool", POOL)
@@ -68,7 +68,7 @@ else:
     raise SystemExit(__doc__)
 extra = f"{RECIPE} --lr {lr} --save-steps {saves} --run-name {run} --save-dir {save}" + (f" {extra_flags}" if extra_flags else "")
 t = modal.Function.from_name(APP, "train").spawn(n_rollout=n_rollout, n_trainer=n_trainer, total_steps=steps, extra_args=extra, pool_dir=POOL,
-                                                 policy_base=POLICY_BASE, full_param=True)
+                                                 policy_base=POLICY_BASE, full_param=True, steer_coeff=float(OVR.get("--steer-coeff", 1.0)))
 rec = {"train": t.object_id, "run": run, "save": save, "policy_base": POLICY_BASE, "pool": POOL, "lr": lr, "group_size": 8, "groups_per_step": 512,
        "steps": steps, "save_steps": saves, "app": APP, "full_param": True, "extra_flags": extra_flags, "split": split,
        "spawned": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -79,6 +79,11 @@ if what in ("val50", "prod"):
                                                                     extra_args="--eval-cache /data/eval_universal_ho/eval_sets_heldout_v2.pt --no-extra-evals")
     rec["eval"] = e.object_id
     rec["eval_app"] = EVAL_APP
+    if "--steer-coeff" in OVR:   # second evaluator at the MATCHED injection strength (the standard one above stays at 1.0)
+        sc = float(OVR["--steer-coeff"]); tagm = f"{run}_inj{sc:g}"
+        e2 = modal.Function.from_name(EVAL_APP, "fullmodel_daemon").spawn(ckpt_dir=save, tag=tagm, wandb_name=f"{run}_eval_inj{sc:g}", final_step=steps,
+                                                                         extra_args="--eval-cache /data/eval_universal_ho/eval_sets_heldout_v2.pt --no-extra-evals", steer_coeff=sc)
+        rec["eval_matched"] = e2.object_id; rec["steer_coeff"] = sc
     rec["eval_note"] = "fullmodel_daemon: one eval_ckpt_daemon --full-model process per full-model checkpoint dir (SAVE_DONE), eval cache v2, no judge extras"
 d = json.load(open(IDS_FULLRL)) if os.path.exists(IDS_FULLRL) else {}
 key = OVR.get("--ids-key", what if what != "bench5" else f"bench5_{tag}")

@@ -259,8 +259,9 @@ def _collect(work="/tmp/disagg"):
                        modal.Secret.from_name("maemm-anthropic")],   # native Sonnet 5 judge: ANTHROPIC_API_KEY + ANTHROPIC_WORKSPACE_ID
               timeout=24 * 3600)
 def train(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_args: str = "", no_wandb: bool = False,
-          pool_dir: str = "", policy_base: str = "", full_param: bool = False):
-    """policy_base: a FULL fine-tuned checkpoint dir (sft/fullft.py layout, SAVE_DONE) the policy is built on; the rollout engines
+          pool_dir: str = "", policy_base: str = "", full_param: bool = False, steer_coeff: float = 1.0):
+    """steer_coeff: injection strength h + coeff*||h||*unit(v) for rollouts AND the trainer hooks (env MAEMM_STEER_COEFF -> mxf.config.STEER_COEFF).
+    policy_base: a FULL fine-tuned checkpoint dir (sft/fullft.py layout, SAVE_DONE) the policy is built on; the rollout engines
     serve it, the trainer starts a FRESH LoRA on it (unless extra_args gives --init-adapter), the reward stays the original base.
     full_param: rl_disagg --full-param -- EVERY weight of the policy is trained (FSDP2 over the trainer ranks), init = policy_base
     (or the base model), bf16 weights pushed to the engines every step, full-model checkpoints (rl/rl_fullparam.py)."""
@@ -280,7 +281,10 @@ def train(n_rollout: int = 1, n_trainer: int = 3, total_steps: int = 6, extra_ar
     work = _work_dir()
     cmd = ["python", "RL/rl_disagg.py", "--role", "launch", "--n-rollout", str(n_rollout), "--n-trainer", str(n_trainer),
            "--data-dir", local_pool, "--total-steps", str(total_steps), "--work-dir", work] + args
-    rc = _run(cmd, _env())
+    env = _env()
+    if steer_coeff != 1.0:
+        env["MAEMM_STEER_COEFF"] = str(steer_coeff); print(f"[modal] STEER_COEFF override = {steer_coeff}", flush=True)
+    rc = _run(cmd, env)
     _collect(work)
     if rc != 0:
         raise RuntimeError(f"rl_disagg exited rc={rc}")
