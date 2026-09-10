@@ -42,7 +42,7 @@ if "--split" in rest:
     i = rest.index("--split"); split = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
 # Optional overrides (keyed, anywhere before `--`): --policy-base <full-model dir> --pool <bank dir> --name <run name> --ids-key <key>
 OVR = {}
-for k in ("--policy-base", "--pool", "--name", "--ids-key"):
+for k in ("--policy-base", "--pool", "--name", "--ids-key", "--steps", "--saves"):
     if k in rest:
         i = rest.index(k); OVR[k] = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
 POOL = OVR.get("--pool", POOL)
@@ -60,6 +60,8 @@ elif what == "prod":
     run, save, steps, saves = "rl_abl_initnewfft_fullparam_8x512", "/data/ckpts_rl_abl_initnewfft_fullparam", 300, "25,50,100,150,200,250,300"
     if "--name" in OVR:   # a second production arm with its own run/save names (e.g. the 104M-pretrain + 5M-midtrain policy)
         run, save = OVR["--name"], f"/data/ckpts_{OVR['--name']}"
+    if "--steps" in OVR:  # long runs (e.g. 2000 steps at the ScaleRL-paper optimizer setting); --saves = comma list (default every 100 + 25,50)
+        steps = int(OVR["--steps"]); saves = OVR.get("--saves", ",".join(["25", "50"] + [str(x) for x in range(100, steps + 1, 100)]))
 elif what == "bench5":
     run, save, steps, saves = f"rl_fullparam_bench5_{tag}", f"/data/ckpts_fullrl_bench5_{tag}", 5, "999"
 else:

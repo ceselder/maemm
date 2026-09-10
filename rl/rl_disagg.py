@@ -186,6 +186,7 @@ def parse_args(argv=None):
     # optimization (rl.py)
     ap.add_argument("--lr", type=float, default=1e-6)
     ap.add_argument("--adam-eps", type=float, default=1e-8)
+    ap.add_argument("--weight-decay", type=float, default=0.0, help="AdamW decoupled weight decay (ScaleRL paper: 0.01; default 0 = previous behaviour)")
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
     ap.add_argument("--clip-eps", type=float, default=0.2)
     ap.add_argument("--tis-cap", type=float, default=2.0)
@@ -2503,7 +2504,7 @@ def run_trainer(a):
         if a.suffix_ckpt:
             fp.ckpt = FP.suffix_checkpointer(actor)
             _log(tag, "suffix activation checkpointing ON (per decoder layer, exact with the prefix cache; sft/prefix_cache.SuffixCheckpointer)")
-        opt = torch.optim.AdamW(list(actor.parameters()), lr=a.lr, weight_decay=0.0, eps=a.adam_eps, betas=tuple(a.adam_betas))
+        opt = torch.optim.AdamW(list(actor.parameters()), lr=a.lr, weight_decay=a.weight_decay, eps=a.adam_eps, betas=tuple(a.adam_betas))
         if a.load_optim:
             FP.load_optim_dcp(actor, opt, a.load_optim, log=lambda m: _log(tag, m))
         if is_main:
@@ -2524,7 +2525,7 @@ def run_trainer(a):
         if a.fp32_head:   # before the micro-batch search so its +memory is part of the OOM probe
             install_fp32_head(actor)
             _log(tag, "lm_head recomputed in fp32 (ScaleRL precision fix, trainer side; the vLLM sampler stays bf16-head/fp32-softmax)")
-        opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0,
+        opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=a.weight_decay,
                                 eps=a.adam_eps, betas=tuple(a.adam_betas))
         optim_p = os.path.join(a.init_adapter or "", "optim.pt")
         if a.init_adapter and os.path.exists(optim_p) and not a.fresh_optim:
@@ -3010,7 +3011,7 @@ def run_bench_trainer(a):
     actor.train()
     if a.fp32_head:
         install_fp32_head(actor)
-    opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0, eps=a.adam_eps, betas=tuple(a.adam_betas))
+    opt = torch.optim.AdamW([p for p in actor.parameters() if p.requires_grad], lr=a.lr, weight_decay=a.weight_decay, eps=a.adam_eps, betas=tuple(a.adam_betas))
     submodule = get_layer(actor, INJECT_LAYER)
     if a.kl_coef > 0 and (a.ref_adapter or a.init_adapter):
         actor.load_adapter(a.ref_adapter or a.init_adapter, adapter_name="ref"); actor.set_adapter("default")
