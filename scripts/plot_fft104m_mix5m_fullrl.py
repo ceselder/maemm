@@ -16,6 +16,13 @@ The chain this script reports on (all wandb project celestedeschamphelaere-perso
   arm C      rl_fullparam_fft104m_mix5m_8x2048_paperlr (pvwi9pv9)  ScaleRL-paper optimizer: lr 5e-7 constant after a 100-step warmup, AdamW eps 1e-15,
                                                                     weight decay .01, 8x2048, 7,400 steps; respawned every 24 h from the latest full-model
                                                                     checkpoint with --step-offset (same wandb id) -> keeps adding checkpoints for ~10 days
+  arm D      rl_fullparam_fft104m_mix5m_8x2048_paperlr_anywin (le1x9x5h)  arm C's EXACT config (paper optimizer, 8x2048, 7,400 steps, leg-driven, eval runs unioned
+                                                                    across legs) plus --reward-window-last 0 (all-token reward; evaluator unchanged = last 5) -> running ~10 days
+  arm E      rl_fullparam_fft104m_mix5m_8x512_steer1p5 (y56pb8eq)  the .425 arm's EXACT recipe with the injected direction at 1.5x strength (h + 1.5*|h|*unit(v)
+                                                                    at the layer-1 marker, for the rollout engines AND the trainer hooks; env MAEMM_STEER_COEFF ->
+                                                                    mxf.config.STEER_COEFF, branch steer-coeff). TWO eval series: <run>_eval = scored at the STANDARD
+                                                                    1.0x injection (comparable to every other arm; the series used in every table and headline) and
+                                                                    <run>_eval_inj1.5 = scored at the MATCHED 1.5x injection (dashed line, same colour, own table column)
 
 Idempotent: every run re-pulls the eval + training histories from wandb (scan_history AND sampled history unioned, deduped by _step; eval runs =
 every run named <run>_eval unioned, latest row per ckpt_step), reads the LoRA init-ablation arms from ~/shared/reports/maemm-sft-init-ablation/data/
@@ -31,7 +38,7 @@ the max relative deviation of the logged cumulative sum is written to data/new_a
     python scripts/plot_fft104m_mix5m_fullrl.py --no-html  # figures + data only
 
 Outputs -> ~/shared/reports/maemm-fft104m-mix5m-fullrl/{data/*.json, fidelity_vs_rl_step, fidelity_vs_rollouts, fidelity_vs_lr_steps,
-           per_family_vs_rl_step, rl_dynamics, bank_recut}.{png,pdf}
+           per_family_vs_rl_step, rl_dynamics, injection_strength, bank_recut}.{png,pdf}
 """
 import argparse
 import datetime as dt
@@ -54,18 +61,24 @@ ABL_DATA = Path("~/shared/reports/maemm-sft-init-ablation/data").expanduser()   
 PRE_DATA = Path("~/shared/reports/maemm-sft-fullft-104m/data").expanduser()       # 104M full-FT pretrain report (init of this chain, eval-noise pairs)
 
 # ---- chart chrome. Colour follows the entity: the 8x512 last-5 arm = blue, the reference full-param arm = orange, arm A (4x batch) = purple,
-#      arm B (all-token reward) = aqua, arm C (paper optimizer) = ink; the four hues validate all-pairs (CVD dE >= 9.2, normal dE >= 16.3);
-#      context (LoRA arms / thresholds) = grey de-emphasis; text never wears a series colour. Aqua (2.7:1) gets direct end labels as relief.
+#      arm B (all-token reward) = aqua, arm C (paper optimizer) = ink, arm D (paper optimizer + all-token) = brown, arm E (1.5x injection) = rose; validated
+#      all-pairs with the dataviz skill's validate_palette.js (normal-vision worst pair purple-blue dE 17.4; CVD worst pair brown-rose dE 7.4 = the 6-8 floor
+#      band, so brown also carries a distinct marker, a long-dash pattern and direct end labels; ink is the deliberate neutral). A second eval series of the
+#      same arm keeps the arm's colour and is drawn dashed with hollow markers. Context (LoRA arms / thresholds) = grey de-emphasis; text never wears a series
+#      colour. Aqua (2.7:1) gets direct end labels as relief.
 THIS_C, REF_C, LORA_C = "#2a78d6", "#eb6834", "#b3b1a8"
-A_C, B_C, C_C = "#7a3aa7", "#1baf7a", "#191919"
+A_C, B_C, C_C, D_C, E_C = "#7a3aa7", "#1baf7a", "#191919", "#8b5a00", "#c2185b"
 INK, INK2, MUTED, GRID, AXIS = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
 plt.rcParams.update({"font.family": "sans-serif", "font.size": 10, "axes.edgecolor": AXIS, "axes.labelcolor": INK2, "xtick.color": INK2,
                      "ytick.color": INK2, "axes.titlecolor": INK, "text.color": INK, "axes.spines.top": False, "axes.spines.right": False,
                      "grid.color": GRID, "grid.linewidth": 0.8, "axes.grid": True, "axes.axisbelow": True, "legend.frameon": False,
                      "figure.facecolor": "white", "axes.facecolor": "white", "savefig.facecolor": "white"})
 
-# The four RL arms that share the re-cut init. Static facts here; lr / warmup / groups / total steps / save steps are re-read from the wandb config.
-ARM_ORDER = ["this", "a", "b", "c"]
+# The six RL arms that share the re-cut init. Static facts here; lr / warmup / groups / total steps / save steps are re-read from the wandb config.
+# `eval_series` (optional) lists (key, wandb-name suffix, description) for every evaluator that scored the arm; the FIRST series is the one used in
+# every table / headline / leader computation, later ones are drawn dashed in the arm's colour and get their own table columns. Default = one series
+# at <run>_eval. `skip_rollouts` keeps an arm off the rollout- and lr-axis figures (arm E has the .425 arm's exact x-axis; it would only add clutter).
+ARM_ORDER = ["this", "a", "b", "c", "d", "e"]
 ARMS = {
     "this": {"id": "4piq4y7x", "name": "rl_fullparam_fft104m_mix5m_8x512", "nick": "8 x 512, last-5 reward", "tiny": "8x512 last-5",
              "long": "8 x 512 rollouts/step, reward = max cosine over the last 5 tokens, lr 1e-6 (the .425 arm; baseline for the new arms)",
@@ -87,8 +100,22 @@ ARMS = {
           "color": C_C, "marker": "v", "ls": "-.", "lw": 1.9, "ms": 7.0,
           "lr": 5e-7, "warmup": 100, "groups_per_step": 2048, "group_size": 8, "total_steps": 7400, "reward_window_last": 5, "weight_decay": 0.01, "adam_eps": 1e-15,
           "save_steps": [25, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000] + list(range(1250, 7400, 250)) + [7400]},
+    "d": {"id": "le1x9x5h", "name": "rl_fullparam_fft104m_mix5m_8x2048_paperlr_anywin", "nick": "8 x 2048, paper optimizer, all-token reward", "tiny": "paper lr, all-token",
+          "long": "arm D: arm C's recipe (8 x 2048, lr 5e-7 after a 100-step warmup, AdamW eps 1e-15, wd .01, 7,400 steps) with the all-token reward (--reward-window-last 0; evaluator unchanged = last 5)",
+          "color": D_C, "marker": "p", "ls": (0, (6, 2)), "lw": 1.9, "ms": 7.6,
+          "lr": 5e-7, "warmup": 100, "groups_per_step": 2048, "group_size": 8, "total_steps": 7400, "reward_window_last": 0, "weight_decay": 0.01, "adam_eps": 1e-15,
+          "save_steps": [25, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000] + list(range(1250, 7400, 250)) + [7400]},
+    "e": {"id": "y56pb8eq", "name": "rl_fullparam_fft104m_mix5m_8x512_steer1p5", "nick": "8 x 512, injection 1.5x", "tiny": "1.5x injection",
+          "long": "arm E: the .425 arm's recipe with the direction injected at 1.5x strength (rollouts and trainer), lr 1e-6 — scored at the standard 1.0x injection",
+          "color": E_C, "marker": "h", "ls": "-", "lw": 2.0, "ms": 7.4,
+          "lr": 1e-6, "warmup": 25, "groups_per_step": 512, "group_size": 8, "total_steps": 300, "reward_window_last": 5, "weight_decay": 0.0, "adam_eps": 1e-8,
+          "save_steps": [25, 50, 100, 150, 200, 250, 300], "steer_coeff": 1.5, "skip_rollouts": True,
+          "eval_series": [("std", "_eval", "scored at the standard 1.0x injection (comparable to every other arm)"),
+                          ("inj1.5", "_eval_inj1.5", "scored at its own 1.5x injection")]},
 }
-NEW_ARMS = ["a", "b", "c"]
+NEW_ARMS = ["a", "b", "c", "d", "e"]
+DEFAULT_EVAL_SERIES = [("std", "_eval", "scored at the standard 1.0x injection")]
+INJ_ARM, INJ_SERIES = "e", "inj1.5"          # the injection-strength arm and the key of its matched-injection eval series
 RUNS = {
     "this_train": ("id", ARMS["this"]["id"], ARMS["this"]["name"]),
     "ref_train": ("name", "rl_abl_initnewfft_fullparam_8x512", None),
@@ -233,13 +260,18 @@ def fetch():
     R = {k: _get_run(api, k) for k in RUNS}
     for k, r in R.items():
         D["runs"][k] = _run_meta(r)
-    # the four arms from the re-cut init: train run by id, eval runs = every run named <run>_eval
+    # the five arms from the re-cut init: train run by id, eval runs = every run named <run><suffix> for every eval series of the arm (default <run>_eval)
     D["arms"] = {}
     for k in ARM_ORDER:
         r = R[k + "_train"]
-        ev_runs = list(api.runs(PROJ, filters={"display_name": ARMS[k]["name"] + "_eval"}, order="-created_at"))
-        D["runs"][k + "_eval"] = _run_meta(ev_runs[0]) if ev_runs else {"id": None, "name": ARMS[k]["name"] + "_eval", "state": "missing", "last_step": None, "created_at": None, "url": None}
-        D["runs"][k + "_eval"]["n_runs"] = len(ev_runs)
+        series = ARMS[k].get("eval_series", DEFAULT_EVAL_SERIES)
+        ev_series = {}
+        for skey, suffix, sdesc in series:
+            ev_runs = list(api.runs(PROJ, filters={"display_name": ARMS[k]["name"] + suffix}, order="-created_at"))
+            meta = _run_meta(ev_runs[0]) if ev_runs else {"id": None, "name": ARMS[k]["name"] + suffix, "state": "missing", "last_step": None, "created_at": None, "url": None}
+            meta["n_runs"] = len(ev_runs)
+            D["runs"][k + "_eval" + ("" if skey == series[0][0] else "_" + skey)] = meta
+            ev_series[skey] = {"key": skey, "suffix": suffix, "desc": sdesc, "run_name": ARMS[k]["name"] + suffix, "runs": meta, "evals": eval_rows(ev_runs)}
         cfg = {kk: v for kk, v in r.config.items() if not isinstance(v, (dict, list))}
         arm = dict(ARMS[k])
         for ck, ak in (("lr", "lr"), ("warmup_steps", "warmup"), ("groups_per_step", "groups_per_step"), ("group_size", "group_size"), ("total_steps", "total_steps"),
@@ -248,7 +280,8 @@ def fetch():
                 arm[ak] = cfg[ck]
         arm["save_steps"] = _parse_save_steps(cfg.get("save_steps"), ARMS[k]["save_steps"])
         arm["rollouts_per_step"] = int(arm["group_size"] * arm["groups_per_step"])
-        D["arms"][k] = {"meta": arm, "evals": eval_rows(ev_runs), "train": train_series(r, DYN_KEYS), "config": cfg}
+        D["arms"][k] = {"meta": arm, "evals": ev_series[series[0][0]]["evals"], "eval_series": ev_series, "series_order": [s[0] for s in series],
+                        "train": train_series(r, DYN_KEYS), "config": cfg}
     D["this"] = D["arms"]["this"]
     D["ref"] = {"evals": eval_rows(R["ref_eval"]), "train": train_series(R["ref_train"], DYN_KEYS),
                 "config": {k: v for k, v in R["ref_train"].config.items() if not isinstance(v, (dict, list))}}
@@ -385,6 +418,23 @@ def onsets(tr, arm=None, running=False):
     return o
 
 
+ONSET_SAME_TOL = 15        # two onset steps within this many steps count as "at the same place" in the prose (a 300-step run; the rules themselves jitter by ~10)
+
+
+def onset_cmp(a, b, tol=ONSET_SAME_TOL):
+    """Plain-words comparison of two onset steps: 'at the same place' / 'N steps later' / 'N steps earlier' / 'never (vs ...)'."""
+    if a is None and b is None:
+        return "never for either arm"
+    if a is None:
+        return "never comes"
+    if b is None:
+        return "comes where the other arm's never did"
+    d = a - b
+    if abs(d) <= tol:
+        return "at the same place"
+    return f"{abs(d)} steps {'later' if d > 0 else 'earlier'}"
+
+
 def dyn_summary(tr):
     if not tr["step"]:
         return {}
@@ -450,6 +500,30 @@ def arm_label(D, k, long=True):
     if pending:
         return base + f" (eval pending for step{'s' if len(pending) > 1 else ''} {', '.join(map(str, pending))})"
     return base
+
+
+def series_pending(D, k, skey):
+    """Checkpoints already saved whose eval in THIS series has not landed."""
+    arm = D["arms"][k]["meta"]; last = D["runs"][k + "_train"]["last_step"] or 0
+    evaluated = {r["ckpt_step"] for r in D["arms"][k]["eval_series"][skey]["evals"]}
+    return [s for s in arm["save_steps"] if s <= last + 1 and s not in evaluated]
+
+
+def series_label(D, k, skey):
+    """Legend label of a non-primary eval series: '<nick> — <desc>' plus the running / pending suffix of THAT series."""
+    arm = D["arms"][k]["meta"]; S_ = D["arms"][k]["eval_series"][skey]
+    st, last, _ = arm_status(D, k)
+    base = f"arm {k.upper()}: {arm['nick']} — {S_['desc']} (dashed, hollow markers)"
+    pending = series_pending(D, k, skey)
+    if st != "finished":
+        return base + f" (running, step {last:,})"
+    if pending:
+        return base + f" (eval pending for step{'s' if len(pending) > 1 else ''} {', '.join(map(str, pending))})"
+    return base
+
+
+def extra_series(D, k):
+    return D["arms"][k]["series_order"][1:]
 
 
 def this_label(D, M):
@@ -549,28 +623,47 @@ def summarize_arms(D, M):
             N["lr_logged_check"][k] = {"n_steps": len(tr["step"]), "n_lr_missing": sum(not _num(v) for v in tr["lr"]), "lr_logged_max": float(np.nanmax([v for v in tr["lr"] if _num(v)])),
                                        "max_rel_dev_cumsum": float(np.nanmax(rel)) if np.isfinite(rel).any() else None,
                                        "logged_lr_first3": [v for v in tr["lr"][:3]], "logged_cumsum_last": float(logged[-1]), "analytic_last": float(analytic[-1])}
+        # every eval series of the arm (the first one is `evals` above); extra series get their own pending list and table rows
+        ser = {}
+        for skey in A["series_order"]:
+            S_ = A["eval_series"][skey]
+            rows_ = [{"ckpt_step": r["ckpt_step"], "cum_rollouts": r["ckpt_step"] * arm["rollouts_per_step"], "cum_lr": cum_lr_ckpt(arm, r["ckpt_step"]),
+                      **{kk: r.get(kk) for kk, _ in TABLE_KEYS}} for r in S_["evals"]]
+            b_ = max(S_["evals"], key=lambda r: r["eval/mean_all"]) if S_["evals"] else None
+            ser[skey] = {"key": skey, "suffix": S_["suffix"], "desc": S_["desc"], "run_name": S_["run_name"], "eval_runs": S_["runs"], "evals": rows_,
+                         "pending_steps": series_pending(D, k, skey), "best": None if b_ is None else {"ckpt_step": b_["ckpt_step"], "mean_all": b_["eval/mean_all"]},
+                         "last_eval": None if not rows_ else {"ckpt_step": rows_[-1]["ckpt_step"], "mean_all": rows_[-1]["eval/mean_all"]},
+                         "primary": skey == A["series_order"][0]}
         N["arms"][k] = {"key": k, "nick": arm["nick"], "long": arm["long"], "label": arm_label(D, k), "wandb_id": arm["id"], "run_name": arm["name"],
                         "state": st, "last_step": last, "total_steps": arm["total_steps"], "pending_steps": pending, "finished": st == "finished",
                         "all_evals_in": st == "finished" and not pending,
-                        "config": {kk: arm.get(kk) for kk in ("lr", "warmup", "groups_per_step", "group_size", "rollouts_per_step", "total_steps", "reward_window_last", "weight_decay", "adam_eps", "save_steps")},
+                        "config": {kk: arm.get(kk) for kk in ("lr", "warmup", "groups_per_step", "group_size", "rollouts_per_step", "total_steps", "reward_window_last", "weight_decay", "adam_eps", "save_steps", "steer_coeff")},
                         "evals": evs, "best": None if best is None else {"ckpt_step": best["ckpt_step"], "mean_all": best["eval/mean_all"]},
                         "last_eval": None if not evs else {"ckpt_step": evs[-1]["ckpt_step"], "mean_all": evs[-1]["eval/mean_all"]},
                         "gain_over_init": None if best is None or init is None else best["eval/mean_all"] - init,
                         "onsets": o, "dynamics": dyn_summary(A["train"]), "peak_metrics": peak_summary(A["train"]),
-                        "eval_runs": D["runs"][k + "_eval"], "train_run": D["runs"][k + "_train"]}
-    # matched steps vs the 8x512 last-5 arm
-    steps_all = sorted({r["ckpt_step"] for k in ARM_ORDER for r in D["arms"][k]["evals"]})
+                        "eval_runs": D["runs"][k + "_eval"], "train_run": D["runs"][k + "_train"],
+                        "eval_series": ser, "series_order": A["series_order"]}
+    # matched steps vs the 8x512 last-5 arm; extra eval series appear as their own columns keyed "<arm>:<series>" (arm E's matched-injection score)
+    cols = [(k, None) for k in ARM_ORDER] + [(k, skey) for k in ARM_ORDER for skey in extra_series(D, k)]
+    def _col(k, skey):
+        return k if skey is None else f"{k}:{skey}"
+    def _rows(k, skey):
+        return D["arms"][k]["evals"] if skey is None else D["arms"][k]["eval_series"][skey]["evals"]
+    N["matched_columns"] = [_col(k, s) for k, s in cols]
+    steps_all = sorted({r["ckpt_step"] for k, s in cols for r in _rows(k, s)})
     N["matched_steps_table"] = []
     for s in steps_all:
         row = {"ckpt_step": s, "values": {}, "delta_vs_base": {}}
-        for k in ARM_ORDER:
-            row["values"][k] = {kk: at(D["arms"][k]["evals"], s, kk) for kk, _ in MATCH_KEYS}
-            if k != "this":
-                row["delta_vs_base"][k] = {kk: (row["values"][k][kk] - row["values"]["this"][kk]) if (row["values"][k][kk] is not None and row["values"]["this"][kk] is not None) else None
+        for k, skey in cols:
+            c = _col(k, skey)
+            row["values"][c] = {kk: at(_rows(k, skey), s, kk) for kk, _ in MATCH_KEYS}
+            if c != "this":
+                row["delta_vs_base"][c] = {kk: (row["values"][c][kk] - row["values"]["this"][kk]) if (row["values"][c][kk] is not None and row["values"]["this"][kk] is not None) else None
                                            for kk, _ in MATCH_KEYS}
         N["matched_steps_table"].append(row)
-    N["matched_steps_delta_mean"] = {k: {str(r["ckpt_step"]): r["delta_vs_base"][k]["eval/mean_all"] for r in N["matched_steps_table"] if r["delta_vs_base"].get(k, {}).get("eval/mean_all") is not None}
-                                     for k in NEW_ARMS}
+    N["matched_steps_delta_mean"] = {c: {str(r["ckpt_step"]): r["delta_vs_base"][c]["eval/mean_all"] for r in N["matched_steps_table"] if r["delta_vs_base"].get(c, {}).get("eval/mean_all") is not None}
+                                     for c in N["matched_columns"] if c != "this"}
     # matched rollouts: for every checkpoint of every arm, the 8x512 arm's value at the same cumulative rollouts (exact when 4s is an evaluated step, else interpolated)
     base_rps = base["meta"]["rollouts_per_step"]
     mr = []
@@ -608,7 +701,143 @@ def summarize_arms(D, M):
                          "reward_window_last": N["arms"][k]["config"]["reward_window_last"]} for k in ARM_ORDER}
     # budget hypothesis: the drift wall sits at a fixed cumulative lr x steps -> arm C (half the lr) should cross at ~2x arm A's step count
     N["budget_hypothesis"] = budget_check(N)
+    # injection strength: arm E's two eval series vs the .425 arm
+    N["injection_strength"] = injection_summary(D, N)
+    # the all-token reward at the paper optimizer: arm D vs arm C at matched steps (fills in as D's checkpoints land)
+    N["paper_reward_window"] = cd_compare(D, N)
     return N
+
+
+def cd_compare(D, N, k_c="c", k_d="d"):
+    """Arm D (paper optimizer + all-token reward) vs arm C (paper optimizer, last-5 reward) at matched steps = the all-token effect at lr 5e-7 / 8x2048, with the
+    lr 1e-6 / 8x512 pair (arm B vs the .425 arm) at the same steps as the reference for what the all-token reward bought there. Both long arms save at the same
+    steps, so every D checkpoint has a C partner once evaluated. Smearing numbers come from the peak-position metrics."""
+    if k_d not in D["arms"] or k_c not in D["arms"]:
+        return None
+    C_, D_, T_, B_ = D["arms"][k_c], D["arms"][k_d], D["arms"]["this"], D["arms"]["b"]
+    steps = sorted({r["ckpt_step"] for r in C_["evals"]} | {r["ckpt_step"] for r in D_["evals"]})
+    rows = []
+    for s in steps:
+        row = {"ckpt_step": s, "c": {kk: at(C_["evals"], s, kk) for kk, _ in MATCH_KEYS}, "d": {kk: at(D_["evals"], s, kk) for kk, _ in MATCH_KEYS}}
+        row["delta_d_minus_c"] = {kk: (row["d"][kk] - row["c"][kk]) if (row["d"][kk] is not None and row["c"][kk] is not None) else None for kk, _ in MATCH_KEYS}
+        tb, tt = at(B_["evals"], s), at(T_["evals"], s)
+        row["ref_lr1e6"] = {"this": tt, "b": tb, "delta_b_minus_this": None if tb is None or tt is None else tb - tt}
+        rows.append(row)
+    common = [r for r in rows if r["delta_d_minus_c"]["eval/mean_all"] is not None]
+    lc = common[-1] if common else None
+    def pm(k, grp, key):
+        p = N["arms"][k]["peak_metrics"]
+        return p.get(grp, {}).get(key) if p else None
+    smear = {k: {"reward_window_last": N["arms"][k]["config"]["reward_window_last"], "peak_dist_mean_from50": pm(k, "peak_dist_mean", "mean_from50"), "peak_dist_last10": pm(k, "peak_dist_mean", "last10"),
+                 "peak_dist_w20_30": pm(k, "peak_dist_mean", "w20_30"), "peak_last_frac_mean_from50": pm(k, "peak_last_frac", "mean_from50"), "peak_last_frac_last10": pm(k, "peak_last_frac", "last10"),
+                 "peak_in_last5_last10": pm(k, "peak_in_last5_frac", "last10"), "peak_in_last5_step0": pm(k, "peak_in_last5_frac", "step0"),
+                 "len_mean_from50": N["arms"][k]["dynamics"].get("len_mean_from50"), "len_last10": N["arms"][k]["dynamics"].get("len_last10"), "len_max": N["arms"][k]["dynamics"].get("len_max"),
+                 "reward_last10": N["arms"][k]["dynamics"].get("reward_last10"), "entropy_last10": N["arms"][k]["dynamics"].get("entropy_last10"),
+                 "state": N["arms"][k]["state"], "last_step": N["arms"][k]["last_step"]} for k in (k_c, k_d, "this", "b")}
+    dl = N["arms"][k_d]["last_step"]
+    if dl:
+        Ct = C_["train"]
+        smear["c_at_d_last10"] = {"window": [dl - 9, dl], "reward": win_mean(Ct, "reward/mean", dl - 9, dl), "len": win_mean(Ct, "rollout/len_mean", dl - 9, dl),
+                                  "peak_dist": win_mean(Ct, "reward/peak_dist_mean", dl - 9, dl), "peak_last_frac": win_mean(Ct, "reward/peak_last_frac", dl - 9, dl),
+                                  "entropy": win_mean(Ct, "policy/entropy", dl - 9, dl), "gnorm": win_mean(Ct, "grad_norm", dl - 9, dl), "dlogp": win_mean(Ct, "policy/sampler_abs_dlogp", dl - 9, dl)}
+    return {"pair": [k_c, k_d], "reference_pair": ["this", "b"], "matched_steps": rows, "n_common": len(common),
+            "last_common": None if lc is None else {"ckpt_step": lc["ckpt_step"], "c": lc["c"]["eval/mean_all"], "d": lc["d"]["eval/mean_all"], "delta": lc["delta_d_minus_c"]["eval/mean_all"],
+                                                     "ref_delta_b_minus_this": lc["ref_lr1e6"]["delta_b_minus_this"], "by_key": lc["delta_d_minus_c"]},
+            "delta_mean_by_step": {str(r["ckpt_step"]): r["delta_d_minus_c"]["eval/mean_all"] for r in common},
+            "ref_delta_mean_by_step": {str(r["ckpt_step"]): r["ref_lr1e6"]["delta_b_minus_this"] for r in rows if r["ref_lr1e6"]["delta_b_minus_this"] is not None},
+            "smearing": smear, "onsets": {k: N["arms"][k]["onsets"] for k in (k_c, k_d)},
+            "c_last_step": N["arms"][k_c]["last_step"], "d_last_step": N["arms"][k_d]["last_step"], "c_state": N["arms"][k_c]["state"], "d_state": N["arms"][k_d]["state"],
+            "d_pending_steps": N["arms"][k_d]["pending_steps"], "c_pending_steps": N["arms"][k_c]["pending_steps"], "d_evals": [(r["ckpt_step"], r["eval/mean_all"]) for r in D_["evals"]],
+            "noise_eps": NOISE_EPS, "table_eps": TABLE_EPS}
+
+
+REWARD_WINDOWS = [(0, 49), (50, 99), (100, 149), (150, 199), (200, 249), (250, 299)]
+
+
+def injection_summary(D, N, k=INJ_ARM, skey=INJ_SERIES):
+    """Arm E (direction injected at 1.5x strength) vs the .425 arm: both eval series at every matched step, per family at the figure step (the last
+    step where the .425 arm and E's standard-injection score both exist; the matched-injection bar falls back to ITS latest step while 300 is pending),
+    reward means per 50-step window, the drift-wall onsets side by side, the wandb config diff, and the verdict."""
+    if k not in D["arms"] or skey not in D["arms"][k]["eval_series"]:
+        return None
+    A, T = D["arms"][k], D["arms"]["this"]
+    std, mat = A["evals"], A["eval_series"][skey]["evals"]
+    base = T["evals"]
+    steps = sorted({r["ckpt_step"] for r in base} | {r["ckpt_step"] for r in std} | {r["ckpt_step"] for r in mat})
+    table = []
+    for s in steps:
+        row = {"ckpt_step": s, "base": {kk: at(base, s, kk) for kk, _ in MATCH_KEYS}, "std": {kk: at(std, s, kk) for kk, _ in MATCH_KEYS},
+               "matched": {kk: at(mat, s, kk) for kk, _ in MATCH_KEYS}}
+        for which in ("std", "matched"):
+            row["delta_" + which] = {kk: (row[which][kk] - row["base"][kk]) if (row[which][kk] is not None and row["base"][kk] is not None) else None for kk, _ in MATCH_KEYS}
+        table.append(row)
+    common = [s for s in steps if at(base, s) is not None and at(std, s) is not None]
+    fig_step = common[-1] if common else None
+    mat_step = fig_step if (fig_step is not None and at(mat, fig_step) is not None) else (mat[-1]["ckpt_step"] if mat else None)
+    fam = {kk: {"label": lab, "plain": FAM_PLAIN.get(kk, lab), "base": at(base, fig_step, kk), "std": at(std, fig_step, kk), "matched": at(mat, mat_step, kk),
+                "base_at_matched_step": at(base, mat_step, kk)} for kk, lab in MATCH_KEYS}
+    for v in fam.values():
+        v["delta_std"] = None if v["base"] is None or v["std"] is None else v["std"] - v["base"]
+        v["delta_matched"] = None if v["base_at_matched_step"] is None or v["matched"] is None else v["matched"] - v["base_at_matched_step"]
+    d_std = {kk: v["delta_std"] for kk, v in fam.items() if v["delta_std"] is not None and kk != "eval/mean_all"}
+    hardest = min(d_std, key=d_std.get) if d_std else None
+    best_b = max(base, key=lambda r: r["eval/mean_all"]) if base else None
+    best_s = max(std, key=lambda r: r["eval/mean_all"]) if std else None
+    best_m = max(mat, key=lambda r: r["eval/mean_all"]) if mat else None
+    rw = [{"window": [a, b], "e": win_mean(A["train"], "reward/mean", a, b), "base": win_mean(T["train"], "reward/mean", a, b)} for a, b in REWARD_WINDOWS]
+    for r in rw:
+        r["delta"] = None if r["e"] is None or r["base"] is None else r["e"] - r["base"]
+    oE, oT = N["arms"][k]["onsets"] or {}, N["arms"]["this"]["onsets"] or {}
+    onset_keys = ("gnorm_gt1_2consec", "gnorm_gt1_for_good", "dlogp_gt05_first", "dlogp_gt05_3consec", "dlogp_gt05_for_good")
+    cfgE, cfgT = A["config"], T["config"]
+    diffs = {kk: [cfgE.get(kk), cfgT.get(kk)] for kk in sorted(set(cfgE) | set(cfgT)) if json.dumps(cfgE.get(kk), default=str) != json.dumps(cfgT.get(kk), default=str)}
+    trivial = {kk for kk, (a, b) in diffs.items() if kk in ("run_name", "save_dir", "policy_base_resolved") or ((a in (0, 0.0, None)) and (b in (0, 0.0, None)))}
+    m = fam["eval/mean_all"]
+    # verdict: does the stronger signal buy anything? (i) scored at the standard injection vs the .425 arm at the figure step; (ii) scored at its own strength
+    # vs the .425 arm at the same step and best-vs-best; the eval noise floor decides "below" / "within" / "above"
+    def _judge(d):
+        return None if d is None else ("below" if d < -NOISE_EPS else ("above" if d > NOISE_EPS else "within"))
+    j_std, j_mat = _judge(m["delta_std"]), _judge(m["delta_matched"])
+    j_best = _judge(None if best_m is None or best_b is None else best_m["eval/mean_all"] - best_b["eval/mean_all"])
+    if j_std is None:
+        verdict = "pending"
+    elif j_std == "below" and j_mat in ("below", "within") and j_best in ("below", "within", None):
+        verdict = "no gain: under-fires at the standard injection, does not beat the standard arm at its own strength"
+    elif j_std == "within" and j_mat in ("below", "within"):
+        verdict = "no gain: within noise at the standard injection, does not beat the standard arm at its own strength"
+    elif j_mat == "above" or j_best == "above":
+        verdict = "gain only when scored at its own strength"
+    else:
+        verdict = "gain"
+    return {"arm": k, "series": skey, "run_name": A["meta"]["name"], "wandb_id": A["meta"]["id"], "steer_coeff": A["meta"].get("steer_coeff"),
+            "injection": {"standard": "h + |h| * unit(v) at the layer-1 marker (STEER_COEFF 1.0)", "arm_e": "h + 1.5 * |h| * unit(v) (STEER_COEFF 1.5, rollouts and trainer hooks)",
+                          "mechanism": "env MAEMM_STEER_COEFF -> mxf.config.STEER_COEFF (read at import; branch steer-coeff); NOT recorded in the wandb config (steer_coeff = None there)"},
+            "series_desc": {"std": A["eval_series"][A["series_order"][0]]["desc"], "matched": A["eval_series"][skey]["desc"]},
+            "eval_runs": {"std": A["eval_series"][A["series_order"][0]]["runs"], "matched": A["eval_series"][skey]["runs"]},
+            "state": N["arms"][k]["state"], "last_step": N["arms"][k]["last_step"],
+            "pending_steps": {"std": N["arms"][k]["pending_steps"], "matched": series_pending(D, k, skey)},
+            "fig_step": fig_step, "matched_step": mat_step, "matched_step_is_fallback": mat_step != fig_step,
+            "per_family": fam, "hardest_hit_family_std": None if hardest is None else {"key": hardest, "plain": FAM_PLAIN.get(hardest, hardest), "delta": d_std[hardest]},
+            "std": {"mean_all": m["std"], "step": fig_step}, "matched": {"mean_all": m["matched"], "step": mat_step}, "base": {"mean_all": m["base"], "step": fig_step, "mean_all_at_matched_step": m["base_at_matched_step"]},
+            "delta_std_mean": m["delta_std"], "delta_matched_mean": m["delta_matched"],
+            "best": {"base": None if best_b is None else {"ckpt_step": best_b["ckpt_step"], "mean_all": best_b["eval/mean_all"]},
+                     "std": None if best_s is None else {"ckpt_step": best_s["ckpt_step"], "mean_all": best_s["eval/mean_all"]},
+                     "matched": None if best_m is None else {"ckpt_step": best_m["ckpt_step"], "mean_all": best_m["eval/mean_all"]}},
+            "matched_steps_table": table, "matched_steps_delta_mean": {"std": {str(r["ckpt_step"]): r["delta_std"]["eval/mean_all"] for r in table if r["delta_std"]["eval/mean_all"] is not None},
+                                                                      "matched": {str(r["ckpt_step"]): r["delta_matched"]["eval/mean_all"] for r in table if r["delta_matched"]["eval/mean_all"] is not None}},
+            "reward_windows": rw, "reward_window_rule": "mean of reward/mean over the logged steps in [a, b] (0-indexed trainer steps)",
+            "onsets": {"e": {kk: oE.get(kk) for kk in onset_keys} | {"dlogp_max": oE.get("dlogp_max"), "dlogp_max_step": oE.get("dlogp_max_step"), "gnorm_max": oE.get("gnorm_max"), "gnorm_max_step": oE.get("gnorm_max_step"), "n_steps_dlogp_gt05": oE.get("n_steps_dlogp_gt05")},
+                       "base": {kk: oT.get(kk) for kk in onset_keys} | {"dlogp_max": oT.get("dlogp_max"), "dlogp_max_step": oT.get("dlogp_max_step"), "gnorm_max": oT.get("gnorm_max"), "gnorm_max_step": oT.get("gnorm_max_step"), "n_steps_dlogp_gt05": oT.get("n_steps_dlogp_gt05")}},
+            "dynamics": {"e": N["arms"][k]["dynamics"], "base": N["arms"]["this"]["dynamics"]},
+            "config_diffs_e_vs_base": diffs, "config_diffs_substantive": [kk for kk in diffs if kk not in trivial],
+            "config_diffs_note": "keys whose values are 0/absent on both sides (e.g. weight_decay: the --weight-decay flag was added by commit 85eebad after the .425 arm launched, both ran without) "
+                                 "and run_name/save_dir are not substantive; steer_coeff is NOT in the wandb config at all (env override)",
+            "onset_same_tol": ONSET_SAME_TOL, "onset_words": {"gnorm_for_good": onset_cmp(oE.get("gnorm_gt1_for_good"), oT.get("gnorm_gt1_for_good")),
+                                                              "gnorm_2consec": onset_cmp(oE.get("gnorm_gt1_2consec"), oT.get("gnorm_gt1_2consec")),
+                                                              "dlogp_first": onset_cmp(oE.get("dlogp_gt05_first"), oT.get("dlogp_gt05_first")),
+                                                              "dlogp_3consec": onset_cmp(oE.get("dlogp_gt05_3consec"), oT.get("dlogp_gt05_3consec"))},
+            "noise_eps": NOISE_EPS, "table_eps": TABLE_EPS,
+            "judgement": {"std_vs_base_at_fig_step": j_std, "matched_vs_base_same_step": j_mat, "matched_best_vs_base_best": j_best}, "verdict": verdict}
 
 
 def budget_check(N):
@@ -738,21 +967,33 @@ def spread(ys, gap, lo=None, hi=None):
     return out
 
 
-def plot_arm(ax, D, k, key="eval/mean_all", init=None, label=None, xmin=None, lw_scale=1.0, ms_scale=1.0, zorder=4, ls=None, x_transform=None, max_step=None):
+def plot_arm(ax, D, k, key="eval/mean_all", init=None, label=None, xmin=None, lw_scale=1.0, ms_scale=1.0, zorder=4, ls=None, x_transform=None, max_step=None,
+             series=None, hollow=False):
+    """One eval series of one arm. series=None -> the arm's primary series (`evals`); otherwise a key of `eval_series` (drawn by the caller dashed + hollow)."""
     arm = D["arms"][k]["meta"]
-    rows = D["arms"][k]["evals"] if max_step is None else [r for r in D["arms"][k]["evals"] if r["ckpt_step"] <= max_step]
+    src = D["arms"][k]["evals"] if series is None else D["arms"][k]["eval_series"][series]["evals"]
+    rows = src if max_step is None else [r for r in src if r["ckpt_step"] <= max_step]
     xs, ys = xy(rows, key, init, xmin)
     if x_transform is not None:
         xs = [x_transform(x) for x in xs]
     if not xs:
         return xs, ys
-    ax.plot(xs, ys, color=arm["color"], lw=arm["lw"] * lw_scale, ls=ls or arm["ls"], marker=arm["marker"], ms=arm["ms"] * ms_scale, mec="white", mew=1.1,
-            label=label, zorder=zorder, solid_capstyle="round")
+    mk = dict(mec=arm["color"], mfc="white", mew=1.4) if hollow else dict(mec="white", mew=1.1)
+    ax.plot(xs, ys, color=arm["color"], lw=arm["lw"] * lw_scale, ls=ls or arm["ls"], marker=arm["marker"], ms=arm["ms"] * ms_scale, label=label, zorder=zorder,
+            solid_capstyle="round", dash_capstyle="round", **mk)
     return xs, ys
 
 
+def place_legend(fig, h, l, fontsize=8.4, pad=0.012):
+    """Figure legend at the bottom; returns the figure-fraction height it occupies so finish() can reserve exactly that (arm count changes over time)."""
+    leg = fig.legend(h, l, loc="lower center", ncol=1, fontsize=fontsize, bbox_to_anchor=(0.5, -0.005))
+    fig.canvas.draw()
+    bb = leg.get_window_extent(fig.canvas.get_renderer()).transformed(fig.transFigure.inverted())
+    return bb.y1 + pad
+
+
 def headline_claim(M, N):
-    T, A, B, C = (N["arms"][k] for k in ARM_ORDER)
+    T, A, B, C = (N["arms"][k] for k in ("this", "a", "b", "c"))
     bo = N["best_overall"]
     tf = M["last"]["mean_all"] if M["last"] else None
     bits = []
@@ -773,16 +1014,24 @@ def headline_claim(M, N):
     if C["last_eval"]:
         bits.append(f"the paper optimizer (lr 5e-7) trails at matched steps ({C['last_eval']['mean_all']:.3f} @{C['last_eval']['ckpt_step']}"
                     + (f", running, step {C['last_step']:,} of {C['total_steps']:,}" if not C["finished"] else "") + ")")
+    P = N.get("paper_reward_window")
+    if P and P["last_common"]:
+        lc = P["last_common"]; Dd = N["arms"]["d"]
+        bits.append(f"the all-token reward on the paper optimizer (arm D) is {sgn(lc['delta'])} vs arm C at step {lc['ckpt_step']} ({lc['d']:.3f} vs {lc['c']:.3f}"
+                    + (f"; running, step {Dd['last_step']:,} of {Dd['total_steps']:,}" if not Dd["finished"] else "") + ")")
+    I = N.get("injection_strength")
+    if I and I["fig_step"] is not None:
+        bits.append(f"injecting the direction at 1.5x strength buys nothing ({I['std']['mean_all']:.3f} @{I['fig_step']} scored at the standard injection, {sgn(I['delta_std_mean'])}"
+                    + (f"; {I['matched']['mean_all']:.3f} @{I['matched_step']} scored at its own strength" if I["matched"]["mean_all"] is not None else "") + ")")
     return "; ".join(bits) if bits else "Held-out fidelity vs RL step for the re-cut-init arms (evals pending)"
 
 
 def plot_headline(D, M, ABL, N):
-    c_evals = D["arms"]["c"]["evals"]
-    c_beyond = [r for r in c_evals if r["ckpt_step"] > 300]
-    if c_beyond:
-        fig, (ax, ax2) = plt.subplots(1, 2, figsize=(15.5, 6.8), gridspec_kw={"width_ratios": [3, 2]}, sharey=True)
+    long_arms = [k for k in ARM_ORDER if any(r["ckpt_step"] > 300 for r in D["arms"][k]["evals"])]     # the 7,400-step arms once they pass 300
+    if long_arms:
+        fig, (ax, ax2) = plt.subplots(1, 2, figsize=(15.5, 7.8), gridspec_kw={"width_ratios": [3, 2]}, sharey=True)
     else:
-        fig, ax = plt.subplots(figsize=(11.5, 6.8)); ax2 = None
+        fig, ax = plt.subplots(figsize=(11.5, 7.8)); ax2 = None
     ref = D["ref"]["evals"]
     first = True
     for a, v in ABL["arms"].items():
@@ -795,7 +1044,12 @@ def plot_headline(D, M, ABL, N):
     for k in ARM_ORDER:
         xs, ys = plot_arm(ax, D, k, init=M["init_mean_all"], label=arm_label(D, k), max_step=300, zorder=5 if k == "this" else 4)
         if len(xs) > 1:
-            ends.append((k, xs[-1], ys[-1]))
+            ends.append((k, None, xs[-1], ys[-1]))
+    for k in ARM_ORDER:                       # secondary eval series (arm E scored at its own 1.5x injection): dashed, hollow markers, same colour, no step-0 point
+        for skey in extra_series(D, k):
+            xs, ys = plot_arm(ax, D, k, series=skey, init=None, label=series_label(D, k, skey), max_step=300, ls="--", lw_scale=0.75, ms_scale=0.9, zorder=4, hollow=True)
+            if xs:
+                ends.append((k, skey, xs[-1], ys[-1]))
     # reference lines: the 8x512 last-5 arm's final (with the eval-noise band) and the best checkpoint of any arm
     tf = M["last"]["mean_all"] if M["last"] else None
     if tf is not None:
@@ -806,21 +1060,29 @@ def plot_headline(D, M, ABL, N):
         ax.hlines(bo["mean_all"], -6, 300, color=INK2, lw=1, ls=(0, (2, 3)), zorder=0)
     # right-margin end labels (the two dotted reference lines are labelled through the arms that define them), spread so they never overprint
     labs = []
-    for k, x, v in ends:
+    for k, skey, x, v in ends:
         arm = D["arms"][k]["meta"]; st, _, _ = arm_status(D, k)
+        if skey is not None:
+            labs.append((f"{v:.3f} @{x} · {arm['tiny']}, scored at 1.5x", x, v, arm["color"])); continue
         extra = f" (band = eval noise ±{NOISE_EPS:.3f})" if k == "this" else (" — best of any arm" if bo and bo["arm"] == k and bo["ckpt_step"] == x else "") + (" (running)" if st != "finished" else "")
         labs.append((f"{v:.3f} @{x} · {arm['tiny']}{extra}", x, v, arm["color"]))
     if M["ref_at_300"] is not None:
         labs.append((f"{M['ref_at_300']:.3f} @300 · old-bank reference", 300, M["ref_at_300"], REF_C))
-    ys_lab = spread([v for _, _, v, _ in labs], 0.0048, lo=0.336, hi=0.4425)
-    for (txt, x, v, col), yl in zip(labs, ys_lab):
+    margin = [L for L in labs if L[1] >= 250]; local = [L for L in labs if L[1] < 250]      # arms still short of 250 steps are labelled next to their last point
+    ys_lab = spread([v for _, _, v, _ in margin], 0.0048, lo=0.336, hi=0.4425)
+    for (txt, x, v, col), yl in zip(margin, ys_lab):
         ax.annotate(txt, xy=(x, v), xytext=(308, yl), textcoords="data", fontsize=8.1, color=INK2, va="center",
                     arrowprops=dict(arrowstyle="-", color=col, lw=0.7, alpha=0.7, shrinkA=0, shrinkB=2))
+    for txt, x, v, col in local:
+        ax.annotate(txt, xy=(x, v), xytext=(7, -5), textcoords="offset points", fontsize=8.1, color=INK2, va="top", ha="left")
+    pend_lines = []
     for k in ARM_ORDER:
         st, last, pending = arm_status(D, k)
-        for s in pending:
-            if s <= 300:
-                ax.text(s, 0.334 + 0.004 * ARM_ORDER.index(k), f"eval @{s} pending ({D['arms'][k]['meta']['nick']})", fontsize=7.2, color=MUTED, ha="center", va="bottom")
+        pend_lines += [(s, f"eval @{s} pending ({D['arms'][k]['meta']['nick']})") for s in pending if s <= 300]
+        for skey in extra_series(D, k):
+            pend_lines += [(s, f"eval @{s} pending ({D['arms'][k]['meta']['nick']}, scored at 1.5x)") for s in series_pending(D, k, skey) if s <= 300]
+    for i, (s, txt) in enumerate(pend_lines):
+        ax.text(s, 0.334 + 0.004 * i, txt, fontsize=7.2, color=MUTED, ha="center", va="bottom")
     if M["init_mean_all"] is not None:
         ax.annotate(f"shared SFT init after midtrain: {M['init_mean_all']:.3f}", xy=(0, M["init_mean_all"]), xytext=(16, -14), textcoords="offset points", fontsize=8.3, color=INK2,
                     arrowprops=dict(arrowstyle="-", color=AXIS, lw=0.8))
@@ -832,22 +1094,26 @@ def plot_headline(D, M, ABL, N):
     ax.set_ylabel("held-out fidelity: mean cosine over 10 direction families")
     style_ax(ax)
     if ax2 is not None:
-        plot_arm(ax2, D, "c", init=None, label=None)
-        for k in ("this", "a", "b"):
+        xm = 0
+        for i, k in enumerate(long_arms):
+            plot_arm(ax2, D, k, init=None, label=None)
+            kl = D["arms"][k]["evals"][-1]; xm = max(xm, kl["ckpt_step"])
+            ax2.annotate(f"{kl['eval/mean_all']:.3f} @{kl['ckpt_step']:,} · {D['arms'][k]['meta']['tiny']}", xy=(kl["ckpt_step"], kl["eval/mean_all"]), xytext=(6, -12 if i == 0 else 8),
+                         textcoords="offset points", fontsize=8.3, color=INK2)
+        for k in ARM_ORDER:
             e = D["arms"][k]["evals"]
-            if e:
+            if k not in long_arms and e and D["arms"][k]["meta"]["total_steps"] <= 300:
                 ax2.axhline(e[-1]["eval/mean_all"], color=D["arms"][k]["meta"]["color"], lw=1, ls=(0, (4, 3)), zorder=0)
-        c_last = c_evals[-1]
-        ax2.annotate(f"{c_last['eval/mean_all']:.3f} @{c_last['ckpt_step']:,}", xy=(c_last["ckpt_step"], c_last["eval/mean_all"]), xytext=(6, -12), textcoords="offset points", fontsize=8.3, color=INK2)
-        ax2.set_xlim(0, c_last["ckpt_step"] * 1.12); ax2.set_title(f"arm C continues: {arm_label(D, 'c', long=False)}; dotted = the other arms' final values", fontsize=9.4, loc="left")
-        ax2.set_xlabel("RL step (arm C, 16,384 rollouts per step)"); style_ax(ax2)
+        ax2.set_xlim(0, xm * 1.12)
+        ax2.set_title(wrap("the 7,400-step arms continue: " + "; ".join(arm_label(D, k, long=False) for k in long_arms) + " — dotted = the 300-step arms' final values", 95), fontsize=9.4, loc="left")
+        ax2.set_xlabel("RL step (7,400-step arms, 16,384 rollouts per step)"); style_ax(ax2)
     head = headline_claim(M, N)
     fig.suptitle(wrap(head, 165) + "\n" + wrap("Held-out mean fidelity vs RL step — Qwen3.6-27B activation-to-text inverter; full-parameter CISPO GRPO from the same SFT init "
                  "(104M pretrain + full-FT midtrain on the re-cut bank), same six-family RL bank; 512 held-out directions per family, best-of-4 at T=1. "
-                 "Orange dashed = the same 8 x 512 recipe from the old-bank init.", 165), fontsize=10.2, x=0.01, ha="left", y=0.995)
+                 "Orange dashed = the same 8 x 512 recipe from the old-bank init. Rose = the 1.5x-injection arm scored at the standard injection; rose dashed, hollow = "
+                 "the same checkpoints scored at their own 1.5x injection.", 165), fontsize=10.2, x=0.01, ha="left", y=0.995)
     h, l = ax.get_legend_handles_labels()
-    fig.legend(h, l, loc="lower center", ncol=1, fontsize=8.4, bbox_to_anchor=(0.5, -0.005))
-    finish(fig, bottom=0.2 if ax2 is None else 0.17)
+    finish(fig, bottom=place_legend(fig, h, l))
     save(fig, "fidelity_vs_rl_step")
 
 
@@ -860,7 +1126,7 @@ def plot_rollouts(D, M, N):
     fig, ax = plt.subplots(figsize=(11.5, 6.6))
     init = M["init_mean_all"]
     xmax = 0
-    for k in ARM_ORDER:
+    for k in [k for k in ARM_ORDER if not ARMS[k].get("skip_rollouts")]:
         arm = D["arms"][k]["meta"]
         xs, ys = plot_arm(ax, D, k, init=None, label=arm_label(D, k), x_transform=lambda s, r=arm["rollouts_per_step"]: s * r, zorder=5 if k == "this" else 4)
         if xs:
@@ -892,8 +1158,8 @@ def plot_rollouts(D, M, N):
             + (", ".join(f"{sgn(r['delta_vs_base'])} ({r['mean_all']:.3f} vs {r['base_mean_all']:.3f} at {r['cum_rollouts'] / 1e3:,.0f}k)" for r in ex) if ex else "n/a")
             + " below the 8 x 512 arm" + (f", and where the 8 x 512 arm ends ({rev['cum_rollouts'] / 1e6:.2f}M rollouts) the 4x arm is at ≈{rev['mean_all']:.3f} (interpolated)" if rev else "")
             + " — its per-step lead is bought with 4x the samples; the all-token-reward arm tracks the 8 x 512 arm rollout-for-rollout and ends higher")
-    ax.set_title(wrap(head, 158) + "\n" + wrap("Held-out mean fidelity vs cumulative rollouts — the four full-parameter RL arms from the same re-cut-bank SFT init; "
-                 "vertical connectors join checkpoints with identical rollout counts. Arm C's axis extends as its 7,400-step run proceeds.", 158), fontsize=10.2, loc="left", pad=10)
+    ax.set_title(wrap(head, 158) + "\n" + wrap("Held-out mean fidelity vs cumulative rollouts — the full-parameter RL arms from the same re-cut-bank SFT init (arm E omitted: it has the "
+                 "8 x 512 arm's axis); vertical connectors join checkpoints with identical rollout counts. Arms C and D extend the axis as their 7,400-step runs proceed.", 158), fontsize=10.2, loc="left", pad=10)
     style_ax(ax)
     h, l = ax.get_legend_handles_labels()
     fig.legend(h, l, loc="lower center", ncol=1, fontsize=8.4, bbox_to_anchor=(0.5, -0.005))
@@ -902,7 +1168,7 @@ def plot_rollouts(D, M, N):
 
 
 def plot_lr_steps(D, M, N):
-    arms = ["this", "a", "c"]
+    arms = ["this", "a", "c", "d"]
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12.5, 9.2), sharex=True, gridspec_kw={"height_ratios": [1.1, 1]})
     xmax = 1e-5
     for k in arms:
@@ -911,7 +1177,12 @@ def plot_lr_steps(D, M, N):
         if xs:
             xmax = max(xmax, xs[-1])
             if k == "c":
-                ax1.annotate(f"{ys[-1]:.3f} @{D['arms'][k]['evals'][-1]['ckpt_step']:,} (running)", xy=(xs[-1], ys[-1]), xytext=(-7, 9), textcoords="offset points", fontsize=8.2, color=INK2, ha="right", va="bottom")
+                ax1.annotate(f"{ys[-1]:.3f} @{D['arms'][k]['evals'][-1]['ckpt_step']:,} · {arm['tiny']}" + (" (running)" if arm_status(D, k)[0] != "finished" else ""), xy=(xs[-1], ys[-1]),
+                             xytext=(-7, 9), textcoords="offset points", fontsize=8.2, color=INK2, ha="right", va="bottom")
+            elif k == "d":     # arm D rides on arm C's curve; its label goes to the empty top-left corner with a thin connector
+                ax1.annotate(f"{ys[-1]:.3f} @{D['arms'][k]['evals'][-1]['ckpt_step']:,} · {arm['tiny']}" + (" (running)" if arm_status(D, k)[0] != "finished" else ""), xy=(xs[-1], ys[-1]),
+                             xytext=(1.15e-5, 0.427), textcoords="data", fontsize=8.2, color=INK2, ha="left", va="center",
+                             arrowprops=dict(arrowstyle="-", color=arm["color"], lw=0.7, alpha=0.7, shrinkA=0, shrinkB=2))
             else:
                 ax1.annotate(f"{ys[-1]:.3f}" + (" (running)" if arm_status(D, k)[0] != "finished" else ""), xy=(xs[-1], ys[-1]), xytext=(7, 0), textcoords="offset points", fontsize=8.2, color=INK2, va="center")
         tr = D["arms"][k]["train"]
@@ -967,8 +1238,8 @@ def plot_lr_steps(D, M, N):
             f"{verdict}. Grad-norm rule: " + (f"A step {g['a']['step']} = {sci(g['a']['cum_lr'])}, C " + (f"step {g['c']['step']} = {sci(g['c']['cum_lr'])} ({g['verdict']})" if g["c"]["cum_lr"]
             else f"not yet (predicted step ≈{g.get('c_predicted_step')})") if g["a"]["cum_lr"] else "pending"))
     fig.suptitle(wrap(head, 175) + "\n" + wrap("Held-out fidelity (top) and sampler-trainer policy drift (bottom) vs cumulative lr x steps for the 8 x 512 arm (lr 1e-6, 25 warmup), "
-                 "arm A (8 x 2048, lr 1e-6, 25 warmup) and arm C (8 x 2048, lr 5e-7 after a 100-step warmup, AdamW eps 1e-15, wd .01). Shaded band = the 8 x 512 arm's onset range by the two rules. "
-                 "Arm B shares the 8 x 512 arm's schedule and is omitted.", 175), fontsize=10.2, x=0.01, ha="left", y=0.995)
+                 "arm A (8 x 2048, lr 1e-6, 25 warmup), arm C (8 x 2048, lr 5e-7 after a 100-step warmup, AdamW eps 1e-15, wd .01) and arm D (arm C's schedule with the all-token reward; brown). "
+                 "Shaded band = the 8 x 512 arm's onset range by the two rules. Arms B and E share the 8 x 512 arm's schedule and are omitted.", 175), fontsize=10.2, x=0.01, ha="left", y=0.995)
     h, l = ax1.get_legend_handles_labels()
     fig.legend(h, l, loc="lower center", ncol=1, fontsize=8.4, bbox_to_anchor=(0.5, -0.005))
     finish(fig, bottom=0.1)
@@ -988,6 +1259,9 @@ def plot_families(D, M, ABL, N):
         ax.plot(xs, ys, color=REF_C, lw=1.6, ls="--", marker="s", ms=5, mec="white", mew=1.0, label=REF_LABEL, zorder=3)
         for k in ARM_ORDER:
             plot_arm(ax, D, k, key=key, init=mid_final.get(key), label=arm_label(D, k), xmin=1 if logx else None, lw_scale=0.85, ms_scale=0.85, zorder=5 if k == "this" else 4)
+        for k in ARM_ORDER:
+            for skey in extra_series(D, k):
+                plot_arm(ax, D, k, key=key, series=skey, init=None, label=series_label(D, k, skey), xmin=1 if logx else None, lw_scale=0.65, ms_scale=0.8, zorder=4, ls="--", hollow=True)
         if logx and _num(mid_final.get(key)):
             ax.axhline(mid_final[key], color=AXIS, lw=1, ls=":", zorder=0)
         # who leads this family at step 300 (or the last step every finished arm has)
@@ -1014,18 +1288,24 @@ def plot_families(D, M, ABL, N):
     B = N["arms"]["b"]
     if B["last_eval"] and at(D["arms"]["b"]["evals"], 300, "eval/sae/norm_act") is not None:
         head += f" — the all-token reward lifts SAE fire-back to {at(D['arms']['b']['evals'], 300, 'eval/sae/norm_act'):.3f} (above the corpus max = 1)"
-    fig.suptitle(wrap(head, 185) + "\n" + wrap("Per-family held-out fidelity vs RL step: the four full-parameter arms from the same re-cut-bank init (8 x 512 last-5 = blue; "
-                 "8 x 2048 = purple; all-token reward = aqua; paper optimizer = ink, running) and the old-bank reference (orange dashed). The midtrain never saw long-context real "
-                 "activations (RL-only family). MLP fire-back was not measured for the re-cut init (no step-0 point there).", 185), fontsize=10.2, x=0.01, ha="left", y=0.995)
+    I = N.get("injection_strength")
+    if I and I["fig_step"] is not None and I["hardest_hit_family_std"]:
+        hh = I["hardest_hit_family_std"]; f_ = I["per_family"][hh["key"]]
+        head += (f" — the 1.5x-injection arm, scored at the standard injection, under-fires most on {hh['plain']} ({f_['std']:.3f} vs {f_['base']:.3f} for the .425 arm @{I['fig_step']}"
+                 + (f"; {f_['matched']:.3f} scored at its own strength" if f_["matched"] is not None else "") + ")")
+    fig.suptitle(wrap(head, 185) + "\n" + wrap("Per-family held-out fidelity vs RL step: the five full-parameter arms from the same re-cut-bank init (8 x 512 last-5 = blue; "
+                 "8 x 2048 = purple; all-token reward = aqua; paper optimizer = ink, running; paper optimizer + all-token reward = brown, running; 1.5x injection = rose, dashed hollow = the same "
+                 "checkpoints scored at their own 1.5x injection) "
+                 "and the old-bank reference (orange dashed). The midtrain never saw long-context real activations (RL-only family). MLP fire-back was not measured for the re-cut init "
+                 "(no step-0 point there).", 185), fontsize=10.2, x=0.01, ha="left", y=0.995)
     h, l = axes.flat[0].get_legend_handles_labels()
-    fig.legend(h, l, loc="lower center", ncol=1, fontsize=8.3, bbox_to_anchor=(0.5, -0.005))
-    finish(fig, bottom=0.14)
+    finish(fig, bottom=place_legend(fig, h, l, fontsize=8.3))
     save(fig, "per_family_vs_rl_step")
     return leaders
 
 
 def plot_dynamics(D, M, N):
-    panels = [("reward/mean", "reward: mean cosine (max over the last 5 tokens; arm B: over all tokens)", False),
+    panels = [("reward/mean", "reward: mean cosine (last-5 window; B and D: all tokens)", False),
               ("policy/entropy", "policy entropy (nats / token)", False),
               ("grad_norm", "gradient norm before clipping (log; dotted = clip at 1.0)", True),
               ("policy/sampler_abs_dlogp", "sampler vs trainer |delta log p| per token (log; dotted = 0.05)", True),
@@ -1048,10 +1328,16 @@ def plot_dynamics(D, M, N):
             ax.plot(x, yy, color=c, lw=0.6, alpha=0.2, zorder=2)
             ax.plot(x, ma, color=c, lw=lw, ls=ls, zorder=4 if tag == "this" else 3, label=lab if key == "reward/mean" else None, solid_capstyle="round")
         if key == "reward/peak_last_frac":
-            tb = D["arms"]["b"]["train"]
-            if tb["step"] and any(_num(v) for v in tb["reward/peak_in_last5_frac"]):
-                ax.plot(tb["step"], rolling(tb["reward/peak_in_last5_frac"]), color=B_C, lw=1.1, ls=":", zorder=2)
-                ax.text(0.99, 0.02, "aqua dotted = arm B's share of peaks inside the last 5 tokens\n(= 1 by construction for the last-5 arms)", transform=ax.transAxes, fontsize=7.6, color=INK2, ha="right", va="bottom")
+            drawn = []
+            for k in [k for k in ARM_ORDER if D["arms"][k]["meta"]["reward_window_last"] == 0]:
+                tb = D["arms"][k]["train"]
+                if tb["step"] and any(_num(v) for v in tb["reward/peak_in_last5_frac"]):
+                    xb = np.array(tb["step"]); yb = rolling(tb["reward/peak_in_last5_frac"])
+                    if xmax > LOG_STEP_AXIS_FROM:
+                        keep = xb >= 1; xb, yb = xb[keep], yb[keep]
+                    ax.plot(xb, yb, color=D["arms"][k]["meta"]["color"], lw=1.1, ls=":", zorder=2); drawn.append(f"arm {k.upper()}")
+            if drawn:
+                ax.text(0.99, 0.02, f"dotted ({', '.join(drawn)}, arm colours) = share of peaks inside the last 5 tokens\n(= 1 by construction for the last-5 arms)", transform=ax.transAxes, fontsize=7.6, color=INK2, ha="right", va="bottom")
             ax.set_ylim(0.2, 1.06)
         if key == "grad_norm":
             ax.axhline(1.0, color=INK2, lw=1, ls=":", zorder=1)
@@ -1074,7 +1360,7 @@ def plot_dynamics(D, M, N):
             ticks = {"grad_norm": [0.4, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0], "policy/sampler_abs_dlogp": [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.1],
                      "reward/peak_dist_mean": [0.5, 1, 2, 5, 10, 20]}[key]
             ax.set_yticks(ticks); ax.set_yticklabels([f"{t:g}" for t in ticks]); ax.set_yticks([], minor=True)
-            ax.set_ylim(ticks[0] * 0.9, ticks[-1] * (1.9 if key in ("grad_norm", "policy/sampler_abs_dlogp") else 1.15))
+            ax.set_ylim(ticks[0] * 0.9, ticks[-1] * (2.6 if key in ("grad_norm", "policy/sampler_abs_dlogp") else 1.15))
         if key == "reward/mean":
             ax.set_ylim(0.15, 0.35)
         if key == "policy/entropy":
@@ -1082,13 +1368,14 @@ def plot_dynamics(D, M, N):
         if key == "time/step_s":
             ax.set_ylim(0, 180)
         if key == "rollout/len_mean":
-            ax.set_ylim(15, 80)
+            lmax = max([N["arms"][k]["dynamics"].get("len_max") or 0 for k in ARM_ORDER] + [80])
+            ax.set_ylim(15, lmax * 1.06 if lmax > 80 else 80)
         ax.set_title(title, fontsize=9.2, loc="left")
         step_axis(ax, xmax, allow_zero=False); style_ax(ax)
     for ax in axes[-1]:
         ax.set_xlabel("RL step" + (" (log)" if xmax > LOG_STEP_AXIS_FROM else ""), fontsize=9)
-    T, A, B, C = (N["arms"][k] for k in ARM_ORDER)
-    oT, oA, oB, oC = (N["arms"][k]["onsets"] or {} for k in ARM_ORDER)
+    T, A, B, C = (N["arms"][k] for k in ("this", "a", "b", "c"))
+    oT, oA, oB, oC = (N["arms"][k]["onsets"] or {} for k in ("this", "a", "b", "c"))
     pB, pT = B["peak_metrics"], T["peak_metrics"]
     head = (f"4x the batch delays the grad-norm wall in steps (above the clip for good from {oA.get('gnorm_gt1_for_good', 'n/a')} vs {oT.get('gnorm_gt1_for_good', 'n/a')} for 8 x 512) but brings the "
             f"|delta log p| crossing EARLIER ({oA.get('dlogp_gt05_first', 'not yet')} vs {oT.get('dlogp_gt05_first', 'n/a')}); the all-token reward smears the peak "
@@ -1096,13 +1383,66 @@ def plot_dynamics(D, M, N):
             f"{fmt(pT['peak_last_frac']['mean_from50'], 2) if pT else 'n/a'}; responses {fmt(B['dynamics'].get('len_mean_from50'), 0)} vs {fmt(T['dynamics'].get('len_mean_from50'), 0)} tokens); "
             f"the paper optimizer (lr 5e-7) keeps grad norm at {fmt(C['dynamics'].get('gnorm_last10'), 2)} and |delta log p| at {fmt(C['dynamics'].get('dlogp_last10'))} at step {C['last_step']:,}"
             + (" (running)" if not C["finished"] else ""))
-    fig.suptitle(wrap(head, 215) + "\n" + wrap(f"RL training dynamics vs step — the four full-parameter arms from the same re-cut init plus the old-bank reference (orange dashed); thin = per step, "
+    Ea = N["arms"].get("e"); oE = (Ea or {}).get("onsets") or {}
+    if Ea and Ea["dynamics"]:
+        head += (f"; the 1.5x-injection arm's reward climb is the 8 x 512 arm's ({fmt(Ea['dynamics'].get('reward_last10'), 3)} vs {fmt(T['dynamics'].get('reward_last10'), 3)} over the last 10 steps), "
+                 f"its grad-norm wall arrives {onset_cmp(oE.get('gnorm_gt1_for_good'), oT.get('gnorm_gt1_for_good'))} (above the clip for good from {oE.get('gnorm_gt1_for_good', 'n/a')} vs {oT.get('gnorm_gt1_for_good', 'n/a')}) "
+                 f"and its |delta log p| crossing {onset_cmp(oE.get('dlogp_gt05_first'), oT.get('dlogp_gt05_first'))} ({oE.get('dlogp_gt05_first') if oE.get('dlogp_gt05_first') is not None else 'never'} vs {oT.get('dlogp_gt05_first', 'n/a')}; "
+                 f"{oE.get('n_steps_dlogp_gt05', 'n/a')} vs {oT.get('n_steps_dlogp_gt05', 'n/a')} steps above .05)")
+    Dd = N["arms"].get("d"); pD = (Dd or {}).get("peak_metrics") or {}
+    if Dd and pD:
+        head += (f"; the all-token reward on the paper optimizer (arm D) smears the peak {fmt((pD.get('peak_dist_mean') or {}).get('mean_from50'), 0)} tokens into the rollout "
+                 f"(responses {fmt(Dd['dynamics'].get('len_mean_from50'), 0)} tokens) at step {Dd['last_step']:,}" + (" (running)" if not Dd["finished"] else ""))
+    fig.suptitle(wrap(head, 215) + "\n" + wrap(f"RL training dynamics vs step — the six full-parameter arms from the same re-cut init plus the old-bank reference (orange dashed); thin = per step, "
                  f"thick = {MA}-step moving average. Onset steps in the boxes use the rules of the earlier sections (grad norm > 1 on 2 consecutive steps / for good; |delta log p| > .05 first / 3 consecutive; step >= 100). "
                  "The reference run did not log the peak-position metrics.", 215), fontsize=10.2, x=0.01, ha="left", y=0.995)
     h, l = axes.flat[0].get_legend_handles_labels()
-    fig.legend(h, l, loc="lower center", ncol=1, fontsize=8.3, bbox_to_anchor=(0.5, -0.005))
-    finish(fig, bottom=0.13)
+    finish(fig, bottom=place_legend(fig, h, l, fontsize=8.3))
     save(fig, "rl_dynamics")
+
+
+def plot_injection(D, N):
+    """Grouped bars per family at the figure step: the .425 arm vs arm E scored at the standard injection vs arm E scored at its own 1.5x injection."""
+    I = N.get("injection_strength")
+    if not I or I["fig_step"] is None:
+        print("injection_strength: no common evaluated step yet — figure skipped"); return
+    fam_keys = [kk for kk, _ in MATCH_KEYS]
+    F = I["per_family"]; armE = D["arms"][INJ_ARM]["meta"]
+    fig, ax = plt.subplots(figsize=(13, 6.4))
+    x = np.arange(len(fam_keys)); w = 0.26
+    spec = [("base", -w, THIS_C, None, 1.0, f"the .425 arm (8 x 512, last-5 reward; standard injection in training and scoring) @{I['fig_step']}"),
+            ("std", 0.0, armE["color"], None, 1.0, f"arm E: trained at 1.5x injection, scored at the STANDARD 1.0x injection @{I['fig_step']}"),
+            ("matched", w, armE["color"], "//", 0.55, f"arm E: trained at 1.5x injection, scored at its OWN 1.5x injection @{I['matched_step']}"
+             + (f" (step {I['fig_step']} eval pending)" if I["matched_step_is_fallback"] else ""))]
+    for which, off, col, hatch, alpha, lab in spec:
+        vals = [F[kk][which] for kk in fam_keys]
+        ys = [v if v is not None else 0 for v in vals]
+        bars = ax.bar(x + off, ys, width=w - 0.02, color=col, alpha=alpha, hatch=hatch, edgecolor="white" if hatch is None else col, linewidth=0.8, label=lab, zorder=3)
+        for xi, v, kk in zip(x + off, vals, fam_keys):
+            if v is None:
+                ax.text(xi, 0.01, "pending", rotation=90, fontsize=7.2, color=MUTED, ha="center", va="bottom"); continue
+            d = None if which == "base" else F[kk]["delta_" + which]
+            txt = f"{v:.3f}" + ("" if d is None else f"\n{sgn(d)}")
+            ax.text(xi, v + 0.008, txt, fontsize=7.6, color=INK2, ha="center", va="bottom", linespacing=1.05)
+    ax.set_xticks(x); ax.set_xticklabels([FAM_PLAIN.get(kk, kk).replace("short-context real activations", "real activations\n(short context)").replace("long-context real activations", "real activations\n(long context)")
+                                          .replace("mean", "mean over the\n10 cosine families") for kk in fam_keys], fontsize=8.8)
+    ax.set_ylim(0, 1.12); ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_ylabel("held-out fidelity (cosine; SAE / MLP = normalised peak activation)")
+    ax.set_xlabel("held-out direction family (512 directions each, best-of-4 at T=1, scored on the clean base at layer 42 over the last 5 tokens)")
+    style_ax(ax)
+    m = F["eval/mean_all"]; hh = I["hardest_hit_family_std"]
+    head = (f"A 1.5x stronger injected signal buys nothing: trained at 1.5x, the policy under-fires when scored at the standard 1.0x injection "
+            f"({m['std']:.3f} vs {m['base']:.3f} mean @{I['fig_step']}, {sgn(m['delta_std'])}"
+            + (f"; {hh['plain']} hit hardest, {F[hh['key']]['std']:.3f} vs {F[hh['key']]['base']:.3f}" if hh else "") + ")"
+            + (f", and even scored at its own 1.5x strength it does not beat the standard arm ({m['matched']:.3f} @{I['matched_step']} vs {m['base_at_matched_step']:.3f}, {sgn(m['delta_matched'])})"
+               if m["matched"] is not None and m["base_at_matched_step"] is not None else ""))
+    fig.suptitle(wrap(head, 170) + "\n" + wrap(f"Per-family held-out fidelity at RL step {I['fig_step']} — Qwen3.6-27B activation-to-text inverter, full-parameter CISPO GRPO, same SFT init, pool, "
+                 "optimizer, batch (8 x 512), reward window (last 5) and step count; the only change is the strength of the direction injected at the layer-1 marker during training "
+                 f"(1.5x the residual norm instead of 1.0x). Numbers above the bars: value and delta vs the .425 arm at the same step. Eval noise floor ±{NOISE_EPS:.3f}.", 170),
+                 fontsize=10.2, x=0.01, ha="left", y=0.995)
+    h, l = ax.get_legend_handles_labels()
+    finish(fig, bottom=place_legend(fig, h, l))
+    save(fig, "injection_strength")
 
 
 def plot_bank():
@@ -1169,7 +1509,10 @@ def write_data(D, M, N, ABL, bank_plot, leaders):
     init_row["delta"] = {k: (init_row["this"][k] - init_row["ref"][k]) if (init_row["this"][k] is not None and init_row["ref"][k] is not None) else None for k, _ in TABLE_KEYS}
     init_row["this_pending"] = False
     arms_ev = {k: {"label": arm_label(D, k), "nick": D["arms"][k]["meta"]["nick"], "color": D["arms"][k]["meta"]["color"], "wandb_id": D["arms"][k]["meta"]["id"],
-                   "rollouts_per_step": D["arms"][k]["meta"]["rollouts_per_step"], "evals": D["arms"][k]["evals"], "init": {"mean_all": M["init_mean_all"], "row": mid_final}}
+                   "rollouts_per_step": D["arms"][k]["meta"]["rollouts_per_step"], "evals": D["arms"][k]["evals"], "init": {"mean_all": M["init_mean_all"], "row": mid_final},
+                   "series_order": D["arms"][k]["series_order"],
+                   "eval_series": {skey: {"desc": S_["desc"], "run_name": S_["run_name"], "label": series_label(D, k, skey) if skey != D["arms"][k]["series_order"][0] else arm_label(D, k),
+                                          "evals": S_["evals"], "runs": S_["runs"]} for skey, S_ in D["arms"][k]["eval_series"].items()}}
                for k in ARM_ORDER}
     json.dump({"generated_at": D["fetched_at"], "table_keys": TABLE_KEYS, "family_panels": FAMILY_PANELS,
                "this": {"label": this_label(D, M), "evals": ev, "init": {"mean_all": M["init_mean_all"], "source": "midtrain final checkpoint eval (mix5msft_midtrain_fft_from_fft104m_eval, last ckpt)", "row": mid_final}},
@@ -1198,6 +1541,8 @@ def write_data(D, M, N, ABL, bank_plot, leaders):
     json.dump({"generated_at": D["fetched_at"], "run": D["runs"]["mid_train"], "eval_run": D["runs"]["mid_eval"], "stats": M["midtrain"],
                "series": {k: mt[k] for k in ("step", "loss", "lr", "ex_per_s", "peak_mem_gb", "_timestamp")}}, open(dd / "midtrain.json", "w"), indent=1)
     json.dump({"generated_at": D["fetched_at"], **N, "family_leaders_at_300": leaders}, open(dd / "new_arms.json", "w"), indent=1, default=str)
+    if N.get("injection_strength"):
+        json.dump({"generated_at": D["fetched_at"], **N["injection_strength"]}, open(dd / "injection_strength.json", "w"), indent=1, default=str)
     summ = {k: v for k, v in M.items() if k not in ("midtrain",)} | {"generated_at": D["fetched_at"], "runs": D["runs"], "midtrain_stats": {k: v for k, v in M["midtrain"].items() if k != "evals"},
                                                                     "bank_n_rows": BANK["n_rows"], "bank_families": BANK["families"], "save_steps": SAVE_STEPS, "ref_step": REF_STEP,
                                                                     "best_overall": N["best_overall"], "arm_status": {k: {"state": N["arms"][k]["state"], "last_step": N["arms"][k]["last_step"],
@@ -1219,14 +1564,28 @@ def main():
     for k in ARM_ORDER:
         A = N["arms"][k]
         print(f"arm {k}: {A['label']}\n   evals {[(e['ckpt_step'], round(e['eval/mean_all'], 4)) for e in A['evals']]} pending {A['pending_steps']}")
+        for skey in A["series_order"][1:]:
+            S_ = A["eval_series"][skey]
+            print(f"   series {skey} ({S_['run_name']}): {[(e['ckpt_step'], round(e['eval/mean_all'], 4)) for e in S_['evals']]} pending {S_['pending_steps']}")
         o = A["onsets"] or {}
         print("   onsets:", json.dumps({kk: (round(v, 7) if isinstance(v, float) else v) for kk, v in o.items() if not kk.startswith("rule") and kk != "gnorm_le1_steps_after_100"}))
     print("matched-step deltas vs 8x512:", json.dumps({k: {s: round(v, 4) for s, v in d.items()} for k, d in N["matched_steps_delta_mean"].items()}))
-    print("matched rollouts:", json.dumps([{kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in r.items() if kk in ("arm", "ckpt_step", "cum_rollouts", "mean_all", "base_equiv_step", "base_mean_all", "base_interpolated", "delta_vs_base", "reverse")} for r in N["matched_rollouts"] if r["arm"] != "b"]))
+    print("matched rollouts:", json.dumps([{kk: (round(v, 4) if isinstance(v, float) else v) for kk, v in r.items() if kk in ("arm", "ckpt_step", "cum_rollouts", "mean_all", "base_equiv_step", "base_mean_all", "base_interpolated", "delta_vs_base", "reverse")} for r in N["matched_rollouts"] if r["arm"] not in ("b", "e")]))
     print("best overall:", N["best_overall"])
     print("budget hypothesis:", N["budget_hypothesis"]["summary"])
+    I = N.get("injection_strength")
+    if I:
+        print(f"injection strength: verdict = {I['verdict']}; fig step {I['fig_step']} (matched @{I['matched_step']}{' fallback' if I['matched_step_is_fallback'] else ''}); "
+              f"std {fmt(I['std']['mean_all'])} ({sgn(I['delta_std_mean'])}), matched {fmt(I['matched']['mean_all'])} ({sgn(I['delta_matched_mean'])}); "
+              f"reward windows E/base {[(round(r['e'], 3) if r['e'] is not None else None, round(r['base'], 3) if r['base'] is not None else None) for r in I['reward_windows']]}; "
+              f"onsets E {I['onsets']['e']} vs base {I['onsets']['base']}; config diffs {list(I['config_diffs_e_vs_base'])}")
+    P = N.get("paper_reward_window")
+    if P:
+        print(f"paper optimizer, all-token (arm D, {P['d_state']} step {P['d_last_step']}) vs last-5 (arm C, {P['c_state']} step {P['c_last_step']}): D evals {[(s, round(v, 4)) for s, v in P['d_evals']]}; "
+              f"delta D-C by step {{{', '.join(f'{s}: {sgn(v)}' for s, v in P['delta_mean_by_step'].items())}}}; ref B-this {{{', '.join(f'{s}: {sgn(v)}' for s, v in P['ref_delta_mean_by_step'].items())}}}; "
+              f"smearing D peak_dist {fmt(P['smearing']['d']['peak_dist_mean_from50'], 1)} len {fmt(P['smearing']['d']['len_mean_from50'], 0)} vs C {fmt(P['smearing']['c']['peak_dist_mean_from50'], 1)} / {fmt(P['smearing']['c']['len_mean_from50'], 0)}")
     bank_plot = plot_bank()
-    plot_headline(D, M, ABL, N); plot_rollouts(D, M, N); plot_lr_steps(D, M, N); leaders = plot_families(D, M, ABL, N); plot_dynamics(D, M, N)
+    plot_headline(D, M, ABL, N); plot_rollouts(D, M, N); plot_lr_steps(D, M, N); leaders = plot_families(D, M, ABL, N); plot_dynamics(D, M, N); plot_injection(D, N)
     write_data(D, M, N, ABL, bank_plot, leaders)
     bh = OUT / "build_html.py"
     if not args.no_html and bh.exists():
