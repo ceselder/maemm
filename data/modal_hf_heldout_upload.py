@@ -63,9 +63,10 @@ def publish(repo: str = REPO, private: bool = True, dry: bool = False):
         dirs = es[f"{fam}_dirs"].float().numpy(); n = len(dirs)
         cols = {"row": np.arange(n), "family": [fam] * n, "direction": [d.tolist() for d in dirs]}
         for k, v in es.items():
-            if k.startswith(fam + "_") and k != f"{fam}_dirs":
+            if k.startswith(fam + "_") and k != f"{fam}_dirs" and (torch.is_tensor(v) or isinstance(v, (list, tuple))):
                 arr = v.numpy() if torch.is_tensor(v) else np.asarray(v, dtype=object)
-                if len(arr) == n: cols[k[len(fam) + 1:]] = [x.tolist() if hasattr(x, "tolist") else x for x in arr]
+                if getattr(arr, "ndim", 0) >= 1 and len(arr) == n:
+                    cols[k[len(fam) + 1:]] = [x.tolist() if hasattr(x, "tolist") else x for x in arr]
         if fam == "sae":
             cols["feature_id"] = list(es["sae_feats"]); cols["corpus_peak"] = es["corpus_peak"].float().numpy().tolist()
         if fam in rows_meta:
