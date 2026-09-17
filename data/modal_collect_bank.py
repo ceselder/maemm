@@ -40,6 +40,7 @@ image = (
     .pip_install("flash-linear-attention==0.5.2")   # GDN forward via fla's Triton chunk kernel (forward is fine on Hopper)
     .add_local_file(REPO / "data" / "collect_acts27b_worker.py", "/pmx/collect_acts27b_worker.py")
     .add_local_file(REPO / "data" / "collect_bank_worker.py", "/pmx/collect_bank_worker.py")
+    .add_local_file(REPO / "data" / "collect_fullctx_worker.py", "/pmx/collect_fullctx_worker.py")
     .add_local_dir(REPO / "mxf", "/pmx/helpers/mxf", ignore=["__pycache__"])
 )
 
@@ -130,7 +131,7 @@ def _other_bank_files(bank_name: str):
 
 
 def _run(out_name: str, n_examples: int, world: int, batch: int, per_window: int, p_lo: int, p_hi: int, w_lo: int,
-         w_hi: int, max_wins: int, chunk_examples: int, seed: int, exclude_from: str = "", hf_stream: str = ""):
+         w_hi: int, max_wins: int, chunk_examples: int, seed: int, exclude_from: str = "", hf_stream: str = "", w_full: bool = False):
     import json
     import subprocess
     import sys
@@ -208,7 +209,7 @@ def _run(out_name: str, n_examples: int, world: int, batch: int, per_window: int
                "--n-examples", str(per[r]), "--seq-len", str(p_hi), "--batch", str(batch), "--per-window", str(per_window),
                "--p-lo", str(p_lo), "--p-hi", str(p_hi), "--w-lo", str(w_lo), "--w-hi", str(w_hi), "--max-wins", str(max_wins),
                "--chunk-examples", str(chunk_examples), "--seed", str(seed), "--mu", MU_PATH,
-               "--exclude-hashes", excl_path, "--out", shards, "--assignment", assign_path]
+               "--exclude-hashes", excl_path, "--out", shards, "--assignment", assign_path] + (["--w-full"] if w_full else [])
         procs.append(subprocess.Popen(cmd, env=env))
         time.sleep(2)
     fails = [r for r, p in enumerate(procs) if p.wait() != 0]
@@ -244,7 +245,7 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
     t0 = time.time()
     vecs = np.memmap(f"{out}/vecs.f16.tmp", np.float16, "w+", shape=(total, D_MODEL))
     recs, off = [], 0
-    ctx_hist, w_hist = np.zeros(1025, np.int64), np.zeros(65, np.int64)
+    ctx_hist, w_hist = np.zeros(2049, np.int64), np.zeros(65, np.int64)
     for r, m in enumerate(mans):
         for ch in m["chunks"]:
             c, n = ch["c"], ch["n"]
@@ -256,7 +257,7 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
                     assert rec["vec_idx"] == i
                     rec["vec_idx"] = off + i
                     recs.append(rec)
-                    ctx_hist[min(rec["ctx_len"], 1024)] += 1
+                    ctx_hist[min(rec["ctx_len"], 2048)] += 1
                     w_hist[min(rec["W"], 64)] += 1
             off += n
     assert off == total and len(recs) == total, (off, total, len(recs))
@@ -276,7 +277,9 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
     stats = {
         "kind": "realact sample-and-emit bank: dir = unit(act_L42[p] - mu_acts27b), target = W-token window ENDING at p "
                 "(firing token last), ctx_len = p+1 = tokens the model saw; windows forwarded alone with BOS",
-        "model": MODEL, "layer": READ_LAYER, "d": D_MODEL, "n_examples": total, "families": {"realact": total},
+        "model": MODEL, "layer": READ_LAYER, "d": D_MODEL, "n_examples": total, "families": {(recs[0]["family"] if recs else "realact"): total},
+        "recipe": ("full_document_forward" if mans[0].get("full_forward") else ("standalone_window_full_context_target" if mans[0].get("w_full") else "standalone_window_suffix_target")),
+        "w_full": bool(mans[0].get("w_full", False)), "full_forward": bool(mans[0].get("full_forward", False)), "tail_tokens": mans[0].get("tail_tokens"),
         "ctx_range": mans[0]["ctx_range"], "w_range": mans[0]["w_range"], "seq_len": mans[0]["seq_len"],
         "per_window": mans[0]["per_window"], "world": world, "seed": seed, "dataset": assign.get("dataset"),
         "n_files": assign.get("n_files"), "n_domains": assign.get("n_domains"), "mode": assign.get("mode"),
@@ -303,17 +306,100 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
               cpu=32, memory=192 * 1024)
 def collect(n_examples: int = 20_000_000, out_name: str = "realact_short_20m", batch: int = 64, per_window: int = 8,
             p_lo: int = 8, p_hi: int = 256, w_lo: int = 8, w_hi: int = 32, max_wins: int = 4, chunk_examples: int = 50_000,
-            seed: int = 7, exclude_from: str = "", hf_stream: str = ""):
+            seed: int = 7, exclude_from: str = "", hf_stream: str = "", w_full: bool = False):
     """hf_stream: JSON {"dataset": "openbmb/Ultra-FineWeb", "config": "default", "split": "en", "skip": 3000000} -> ordered
-    document-range streaming instead of the FineFineWeb file assignment (see _run)."""
-    _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from, hf_stream)
+    document-range streaming instead of the FineFineWeb file assignment (see _run). w_full: target = the FULL context of the
+    standalone window (W = ctx_len; precise inversion) instead of a W~U[w_lo,w_hi] window."""
+    _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from, hf_stream, w_full)
 
 
-def _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from, hf_stream=""):
+def _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from, hf_stream="", w_full=False):
     import subprocess
     n = len([ln for ln in subprocess.check_output(["nvidia-smi", "-L"], text=True).splitlines() if ln.strip()])
     _run(out_name, n_examples, world=n, batch=batch, per_window=per_window, p_lo=p_lo, p_hi=p_hi, w_lo=w_lo, w_hi=w_hi,
-         max_wins=max_wins, chunk_examples=chunk_examples, seed=seed, exclude_from=exclude_from, hf_stream=hf_stream)
+         max_wins=max_wins, chunk_examples=chunk_examples, seed=seed, exclude_from=exclude_from, hf_stream=hf_stream, w_full=w_full)
+
+
+def _run_fullctx(out_name: str, n_examples: int, world: int, ctx_lo: int, ctx_hi: int, per_doc: int, batch: int, tail: int,
+                 chunk_examples: int, seed: int, hf_stream: str, family: str):
+    """FULL-DOCUMENT forwards (collect_fullctx_worker.py): each document is forwarded as [BOS] + its first ctx_hi tokens (no window
+    chunking), per_doc positions p with ctx_len = p+1 in [ctx_lo, min(ctx_hi, doc_len)] are sampled, direction = unit(h[p] - mu);
+    target_text = the last `tail` tokens ending at p (for logging / transcripts; the RL reward never reads it). Ordered
+    document-range streaming only (hf_stream). Same shard / manifest / finalize path as _run."""
+    import json
+    import subprocess
+    import sys
+    import threading
+    import time
+
+    out = f"/data/banks/{out_name}"
+    if os.path.exists(f"{out}/build_stats.json"):
+        raise RuntimeError(f"{out}/build_stats.json exists -- bank already finalized; new out_name?")
+    shards = f"{out}/shards"
+    os.makedirs(shards, exist_ok=True)
+    os.environ["HF_HOME"] = "/data/hf_cache"
+    assert os.path.exists(MU_PATH), f"{MU_PATH} missing (acts27b whiten_mu is the suite's realact convention)"
+    assert hf_stream, "collect_fullctx needs hf_stream (ordered document-range streaming)"
+    assign_path = f"{shards}/assignment.json"
+    if os.path.exists(assign_path):
+        assign = json.load(open(assign_path))
+        assert assign.get("world", world) == world, "resume with a different world size is not supported"
+    else:
+        spec = json.loads(hf_stream)
+        assign = {"mode": "hfstream", "dataset": spec["dataset"], "config": spec.get("config"), "split": spec.get("split", "train"),
+                  "skip": int(spec.get("skip", 0)), "shuffle": bool(spec.get("shuffle", False)), "world": world, "seed": seed,
+                  "note": "document-range mode (ordered stream from `skip`, modulo-`world` sharding by document index); FULL-document forwards"}
+        json.dump(assign, open(assign_path, "w"))
+        print(f"[modal] assignment: ORDERED STREAM {assign['dataset']} split={assign['split']} skip={assign['skip']} over {world} ranks; "
+              f"full forwards ctx [{ctx_lo},{ctx_hi}] x {per_doc}/doc, family {family}", flush=True)
+    vol.commit()
+    from huggingface_hub import snapshot_download
+    sys.path.insert(0, "/pmx/helpers")
+    from mxf.config import MODEL
+    snapshot_download(MODEL, allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.txt"])
+    vol.commit()
+    stop = threading.Event()
+
+    def committer():
+        while not stop.wait(300):
+            try:
+                vol.commit()
+            except Exception as e:  # noqa
+                print(f"[modal] periodic commit failed: {e}", flush=True)
+    threading.Thread(target=committer, daemon=True).start()
+    per = [n_examples // world + (1 if r < n_examples % world else 0) for r in range(world)]
+    t0 = time.time()
+    procs = []
+    for r in range(world):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(r)
+        env["PYTHONPATH"] = "/pmx:/pmx/helpers"
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        cmd = [sys.executable, "/pmx/collect_fullctx_worker.py", "--rank", str(r), "--world", str(world), "--n-examples", str(per[r]),
+               "--ctx-lo", str(ctx_lo), "--ctx-hi", str(ctx_hi), "--per-doc", str(per_doc), "--batch", str(batch), "--tail", str(tail),
+               "--chunk-examples", str(chunk_examples), "--seed", str(seed), "--mu", MU_PATH, "--out", shards, "--assignment", assign_path,
+               "--family", family]
+        procs.append(subprocess.Popen(cmd, env=env))
+        time.sleep(2)
+    fails = [r for r, p in enumerate(procs) if p.wait() != 0]
+    stop.set()
+    vol.commit()
+    if fails:
+        raise RuntimeError(f"worker rank(s) {fails} failed -- shards persisted; rerun collect_fullctx (same out_name) to resume")
+    print(f"[modal] all workers done in {(time.time() - t0) / 60:.1f} min -- finalizing", flush=True)
+    _finalize(out, world, n_examples, seed, assign, time.time() - t0)
+    vol.commit()
+
+
+@app.function(image=image, gpu=GPU, volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=86400,
+              cpu=32, memory=192 * 1024)
+def collect_fullctx(n_examples: int, out_name: str, ctx_lo: int = 64, ctx_hi: int = 2048, per_doc: int = 8, batch: int = 4, tail: int = 64,
+                    chunk_examples: int = 50_000, seed: int = 7, hf_stream: str = "", family: str = "realact_fullctx"):
+    """Long-context real-activation rows from FULL-document forwards (see _run_fullctx). e.g. ctx_lo=64 ctx_hi=512 (batch 8) and
+    ctx_lo=513 ctx_hi=2048 (batch 4) for the RL pool's two context buckets."""
+    import subprocess
+    n = len([ln for ln in subprocess.check_output(["nvidia-smi", "-L"], text=True).splitlines() if ln.strip()])
+    _run_fullctx(out_name, n_examples, n, ctx_lo, ctx_hi, per_doc, batch, tail, chunk_examples, seed, hf_stream, family)
 
 
 @app.function(image=image, gpu="B200:8", volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=86400,

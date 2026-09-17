@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--mu", required=True, help="whiten_mu.npy")
     ap.add_argument("--exclude-hashes", default="", help="json file: list of span hashes to skip (eval docs)")
+    ap.add_argument("--w-full", action="store_true", help="target = the FULL context [0..p] of the standalone window (W = ctx_len): "
+                    "re-encoding the target reproduces exactly the tokens that produced the activation (precise inversion)")
     ap.add_argument("--out", required=True, help="shard dir (on the volume)")
     ap.add_argument("--assignment", required=True, help="json from the driver: mode + file slices")
     a = ap.parse_args()
@@ -100,7 +102,7 @@ def main():
         m = {"rank": r, "n_examples_target": a.n_examples, "kept": kept, "chunks": chunks, "reader_state": reader.state(),
              "done": done, "bos_id": int(bos), "mode": assign["mode"], "docs": n_seen_docs, "skipped_docs": n_skipped_docs,
              "norm_drop": n_norm_drop, "norm_median": norm_med, "seq_len": L, "per_window": K,
-             "ctx_range": [a.p_lo, a.p_hi], "w_range": [a.w_lo, a.w_hi]}
+             "ctx_range": [a.p_lo, a.p_hi], "w_range": [a.w_lo, a.w_hi], "w_full": bool(a.w_full), "full_forward": False}
         with open(man_path + ".tmp", "w") as f:
             json.dump(m, f)
         os.replace(man_path + ".tmp", man_path)
@@ -135,13 +137,13 @@ def main():
                     n_norm_drop += 1
                     continue
                 ctx_len = p + 1
-                W = int(rng.integers(a.w_lo, min(a.w_hi, ctx_len) + 1))
+                W = ctx_len if a.w_full else int(rng.integers(a.w_lo, min(a.w_hi, ctx_len) + 1))
                 text = tok.decode(wins[b][p - W + 1 : p + 1], skip_special_tokens=True)
                 if not text.strip():
                     continue
                 vec_buf.append(dirs[b, k])
                 rec_buf.append({"vec_idx": buf_n, "target_text": text, "family": "realact", "ctx_len": ctx_len, "W": W,
-                                "src": f"r{r}_w{n_win + b}"})
+                                "full_ctx": bool(a.w_full), "src": f"r{r}_w{n_win + b}"})
                 buf_n += 1
                 kept += 1
         n_win += B
