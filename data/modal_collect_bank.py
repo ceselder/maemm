@@ -492,6 +492,17 @@ def smoke(n_examples: int = 3000, out_name: str = "realact_short_smoke", batch: 
          chunk_examples=1000, seed=7)
 
 
+@app.function(image=image, timeout=300, cpu=2)
+def code_check():
+    """What worker code THIS deployment mounts (guards against stale mounts): doc_idx occurrences + sha1 of each worker file."""
+    import hashlib
+    out = {}
+    for f in ("/pmx/collect_bank_worker.py", "/pmx/collect_fullctx_worker.py", "/pmx/collect_acts27b_worker.py"):
+        src = open(f).read()
+        out[f] = {"doc_idx": src.count("doc_idx"), "cur_doc_index": src.count("cur_doc_index"), "sha1_12": hashlib.sha1(src.encode()).hexdigest()[:12], "bytes": len(src)}
+    return out
+
+
 @app.function(image=image, volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=1800, cpu=4)
 def peek(out_name: str = "realact_short_smoke", n: int = 6):
     import json
