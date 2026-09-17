@@ -97,6 +97,37 @@ def stage(d, key):
     return key in d and d[key].get("done")
 
 
+def _manifests_done(out_name, world=8):
+    ok = 0
+    for r in range(world):
+        try:
+            m = vol_get_json(f"/banks/{out_name}/shards/manifest_r{r}.json")
+            ok += int(bool(m.get("done")) and int(m.get("kept", 0)) >= int(m.get("n_examples_target", 1)))
+        except Exception:  # noqa
+            pass
+    return ok == world
+
+
+def wait_collect(d, key, out_name, n_examples, seed, poll=120):
+    """Wait for a collection call. If the call FAILED but every rank left a DONE manifest (the interpreter-teardown crash that hit
+    the SFT collection at 03:24Z), publish the bank with maemm-collect-bank-s2m.finalize_only and wait for that instead."""
+    fc = modal.FunctionCall.from_id(d[key]["call"]); t0 = time.time()
+    while True:
+        try:
+            r = fc.get(timeout=0)
+            log(f"{key} DONE after {(time.time() - t0) / 60:.0f} min: {str(r)[:300]}"); return r
+        except TimeoutError:
+            time.sleep(poll)
+        except Exception as e:  # noqa
+            log(f"{key} call FAILED: {type(e).__name__}: {str(e)[:300]}")
+            if d[key].get("finalize_spawned") or not _manifests_done(out_name):
+                discord(f"{key} FAILED and its shards are incomplete — chain paused"); raise SystemExit(1)
+            c = modal.Function.from_name(APPS["collect"], "finalize_only").spawn(out_name=out_name, n_examples=n_examples, seed=seed)
+            d[key]["collect_call"] = d[key]["call"]; d[key]["call"] = c.object_id; d[key]["finalize_spawned"] = now(); save(d)
+            log(f"{key}: all ranks have DONE manifests -> finalize_only spawned {c.object_id}")
+            fc = modal.FunctionCall.from_id(c.object_id)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 d = load()
 log("driver start; stages done: " + ", ".join(k for k in d if isinstance(d[k], dict) and d[k].get("done")))
@@ -104,7 +135,7 @@ log("driver start; stages done: " + ", ".join(k for k in d if isinstance(d[k], d
 # ---- B. SFT mix (exact 50/50) -> SFT + evaluator ----------------------------------------------------------------------
 if not stage(d, "compose_sft"):
     wait_call(d["bank_sae2m_sft"]["call"], "SAE bank sae2m_sft")
-    wait_call(d["coll_sft_ctx8_64"]["call"], "collection ufw_ctx8_64_sft_4m_v3")
+    wait_collect(d, "coll_sft_ctx8_64", "ufw_ctx8_64_sft_4m_v3", 4_000_000, 61)
     st = vol_get_json("/banks/sae2m_sft/build_stats.json"); fam = st["families"]
     n_enc, n_dec = int(fam["sae2m"]), int(fam["sae2m_dec"])
     acts_avail = int(vol_get_json("/banks/ufw_ctx8_64_sft_4m_v3/build_stats.json")["n_examples"])
@@ -152,7 +183,7 @@ if not stage(d, "sft"):
 # ---- C. RL pool (exact thirds) -------------------------------------------------------------------------------------------
 if not stage(d, "compose_rl"):
     wait_call(d["bank_sae2m_rl"]["call"], "SAE bank sae2m_rl")
-    wait_call(d["coll_rl_ctx64_2048"]["call"], "collection ufw_ctx64_2048_rl_500k_v3")
+    wait_collect(d, "coll_rl_ctx64_2048", "ufw_ctx64_2048_rl_500k_v3", 500_000, 62)
     fam = vol_get_json("/banks/sae2m_rl/build_stats.json")["families"]
     n_sae = int(fam["sae2m"]) + int(fam["sae2m_dec"])
     n_avail = int(vol_get_json("/banks/ufw_ctx64_2048_rl_500k_v3/build_stats.json")["n_examples"])
