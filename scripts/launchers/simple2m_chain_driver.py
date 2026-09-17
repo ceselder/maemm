@@ -104,14 +104,14 @@ log("driver start; stages done: " + ", ".join(k for k in d if isinstance(d[k], d
 # ---- B. SFT mix (exact 50/50) -> SFT + evaluator ----------------------------------------------------------------------
 if not stage(d, "compose_sft"):
     wait_call(d["bank_sae2m_sft"]["call"], "SAE bank sae2m_sft")
-    wait_call(d["coll_sft_ctx8_64"]["call"], "collection ufw_ctx8_64_sft_4m")
+    wait_call(d["coll_sft_ctx8_64"]["call"], "collection ufw_ctx8_64_sft_4m_v3")
     st = vol_get_json("/banks/sae2m_sft/build_stats.json"); fam = st["families"]
     n_enc, n_dec = int(fam["sae2m"]), int(fam["sae2m_dec"])
-    acts_avail = int(vol_get_json("/banks/ufw_ctx8_64_sft_4m/build_stats.json")["n_examples"])
+    acts_avail = int(vol_get_json("/banks/ufw_ctx8_64_sft_4m_v3/build_stats.json")["n_examples"])
     n_sae = min(n_enc + n_dec, acts_avail) // 2 * 2                    # even, so enc == dec
     n_acts = n_sae                                                       # EXACT 50/50: activations == SAE rows
-    spec = [{"name": "acts_ufw_sft", "banks": ["/data/banks/ufw_ctx8_64_sft_4m"], "dtype": "f16", "families": ["realact"], "n": n_acts,
-             "all_one_family": "realact", "fresh": "Ultra-FineWeb docs [5.0M, ...) ordered stream; standalone 64-token windows, ctx 8-64, target = FULL context"},
+    spec = [{"name": "acts_ufw_sft", "banks": ["/data/banks/ufw_ctx8_64_sft_4m_v3"], "dtype": "f16", "families": ["realact"], "n": n_acts,
+             "all_one_family": "realact", "fresh": "Ultra-FineWeb docs [5.5M, ...) ordered stream; standalone 64-token windows, ctx 8-64, target = FULL context"},
             {"name": "sae2m_sft", "banks": ["/data/banks/sae2m_sft"], "dtype": "f32", "families": ["sae2m", "sae2m_dec"],
              "n": {"sae2m": n_sae // 2, "sae2m_dec": n_sae // 2},
              "fresh": "2M-SAE SFT feature split (1,847,152 features; eval 100k + RL 150k held out); enc + dec directions x end-anchored max-act windows"}]
@@ -152,14 +152,14 @@ if not stage(d, "sft"):
 # ---- C. RL pool (exact thirds) -------------------------------------------------------------------------------------------
 if not stage(d, "compose_rl"):
     wait_call(d["bank_sae2m_rl"]["call"], "SAE bank sae2m_rl")
-    wait_call(d["coll_rl_ctx64_2048"]["call"], "collection ufw_ctx64_2048_rl_500k")
+    wait_call(d["coll_rl_ctx64_2048"]["call"], "collection ufw_ctx64_2048_rl_500k_v3")
     fam = vol_get_json("/banks/sae2m_rl/build_stats.json")["families"]
     n_sae = int(fam["sae2m"]) + int(fam["sae2m_dec"])
-    n_avail = int(vol_get_json("/banks/ufw_ctx64_2048_rl_500k/build_stats.json")["n_examples"])
+    n_avail = int(vol_get_json("/banks/ufw_ctx64_2048_rl_500k_v3/build_stats.json")["n_examples"])
     n_each = min(n_sae, n_avail)                                         # EVEN split: activations == SAE rows
-    spec = [{"name": "acts_ctx64_2048_rl", "banks": ["/data/banks/ufw_ctx64_2048_rl_500k"], "dtype": "f16", "families": ["realact_ctx64_2048"], "n": n_each,
+    spec = [{"name": "acts_ctx64_2048_rl", "banks": ["/data/banks/ufw_ctx64_2048_rl_500k_v3"], "dtype": "f16", "families": ["realact_ctx64_2048"], "n": n_each,
              "all_one_family": "realact_ctx64_2048",
-             "fresh": "Ultra-FineWeb docs [9.0M, ...) ordered stream; FULL-document forwards (first 2048 tokens), positions uniform, ctx 64-2048"},
+             "fresh": "Ultra-FineWeb docs [9.5M, ...) ordered stream; FULL-document forwards (first 2048 tokens), positions uniform, ctx 64-2048"},
             {"name": "sae2m_rl", "banks": ["/data/banks/sae2m_rl"], "dtype": "f32", "families": ["sae2m", "sae2m_dec"],
              "n": {"sae2m": n_each // 2, "sae2m_dec": n_each - n_each // 2} if n_each < n_sae else None,
              "fresh": "2M-SAE RL feature split (150,000 features; disjoint from SFT and eval); enc + dec"}]
