@@ -212,14 +212,46 @@ def _run(out_name: str, n_examples: int, world: int, batch: int, per_window: int
                "--exclude-hashes", excl_path, "--out", shards, "--assignment", assign_path] + (["--w-full"] if w_full else [])
         procs.append(subprocess.Popen(cmd, env=env))
         time.sleep(2)
-    fails = [r for r, p in enumerate(procs) if p.wait() != 0]
+    rcs = [p.wait() for p in procs]
     stop.set()
     vol.commit()
+    fails = [r for r in range(world) if not _manifest_done(shards, r)]      # success = a DONE manifest on disk, whatever the exit code
+    bad_rc = [r for r, rc in enumerate(rcs) if rc != 0 and r not in fails]
+    if bad_rc:
+        print(f"[modal] rank(s) {bad_rc} exited non-zero AFTER writing a done manifest (teardown crash) -- ignored", flush=True)
     if fails:
         raise RuntimeError(f"worker rank(s) {fails} failed -- shards persisted; rerun run_collect (same out-name) to resume")
     print(f"[modal] all workers done in {(time.time() - t0) / 60:.1f} min -- finalizing", flush=True)
     _finalize(out, world, n_examples, seed, assign, time.time() - t0)
     vol.commit()
+
+
+def _manifest_done(shards: str, r: int) -> bool:
+    import json
+    try:
+        m = json.load(open(f"{shards}/manifest_r{r}.json"))
+        return bool(m.get("done")) and int(m.get("kept", 0)) >= int(m.get("n_examples_target", 1))
+    except Exception:  # noqa
+        return False
+
+
+@app.function(image=image, volumes={"/data": vol}, timeout=8 * 3600, cpu=16, memory=96 * 1024)
+def finalize_only(out_name: str, n_examples: int, seed: int):
+    """Publish a bank whose workers all wrote DONE manifests but whose collect call died afterwards (a rank's interpreter teardown
+    crashed with 'PyGILState_Release ... runtime state: finalizing'): shards -> vecs.f16 + records.jsonl + build_stats.json +
+    doc_ids_used.json (== the tail of _run)."""
+    import json, time
+    vol.reload()
+    out = f"/data/banks/{out_name}"; shards = f"{out}/shards"
+    assign = json.load(open(f"{shards}/assignment.json")); world = int(assign["world"])
+    fails = [r for r in range(world) if not _manifest_done(shards, r)]
+    if fails:
+        raise RuntimeError(f"rank(s) {fails} have no done manifest -- resume the collect first")
+    t0 = time.time()
+    _finalize(out, world, n_examples, seed, assign, float("nan"))
+    vol.commit()
+    st = json.load(open(f"{out}/build_stats.json"))
+    return {"out": out, "n_examples": st["n_examples"], "families": st["families"], "n_docs_used": st.get("n_docs_used"), "finalize_s": time.time() - t0}
 
 
 def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wall_s: float):
@@ -391,9 +423,13 @@ def _run_fullctx(out_name: str, n_examples: int, world: int, ctx_lo: int, ctx_hi
                "--family", family]
         procs.append(subprocess.Popen(cmd, env=env))
         time.sleep(2)
-    fails = [r for r, p in enumerate(procs) if p.wait() != 0]
+    rcs = [p.wait() for p in procs]
     stop.set()
     vol.commit()
+    fails = [r for r in range(world) if not _manifest_done(shards, r)]      # success = a DONE manifest on disk, whatever the exit code
+    bad_rc = [r for r, rc in enumerate(rcs) if rc != 0 and r not in fails]
+    if bad_rc:
+        print(f"[modal] rank(s) {bad_rc} exited non-zero AFTER writing a done manifest (teardown crash) -- ignored", flush=True)
     if fails:
         raise RuntimeError(f"worker rank(s) {fails} failed -- shards persisted; rerun collect_fullctx (same out_name) to resume")
     print(f"[modal] all workers done in {(time.time() - t0) / 60:.1f} min -- finalizing", flush=True)
