@@ -108,6 +108,7 @@ def main():
         os.replace(man_path + ".tmp", man_path)
 
     pending, vec_buf, rec_buf, buf_n, norm_med = [], [], [], 0, None
+    win_doc = {}                                                       # id(window) -> absolute document index (range mode; -1 otherwise)
     n_win = 0
     t0 = time.time()
 
@@ -143,9 +144,11 @@ def main():
                     continue
                 vec_buf.append(dirs[b, k])
                 rec_buf.append({"vec_idx": buf_n, "target_text": text, "family": "realact", "ctx_len": ctx_len, "W": W,
-                                "full_ctx": bool(a.w_full), "src": f"r{r}_w{n_win + b}"})
+                                "full_ctx": bool(a.w_full), "doc_idx": int(win_doc.get(id(wins[b]), -1)), "src": f"r{r}_w{n_win + b}"})
                 buf_n += 1
                 kept += 1
+        for w in wins:
+            win_doc.pop(id(w), None)
         n_win += B
 
     def drain():
@@ -181,6 +184,7 @@ def main():
 
     for text in reader.docs():
         n_seen_docs += 1
+        doc_idx = int(getattr(reader, "cur_doc_index", -1))
         ids = tok(text, add_special_tokens=False, truncation=True, max_length=a.max_wins * L + 8)["input_ids"]
         if len(ids) < a.p_lo:
             continue
@@ -193,6 +197,7 @@ def main():
             if len(w) < a.p_lo:
                 break
             pending.append(w)                                            # short doc tails get their own equal-length batches
+            win_doc[id(w)] = doc_idx
             nw += 1
             if nw >= a.max_wins:
                 break

@@ -156,6 +156,7 @@ class StreamReader:
         # same way). Default (no skip, shuffle=True) keeps the old behaviour.
         self.skip = int(assign.get("skip", 0) or 0)
         self.shuffle = bool(assign.get("shuffle", True))
+        self.cur_doc_index = -1                                 # exact only when shuffle is False (range mode)
         if self.shuffle:
             ds = ds.shuffle(seed=seed, buffer_size=10_000)
         self.docs_seen = (state or {}).get("docs_seen", 0)
@@ -174,6 +175,7 @@ class StreamReader:
             text = row.get("text") or row.get("content") or ""
             if len(text) < 1500:
                 continue
+            self.cur_doc_index = self.skip + idx            # ABSOLUTE single-stream document index (range mode) -> per-row doc_idx
             yield text
 
     def state(self):

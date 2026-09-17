@@ -91,15 +91,15 @@ def main():
     def forward(docs):
         nonlocal buf_n, kept, norm_med, n_norm_drop, n_fwd_docs
         B = len(docs)
-        Lmax = max(len(d) for d in docs)
+        Lmax = max(len(d) for d, _ in docs)
         ids = torch.full((B, Lmax + 1), int(pad), dtype=torch.long, device="cuda:0")
         mask = torch.zeros((B, Lmax + 1), dtype=torch.long, device="cuda:0")
-        for b, d in enumerate(docs):
+        for b, (d, _) in enumerate(docs):
             ids[b, 0] = bos
             ids[b, 1:len(d) + 1] = torch.tensor(d, dtype=torch.long, device="cuda:0")
             mask[b, :len(d) + 1] = 1
         h, _ = read_resid(model, READ_LAYER, {"input_ids": ids, "attention_mask": mask}, pool="all")   # fp32 [B, Lmax+1, d]
-        for b, d in enumerate(docs):
+        for b, (d, doc_idx) in enumerate(docs):
             n = len(d)
             lo, hi = a.ctx_lo - 1, min(a.ctx_hi, n) - 1                     # 0-indexed content positions; ctx_len = p + 1
             cand = np.arange(lo, hi + 1)
@@ -127,14 +127,14 @@ def main():
                     continue
                 vec_buf.append(dirs[k])
                 rec_buf.append({"vec_idx": buf_n, "target_text": text, "family": a.family, "ctx_len": ctx_len, "W": W, "doc_len": n,
-                                "full_forward": True, "src": f"r{r}_d{n_fwd_docs + b}"})
+                                "full_forward": True, "doc_idx": int(doc_idx), "src": f"r{r}_d{n_fwd_docs + b}"})
                 buf_n += 1
                 kept += 1
         n_fwd_docs += B
 
     def run_pending():
         nonlocal pending
-        docs = sorted(pending, key=len)                                     # length-sorted batches -> little padding
+        docs = sorted(pending, key=lambda t: len(t[0]))                     # length-sorted batches -> little padding
         pending = []
         for i in range(0, len(docs), a.batch):
             if kept >= a.n_examples:
@@ -171,7 +171,7 @@ def main():
         if len(ids_) < a.ctx_lo:
             n_short_docs += 1
             continue
-        pending.append(ids_)
+        pending.append((ids_, int(getattr(reader, "cur_doc_index", -1))))
         if len(pending) >= BUF:
             run_pending()
             if buf_n >= a.chunk_examples:

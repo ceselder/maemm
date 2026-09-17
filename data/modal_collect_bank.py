@@ -295,6 +295,16 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
         "wall_s": wall_s, "finalize_s": time.time() - t0, "created": time.time(),
         "files": {"vecs.f16": f"float16 [{total},{D_MODEL}]", "records.jsonl": "shuffled; vec_idx -> row"},
     }
+    # ---- document registry: every Ultra-FineWeb document (absolute single-stream index) that contributed >= 1 row ----
+    doc_ids = sorted({int(rec["doc_idx"]) for rec in recs if int(rec.get("doc_idx", -1)) >= 0})
+    reg = {"bank": out, "dataset": assign.get("dataset"), "config": assign.get("config"), "split": assign.get("split"), "mode": assign.get("mode"),
+           "skip": assign.get("skip"), "doc_range_iterated": (stats.get("hf_stream") or {}).get("doc_range"), "n_docs_used": len(doc_ids),
+           "n_rows": total, "rows_with_doc_idx": int(sum(1 for rec in recs if int(rec.get("doc_idx", -1)) >= 0)),
+           "doc_idx_meaning": "absolute document index in the ordered single stream of dataset/split (0-based); rows carry it as doc_idx",
+           "doc_idx": doc_ids}
+    json.dump(reg, open(f"{out}/doc_ids_used.json", "w"))
+    stats["n_docs_used"] = len(doc_ids)
+    stats["doc_ids_file"] = f"{out}/doc_ids_used.json"
     json.dump(stats, open(f"{out}/build_stats.json", "w"), indent=2)
     shutil.copy(f"{shards}/assignment.json", f"{out}/assignment.json")   # keeps the file list for disjoint follow-up banks
     shutil.rmtree(shards, ignore_errors=True)
