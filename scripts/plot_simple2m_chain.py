@@ -166,7 +166,7 @@ def main():
     claim = (f"A single 8M-row SFT from the base model (50/50 activations of 8-64 tokens of context with full-context targets + 2M-SAE encoder/decoder rows) DECLINES on held-out "
              f"fidelity from {ys[0]:.3f} ({xs[0]:.0f}M rows) to {ys[-1]:.3f} ({xs[-1]:.0f}M) while its train loss keeps falling; full-parameter RL from that final "
              + (f"reaches {best_rl['eval/mean_all']:.3f} at step {best_rl['ckpt_step']} (arm A {next((r['eval/mean_all'] for r in refs['a']['evals'] if r['ckpt_step'] == best_rl['ckpt_step']), float('nan')):.3f} at the same step from a {refs['a']['init_mean_all']:.3f} init)"
-                if best_rl else "is running") + f" — Qwen3.6-27B activation-to-text inverter, 512 held-out directions per family, best-of-4 at T=1" + (f" (RL at step {rl_last_step} of 300)" if rl_last_step and rl_last_step < 300 else ""))
+                if best_rl else "is running") + f" — Qwen3.6-27B activation-to-text inverter, 512 held-out directions per family, best-of-4 at T=1" + (f" (RL at step {rl_last_step} of 300)" if rl_last_step and rl_last_step < 300 and rl_dyn.get("state") == "running" else ""))
     fig.suptitle(wrap(claim, 165), fontsize=10.2, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.87)); savefig(fig, "fidelity_chain")
 
