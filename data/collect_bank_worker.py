@@ -226,6 +226,8 @@ def main():
         raise RuntimeError(f"rank {r}: corpus exhausted at {kept}/{a.n_examples} examples")
     write_manifest(done=True)
     log(r, f"DONE {kept} examples in {len(chunks)} chunks ({(time.time() - t0) / 60:.1f} min)")
+    sys.stdout.flush(); sys.stderr.flush()
+    os._exit(0)          # all shards + the done manifest are on disk (os.replace); skip interpreter teardown, which has crashed finished ranks
 
 
 def _drain_mixed(pending, forward, a, L, done):
