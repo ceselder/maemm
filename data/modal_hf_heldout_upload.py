@@ -30,7 +30,7 @@ REG = "/data/simple2m/doc_registry.json"
 MODEL = "Qwen/Qwen3.6-27B"
 
 
-@app.function(image=image, cpu=16, memory=128 * 1024, ephemeral_disk=256 * 1024, volumes={"/data": vol},
+@app.function(image=image, cpu=16, memory=128 * 1024, ephemeral_disk=524288, volumes={"/data": vol},
               secrets=[modal.Secret.from_name("maemm-hf")], timeout=4 * 3600)
 def publish(repo: str = REPO, private: bool = True, dry: bool = False):
     import json, time
