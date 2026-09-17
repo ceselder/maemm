@@ -37,6 +37,12 @@ REFS = {
     "base": {"run": "rl_fullparam_fft104m_mix5m_8x512", "label": "the .425 arm: midtrain init, 8x512, last-5 reward", "init_run": "sft_mix5msft_midtrain_fft_from_fft104m", "init_step": 671, "color": "#2b6cb0", "ls": ":"},
 }
 THIS_C, SFT_C = "#c0392b", "#c0392b"
+# the three "yolo" RL variants launched 2026-09-17 18:57Z from the SAME SFT final (scripts/launchers/spawn_simple2m_rl_variants.py); equal 16,384 rollouts per step
+VARIANTS = {
+    "v16x1024":              {"run": "rl_simple2m_16x1024_anywin",         "short": "16x1024 whole-span", "label": "variant: 16 prompts x 1,024 rollouts, lr 1e-6, WHOLE-span reward",          "color": "#d98a2b", "ls": (0, (4, 2)), "reward_note": "whole-span reward (comparable to the main arm)"},
+    "v8x2048_last16_lr5e-7": {"run": "rl_simple2m_8x2048_last16_lr5e-7",   "short": "last-16 reward, lr 5e-7", "label": "variant: 8x2048, lr 5e-7, reward on the LAST 16 tokens only",              "color": "#5c8fd6", "ls": (0, (1, 1.5)), "reward_note": "reward = max activation over the last 16 tokens (NOT comparable to whole-span reward)"},
+    "v8x2048_last16_lr1e-6": {"run": "rl_simple2m_8x2048_last16_lr1e-6",   "short": "last-16 reward, lr 1e-6", "label": "variant: 8x2048, lr 1e-6, reward on the LAST 16 tokens only",              "color": "#3f9a4e", "ls": (0, (4, 1.5, 1, 1.5)), "reward_note": "reward = max activation over the last 16 tokens (NOT comparable to whole-span reward)"},
+}
 INK, INK2, GRID = "#2b2b2b", "#6b6b6b", "#e6e2dc"
 COS_FAMS = ["realact", "realact_early", "realact_mid", "realact_long", "indist_realact", "indist_long", "bsf", "cluster", "indist_probe", "jlens"]
 FIRE = [("eval/sae/fired", "131k SAE features fired (gate)"), ("eval/sae2m_enc/fired", "held-out 2M-SAE ENCODER dirs fired"),
@@ -95,7 +101,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--no-html", action="store_true"); ap.add_argument("--no-mirror", action="store_true"); a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True); (OUT / "data").mkdir(exist_ok=True)
     if not a.no_mirror:
-        mirror([f"sft_{SFT_RUN}", RL_RUN])
+        mirror([f"sft_{SFT_RUN}", RL_RUN] + [V["run"] for V in VARIANTS.values()])
     ids = json.load(open(IDS)); registry = json.load(open(REGISTRY)) if REGISTRY.exists() else None
     sft = evals(f"sft_{SFT_RUN}"); rl = evals(RL_RUN)
     refs = {}
@@ -103,6 +109,20 @@ def main():
         ev = evals(R["run"]); init = [r for r in evals(R["init_run"]) if r["ckpt_step"] == R["init_step"]]
         refs[k] = {**R, "evals": ev, "init_mean_all": init[0]["eval/mean_all"] if init else None}
     sft_final = sft[-1] if sft else None
+    var_ids = ids.get("rl_variants", {})
+    variants = {}
+    for k, V in VARIANTS.items():
+        wid = var_ids.get(k, {}).get("wandb")
+        dyn = wandb_series(wid, ["reward/mean", "policy/entropy", "grad_norm", "policy/sampler_abs_dlogp", "ratio/clipfrac", "rollout/len_mean", "time/step_s"]) if wid else None
+        if dyn is None:  # wandb id not recorded: look the run up by display name
+            try:
+                import wandb as _w
+                rs = list(_w.Api().runs(PROJ, filters={"display_name": V["run"]}))
+                if rs:
+                    dyn = wandb_series(rs[-1].id, ["reward/mean", "policy/entropy", "grad_norm", "policy/sampler_abs_dlogp", "ratio/clipfrac", "rollout/len_mean", "time/step_s"])
+            except Exception as e:  # noqa
+                print(f"[variants] wandb lookup failed for {V['run']}: {e}")
+        variants[k] = {**V, "evals": evals(V["run"]), "dyn": dyn, "ids": var_ids.get(k, {}), "last_train_step": max(dyn["step"]) if dyn and dyn["step"] else None}
     fetched = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     sft_dyn = wandb_series(SFT_WANDB, ["loss", "lr", "ex_per_s"])
     rl_dyn = wandb_series(RL_WANDB, ["reward/mean", "policy/entropy", "grad_norm", "policy/sampler_abs_dlogp", "ratio/clipfrac", "rollout/len_mean", "time/step_s",
@@ -130,10 +150,14 @@ def main():
         if not R["evals"]: continue
         xx = [0] + [r["ckpt_step"] for r in R["evals"]]; yy = [R["init_mean_all"]] + [r["eval/mean_all"] for r in R["evals"]]
         ax2.plot(xx, yy, ls=R["ls"], marker="s", ms=3.6, lw=1.4, color=R["color"], label=R["label"], alpha=0.95)
+    for k, V in variants.items():
+        if not V["evals"] or not sft_final: continue
+        xx = [0] + [r["ckpt_step"] for r in V["evals"]]; yy = [sft_final["eval/mean_all"]] + [r["eval/mean_all"] for r in V["evals"]]
+        ax2.plot(xx, yy, ls=V["ls"], marker="D", ms=3.8, lw=1.5, color=V["color"], label=V["label"], zorder=4)
     ax2.set_xlabel("RL step (16,384 rollouts per step for the 8x2048 arms, 4,096 for 8x512; step 0 = the SFT init)"); ax2.grid(color=GRID, lw=0.6)
     ax2.set_xlim(-8, max(320, (max(rx) if rx else 300) + 20))
     ax2.set_title("RL repairs it and passes the midtrain-init arms at matched steps", fontsize=10, loc="left")
-    ax2.legend(loc="lower right", fontsize=7.6, frameon=False)
+    ax2.legend(loc="lower right", fontsize=7.0, frameon=False)
     ax1.legend(loc="upper right", fontsize=7.6, frameon=False)
     ymin = min([min(ys)] + [min(r["eval/mean_all"] for r in R["evals"]) for R in refs.values() if R["evals"]] + [R["init_mean_all"] for R in refs.values() if R["init_mean_all"]]) - 0.02
     ax1.set_ylim(ymin, 0.45)
@@ -203,11 +227,40 @@ def main():
         fig.suptitle(wrap(f"SFT overfits its own distribution: train NLL falls {np.nanmean(v[:20]):.2f} -> {np.nanmean(v[-20:]):.2f} while held-out fidelity falls {ys[0]:.3f} -> {ys[-1]:.3f} (8M rows, one epoch, lr 1e-5, batch 4,096, full fine-tune of Qwen3.6-27B)", 130), fontsize=10, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.9)); savefig(fig, "sft_loss")
 
+    # ---------------- RL variants: same SFT init, different batch shape / reward window / lr ----------------
+    if any(V["evals"] for V in variants.values()):
+        fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.2))
+        arms = [("main", {"run": RL_RUN, "short": "main arm (8x2048 whole-span)", "label": "main arm: 8x2048, lr 1e-6, whole-span reward", "color": THIS_C, "ls": "-", "evals": rl, "dyn": rl_dyn})] + list(variants.items())
+        for k, V in arms:
+            if not V["evals"]: continue
+            xx = [0] + [r["ckpt_step"] for r in V["evals"]]
+            axes[0].plot(xx, [sft_final["eval/mean_all"]] + [r["eval/mean_all"] for r in V["evals"]], ls=V["ls"], marker="o", ms=4.5, lw=2 if k == "main" else 1.6, color=V["color"], label=V["label"])
+            if k == "main":
+                for x, y in zip(xx[1:], [r["eval/mean_all"] for r in V["evals"]]): axes[0].annotate(f"{y:.3f}", (x, y), xytext=(0, 6), textcoords="offset points", ha="center", fontsize=7, color=V["color"])
+            axes[1].plot(xx, [sft_final.get("eval/sae2m_enc/fired", np.nan)] + [r.get("eval/sae2m_enc/fired", np.nan) for r in V["evals"]], ls=V["ls"], marker="o", ms=4, lw=1.6, color=V["color"], label=f"{V['short']}: encoder")
+            axes[1].plot(xx, [sft_final.get("eval/sae2m_dec/fired", np.nan)] + [r.get("eval/sae2m_dec/fired", np.nan) for r in V["evals"]], ls=V["ls"], marker="s", ms=3.5, lw=1.0, color=V["color"], alpha=0.6, label=f"{V['short']}: decoder")
+            if V["dyn"] and V["dyn"]["step"]:
+                st = np.array(V["dyn"]["step"]); ev = np.array([np.nan if x is None else x for x in V["dyn"]["policy/entropy"]], float)
+                if len(ev) >= 10: ker = np.ones(10) / 10; axes[2].plot(st[9:], np.convolve(np.nan_to_num(ev, nan=np.nanmean(ev)), ker, mode="valid"), ls=V["ls"], lw=1.7, color=V["color"], label=V["short"])
+        a_ev = refs["a"]["evals"]
+        if a_ev: axes[0].plot([r["ckpt_step"] for r in a_ev], [r["eval/mean_all"] for r in a_ev], ls="-", marker="s", ms=3, lw=1.1, color=refs["a"]["color"], alpha=0.8, label="reference: arm A (midtrain init, last-5 reward)")
+        axes[0].set_title("held-out fidelity (mean_all) per checkpoint", fontsize=10, loc="left"); axes[0].set_ylabel("mean cosine over 10 held-out direction families"); axes[0].legend(fontsize=7, frameon=False, loc="lower right")
+        axes[1].set_title("held-out 2M-SAE features fired (encoder = circles, decoder = squares)", fontsize=10, loc="left"); axes[1].set_ylabel("fraction of 512 held-out features above the gate"); axes[1].legend(fontsize=6.8, frameon=False, loc="upper left", ncol=2); axes[1].set_ylim(0, 0.62)
+        axes[2].set_title("policy entropy (10-step mean)", fontsize=10, loc="left"); axes[2].set_ylabel("entropy (nats / token)"); axes[2].legend(fontsize=7, frameon=False)
+        for ax in axes: ax.grid(color=GRID, lw=0.6); ax.set_xlabel("RL step (16,384 rollouts per step in every arm; step 0 = the shared SFT init)")
+        prog = ", ".join(f"{V['short']} at step {V['last_train_step']}" for k, V in variants.items() if V["last_train_step"])
+        fig.suptitle(wrap("Four RL runs from the SAME SFT init: the main arm (8 prompts x 2,048 rollouts, whole-span reward, lr 1e-6) vs 16x1,024 prompts/rollouts, and vs rewarding only the last 16 generated tokens at lr 5e-7 / 1e-6 "
+                          "— at matched steps 16x1024 tracks the main arm exactly, last-16 at lr 1e-6 matches on mean_all but fires fewer held-out 2M features, last-16 at lr 5e-7 lags; entropy falls fastest in the last-16 lr 1e-6 arm"
+                          + (f" (in progress: {prog})" if prog else ""), 165), fontsize=10.2, x=0.01, ha="left")
+        fig.tight_layout(rect=(0, 0, 1, 0.88)); savefig(fig, "rl_variants")
+
     # ---------------- data ----------------
     dd = OUT / "data"
     json.dump({"generated_at": fetched, "run": SFT_RUN, "wandb": SFT_WANDB, "eff_batch": EFF_BATCH, "rows_per_ckpt": {r["ckpt_step"]: r["ckpt_step"] * EFF_BATCH for r in sft}, "evals": sft}, open(dd / "sft_evals.json", "w"), indent=1)
     json.dump({"generated_at": fetched, "run": RL_RUN, "wandb": RL_WANDB, "init": sft_final, "evals": rl, "best": best_rl, "last_train_step": rl_last_step}, open(dd / "rl_evals.json", "w"), indent=1)
     json.dump({"generated_at": fetched, "arms": {k: {kk: vv for kk, vv in R.items() if kk not in ("ls",)} for k, R in refs.items()}}, open(dd / "reference_arms.json", "w"), indent=1)
+    json.dump({"generated_at": fetched, "shared_init": sft_final, "variants": {k: {kk: vv for kk, vv in V.items() if kk not in ("ls", "dyn")} for k, V in variants.items()},
+               "dynamics": {k: V["dyn"] for k, V in variants.items() if V["dyn"]}}, open(dd / "rl_variants.json", "w"), indent=1, default=str)
     if rl_dyn: json.dump({"generated_at": fetched, **rl_dyn}, open(dd / "rl_dynamics.json", "w"), indent=1)
     if sft_dyn: json.dump({"generated_at": fetched, **sft_dyn}, open(dd / "sft_loss.json", "w"), indent=1)
     comp = {"sft_mix": ids.get("compose_sft", {}), "rl_pool": ids.get("compose_rl", {}), "feature_split": ids.get("feature_split"), "doc_ranges": ids.get("doc_ranges"),
@@ -222,6 +275,8 @@ def main():
             "sft_best": max(sft, key=lambda r: r["eval/mean_all"])["ckpt_step"] if sft else None, "rl_curve": [(r["ckpt_step"], round(r["eval/mean_all"], 4)) for r in rl],
             "rl_best": best_rl, "rl_last_train_step": rl_last_step, "rl_state": rl_dyn["state"] if rl_dyn else None, "matched_step_mean_all": matched,
             "ref_inits": {k: R["init_mean_all"] for k, R in refs.items()},
+            "variants": {k: {"run": V["run"], "curve": [(r["ckpt_step"], round(r["eval/mean_all"], 4)) for r in V["evals"]], "last_train_step": V["last_train_step"],
+                             "heldout_2m": {r["ckpt_step"]: {kk: r.get(kk) for kk in ("eval/sae2m_enc/fired", "eval/sae2m_dec/fired")} for r in V["evals"]}} for k, V in variants.items()},
             "heldout_2m": {"sft_final": {k: sft_final.get(k) for k in ("eval/sae2m_enc/fired", "eval/sae2m_dec/fired", "eval/sae2m_enc/norm_act", "eval/sae2m_dec/norm_act")} if sft_final else None,
                            "rl": {r["ckpt_step"]: {k: r.get(k) for k in ("eval/sae2m_enc/fired", "eval/sae2m_dec/fired", "eval/sae2m_enc/norm_act", "eval/sae2m_dec/norm_act")} for r in rl}}}
     json.dump(summ, open(dd / "summary.json", "w"), indent=1, default=str)
