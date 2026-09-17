@@ -131,10 +131,13 @@ def _load_refs(eval_cache, pool_heldout, dev):
 def build(out_name: str = "sae2m_bank", ae: str = AE_DEFAULT, maxacts: str = MAXACTS_DEFAULT, windows_per_feature: int = 3, min_tok: int = 8,
           max_rows_per_family: int = 3_000_000, seed: int = 2026, overwrite: bool = False, anchor_batch: int = 512, anchor_rule: str = "last",
           skip_anchor: bool = False, eval_cache: str = EVAL_CACHE_V2, pool_heldout: str = POOL_HELDOUT, sae131k: str = SAE131K,
-          overlap_flag_frac: float = 0.01, max_features: int = 0):
+          overlap_flag_frac: float = 0.01, max_features: int = 0, feature_split: str = "", split_key: str = ""):
     """max_rows_per_family caps the number of WINDOWS (= rows per family; total rows = 2x). max_features > 0: only the first
-    max_features feature ids are considered (debug). skip_anchor=True keeps every roundtrip-valid window (debug only)."""
-    import glob, json, shutil, sys, time
+    max_features feature ids are considered (debug). skip_anchor=True keeps every roundtrip-valid window (debug only).
+    feature_split + split_key: an .npz of disjoint sorted int feature-id arrays (e.g. /data/sae2m/feature_split.npz with keys
+    eval / rl / sft); ONLY the features under split_key are eligible (the others are treated as dead), and the arrays are
+    asserted disjoint so a bank can never contain a held-out feature."""
+    import glob, hashlib, json, shutil, sys, time
     import numpy as np
     import torch
     import torch.nn.functional as F
@@ -187,6 +190,24 @@ def build(out_name: str = "sae2m_bank", ae: str = AE_DEFAULT, maxacts: str = MAX
     if max_features and max_features > 0:
         keep_f = np.zeros(Fd, bool); keep_f[:max_features] = True
         fire = np.where(keep_f, fire, 0)
+    split_info = None
+    if feature_split:
+        assert split_key, "feature_split needs split_key (a key of the npz, e.g. eval | rl | sft)"
+        sp = np.load(feature_split)
+        assert split_key in sp.files, (split_key, sp.files)
+        allowed = np.asarray(sp[split_key], np.int64)
+        others = {k: np.asarray(sp[k], np.int64) for k in sp.files if k != split_key}
+        assert allowed.size and allowed.min() >= 0 and allowed.max() < Fd and len(np.unique(allowed)) == len(allowed), "bad split ids"
+        for k, o in others.items():
+            assert np.intersect1d(allowed, o).size == 0, f"feature split {split_key} overlaps {k}"
+        n_live_before = int(live_mask(max_acts, fire, thr_ma).sum())
+        keep_f = np.zeros(Fd, bool); keep_f[allowed] = True
+        fire = np.where(keep_f, fire, 0)
+        split_info = {"path": feature_split, "key": split_key, "n_allowed": int(len(allowed)), "n_live_before_split": n_live_before,
+                      "other_keys": {k: int(len(o)) for k, o in others.items()},
+                      "npz_sha256_16": hashlib.sha256(open(feature_split, "rb").read()).hexdigest()[:16]}
+        log(f"feature split {feature_split}[{split_key}]: {len(allowed)} eligible features (others {split_info['other_keys']} excluded; "
+            f"live before split {n_live_before})")
     live = live_mask(max_acts, fire, thr_ma)
     cand = candidate_mask(max_acts, lengths, thr_ma, min_tok) & live[:, None]
     from transformers import AutoTokenizer
@@ -411,7 +432,7 @@ def build(out_name: str = "sae2m_bank", ae: str = AE_DEFAULT, maxacts: str = MAX
              "sae": {"ae": ae, "F": int(Fd), "d": int(d), "k": k_sae, "threshold": thr, "bytes": os.path.getsize(ae)},
              "maxacts": {"path": maxacts, "N": int(N_st), "L": int(L_win), "pad_id": pad_id, "threshold": thr_ma, "meta": ma_meta,
                          "live_features": n_live, "dead_features": int(Fd - n_live), "candidate_windows": int(n_cand)},
-             "selection": {"windows_per_feature": K, "min_tok": min_tok, "max_rows_per_family": int(max_rows_per_family), "max_features_debug": int(max_features),
+             "selection": {"windows_per_feature": K, "min_tok": min_tok, "max_rows_per_family": int(max_rows_per_family), "max_features_debug": int(max_features), "feature_split": split_info,
                            "roundtrip": rt_stats, "breadth_first": sel_info, "selected_windows": int(n_sel),
                            "coverage_hist_selected_live_features": live_cov_sel, "coverage_hist_final_live_features": live_cov_final,
                            "features_in_bank": int(nU), "n_tok_hist_final": {str(int(a)): int(b) for a, b in zip(*np.unique(n_tok_final, return_counts=True))} if len(n_tok_final) else {}},
