@@ -36,7 +36,7 @@ RL_RECIPE = ("--recipe scalerl --loss cispo --cispo-eps-max 5 --loss-agg prompt 
              "--max-lag 2 --fp32-head --autocast-bf16 --length-control penalty --kl-coef 0 --entropy-coef 0 --entropy-target 0 --groups-per-step 2048 "
              "--group-size 8 --warmup-steps 25 --len-penalty-start 8 --len-penalty-per-tok 0.00025 --max-new-tokens 192 --reward-window-last 0 "
              "--prefix-cache --score-length-bucket --cuda-graphs --max-num-seqs 512 --rollout-block-groups 32 --save-every 0 --transcript-every 5 "
-             "--lr 1e-6 --save-steps 25,50,100,150,200,250,300")
+             "--lr 1e-6 --save-steps 25,50,100,150,200,250,300 --eval-cache " + V3)   # inline eval on cache v3 too
 RL_STEPS = 300
 
 
