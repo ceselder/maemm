@@ -527,7 +527,7 @@ def main():
         json.dump({"ckpt_step": s, "ckpt": ck, **extras, "metrics": row, "n_lora_tensors": n_t, "protocol": {
             "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]), "bo": a.eval_bo, "temp": a.eval_temp,
             "min_new": a.eval_min_new, "max_new": a.eval_max_new, "eval_cache": a.eval_cache,
-            "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "full_model": a.full_model,
+            "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "sae_slice_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("sfams", [])}, "full_model": a.full_model,
             "policy_base": policy_base or MODEL, "hnorm_adapter_on": hnorm_on,
             "mlp_stats": a.mlp_stats if EV.get("mlp_stats") else None, "mlp_chance_acts": EV.get("mlp_chance_acts"),
             "injection_check": chk}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
@@ -535,7 +535,7 @@ def main():
             json.dump({"ckpt_step": s, "ckpt": ck, "tag": a.tag, **extras, "protocol": {
                 "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]), "bo": a.eval_bo, "temp": a.eval_temp,
                 "min_new": a.eval_min_new, "max_new": a.eval_max_new, "eval_cache": a.eval_cache, "sae_fire": EV["EU"].SAE_FIRE,
-                "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "full_model": a.full_model,
+                "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "sae_slice_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("sfams", [])}, "full_model": a.full_model,
                 "policy_base": policy_base or MODEL, "mlp_stats": a.mlp_stats if EV.get("mlp_stats") else None,
                 "mlp_chance_acts": EV.get("mlp_chance_acts")}, "aggregates": {k: v for k, v in ev.items() if k.startswith("eval/")},
                 "perdir": perdir}, open(f"{a.out_dir}/perdir_ckpt_{s}.json", "w"))

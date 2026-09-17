@@ -122,6 +122,86 @@ def extra_families(eval_sets):
     return list(eval_sets["meta"].get(EXTRA_FAMS_KEY, []))
 
 
+# SAE-SLICE families (eval cache v3, eval/modal_build_eval_v3.py): held-out features of a SECOND SAE (the 2,097,152-feature
+# layer-42 SAE /data/sae2m/trainer_0/ae.pt) whose full encoder (21.5 GB bf16) is never loaded by an evaluator. The cache ships,
+# per family <fam>, <fam>_dirs [n, d] (unit ENCODER columns for "sae2m_enc", unit DECODER rows for "sae2m_dec" -- the SAME held-out
+# features), <fam>_feats [n] (feature ids) and <fam>_corpus_peak [n] (top activation over the 1.0B-token max-acts scan), plus ONE
+# shared eval_sets["sae_slice"] = {feats [m] sorted, W_enc [d, m], b_enc [m], b_dec [d], threshold, F, ae} holding just the eval
+# features' encoder columns. Scoring == the 131k "sae" family (relu((h - b_dec) . W_enc[:, f] + b_enc[f]), max over kept tokens,
+# best-of-bo): eval/<fam>/{cos, norm_act, fired, beat_corpus, unverbalized_frac, unverbalized_p10, gate}; "fired" = the 2M SAE's
+# own learned gate. No cross-feature rank metrics (they need every column). NEVER in eval/mean_all (cache comparability).
+SLICE_FAMS_KEY = "sae_slice_families"
+SLICE_KEY = "sae_slice"
+
+
+def slice_families(eval_sets):
+    """SAE-slice families present in an eval-set cache — [] for v1/v2 caches."""
+    return list(eval_sets["meta"].get(SLICE_FAMS_KEY, []))
+
+
+class SliceSAE:
+    """Encoder columns of a subset of features of a (huge) BatchTopK SAE, exposing BatchTopKSAE.encode_features so
+    score_sae_peaks scores it unchanged. Feature ids are the FULL SAE's ids; the slice maps them to columns."""
+
+    def __init__(self, feats, W_enc, b_enc, b_dec, threshold, F, device):
+        self.feats = torch.as_tensor(feats, dtype=torch.long).cpu()            # sorted [m]
+        assert bool((self.feats[1:] > self.feats[:-1]).all()), "slice feats must be sorted and unique"
+        self.W_enc = torch.as_tensor(W_enc).float().to(device)                 # [d, m]
+        self.b_enc = torch.as_tensor(b_enc).float().to(device)                 # [m]
+        self.b_dec = torch.as_tensor(b_dec).float().to(device)                 # [d]
+        self.threshold = float(threshold); self.d_sae = int(F); self.d_in = int(self.W_enc.shape[0])
+        assert self.W_enc.shape[1] == len(self.feats) == len(self.b_enc), (self.W_enc.shape, len(self.feats), len(self.b_enc))
+
+    def cols(self, feature_ids):
+        f = torch.as_tensor(feature_ids, dtype=torch.long).cpu()
+        pos = torch.searchsorted(self.feats, f)
+        assert bool((pos < len(self.feats)).all()) and bool((self.feats[pos.clamp(max=len(self.feats) - 1)] == f).all()), \
+            "feature id not in the SAE slice"
+        return pos.to(self.W_enc.device)
+
+    def encode_features(self, acts_BLD, feature_ids):
+        idx = self.cols(feature_ids)
+        return torch.relu((acts_BLD.to(self.W_enc.dtype) - self.b_dec) @ self.W_enc[:, idx] + self.b_enc[idx])
+
+
+def load_sae_slice(eval_sets, device):
+    """The cache's sae_slice dict -> SliceSAE on `device` (None when the cache has no slice families)."""
+    if not slice_families(eval_sets):
+        return None
+    sl = eval_sets[SLICE_KEY]
+    return SliceSAE(sl["feats"], sl["W_enc"], sl["b_enc"], sl["b_dec"], sl["threshold"], sl["F"], device)
+
+
+def slice_metrics(fam, best_act, corpus_peak, gate):
+    """The sae-family firing metrics for a slice family: best_act / corpus_peak np [n], gate = that SAE's learned threshold."""
+    best = np.asarray(best_act, np.float64); cp = np.asarray(corpus_peak, np.float64)
+    na = best / np.maximum(cp, 1e-6)
+    out = {f"eval/{fam}/norm_act": float(na.mean()), f"eval/{fam}/fired": float(np.mean(best > gate)),
+           f"eval/{fam}/beat_corpus": float(np.mean(best > cp)), f"eval/{fam}/unverbalized_frac": float(np.mean(best <= gate)),
+           f"eval/{fam}/unverbalized_p10": float(np.mean(na < 0.10)), f"eval/{fam}/gate": float(gate),
+           f"eval/{fam}/best_act_mean": float(best.mean())}
+    out[f"eval/all/{fam}_norm_act"] = out[f"eval/{fam}/norm_act"]; out[f"eval/all/{fam}_unverbalized"] = out[f"eval/{fam}/unverbalized_frac"]
+    return out
+
+
+@torch.no_grad()
+def eval_sae_slice_family(tag, dirs_unit, feats, slice_sae, actor, tok, prompt_ids, marker, sub, dev,
+                          bo, temp, max_new, min_new, gen_chunk, keep_texts=False):
+    """Slice family: best-of-bo max-token target-feature act (via the slice) AND best-of-bo max-token cosine to the injected
+    direction. Returns (best_act np [N], best_cos np [N]) (+ best-by-act sample texts when keep_texts)."""
+    n = len(feats)
+    best = np.full(n, -1e9); best_cos = np.full(n, -1e9); best_txt = [""] * n
+    for rows, texts in _gen_batches(tag, dirs_unit, actor, tok, prompt_ids, marker, sub, dev, bo, temp, max_new, min_new, gen_chunk):
+        acts, _ = score_sae_peaks(texts, [feats[i] for i in rows], slice_sae, actor, tok, dev)
+        rdirs = F.normalize(torch.stack([dirs_unit[i] for i in rows]), dim=-1)
+        cos = score_probe_cos(texts, rdirs, actor, tok, dev).numpy().astype(np.float64)
+        np.maximum.at(best_cos, rows, cos)
+        for j, i in enumerate(rows):
+            if acts[j].item() > best[i]:
+                best[i] = acts[j].item(); best_txt[i] = texts[j]
+    return (best, best_cos, best_txt) if keep_texts else (best, best_cos)
+
+
 # ---------------------------------------------------------------------------------------------
 # scoring (protocol identical to SL/eval_dirs.py; duplicated so this module imports standalone)
 # ---------------------------------------------------------------------------------------------
@@ -853,6 +933,19 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
                         cm, cpd = mlp_chance_metrics(fam, ch, k)
                         out.update(cm)
                         pd["extra"][fam]["chance"] = cpd
+            # SAE-slice families (cache v3: held-out features of the 2M SAE, encoder + decoder directions): NOT in mean_all
+            sfams = slice_families(eval_sets)
+            if sfams:
+                sl = load_sae_slice(eval_sets, dev)
+                pd["slice"] = {}
+                for fam in sfams:
+                    feats_f = [int(f) for f in eval_sets[f"{fam}_feats"]]
+                    res = eval_sae_slice_family(fam, eval_sets[f"{fam}_dirs"], feats_f, sl, *gen_args, keep_texts=per_dir)
+                    cp_f = eval_sets[f"{fam}_corpus_peak"].numpy().astype(np.float64)
+                    out[f"eval/{fam}/cos"] = float(res[1].mean())
+                    out.update(slice_metrics(fam, res[0], cp_f, sl.threshold))
+                    pd["slice"][fam] = {"feature": feats_f, "best_act": res[0].tolist(), "corpus_peak": cp_f.tolist(), "cos": res[1].tolist(),
+                                        "fired": (res[0] > sl.threshold).astype(int).tolist(), **({"best_text": res[2]} if per_dir else {})}
     finally:
         if was_training:
             actor.train()
@@ -866,7 +959,7 @@ def run_eval(actor, tok, prompt_ids, marker, sub, eval_sets, sae, bo, temp, max_
                                           if f not in CONTROL_FAMS]))
     # headline mirror group — one wandb panel with every family side by side
     # legacy mode: probe/jlens/cluster/random/realact _cos; held-out mode: bsf replaces probe
-    for fam in fams + xfams:
+    for fam in fams + xfams + slice_families(eval_sets):
         out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
     out["eval/all/sae_norm_act"] = out["eval/sae/norm_act"]
     out["eval/all/sae_unverbalized"] = out["eval/sae/unverbalized_frac"]

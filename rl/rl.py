@@ -493,6 +493,11 @@ def load_eval_assets(a, device, is_main):
         for fam in xfams:
             for suf in ("_dirs", "_neuron", "_polarity", "_corpus_max"):
                 assert f"{fam}{suf}" in es, f"eval cache lacks {fam}{suf}"
+        sfams = EU.slice_families(es)   # cache v3: held-out 2M-SAE features (enc + dec dirs) scored through an encoder SLICE, NEVER in mean_all
+        for fam in sfams:
+            for suf in ("_dirs", "_feats", "_corpus_peak"):
+                assert f"{fam}{suf}" in es, f"eval cache lacks {fam}{suf}"
+        assert not sfams or EU.SLICE_KEY in es, f"eval cache lists slice families {sfams} but has no {EU.SLICE_KEY}"
         if a.eval_n_per_family > 0:   # cost control: first n rows of every family (frozen order -> same subset every ckpt)
             n = a.eval_n_per_family
             for fam in fams:
@@ -502,8 +507,15 @@ def load_eval_assets(a, device, is_main):
                     es[f"{fam}{suf}"] = es[f"{fam}{suf}"][:n]
             es["sae_dirs"], es["sae_feats"] = es["sae_dirs"][:n], list(es["sae_feats"])[:n]
             es["corpus_peak"] = es["corpus_peak"][:n]
+            for fam in sfams:
+                es[f"{fam}_dirs"], es[f"{fam}_corpus_peak"] = es[f"{fam}_dirs"][:n], es[f"{fam}_corpus_peak"][:n]
+                es[f"{fam}_feats"] = list(es[f"{fam}_feats"])[:n]
         ev = {"EU": EU, "es": es, "sae": sae, "fams": fams, "xfams": xfams, "feats": list(es["sae_feats"]),
-              "cp": es["corpus_peak"].numpy().astype(np.float64), "mlp_stats": None, "mlp_chance_acts": None}
+              "cp": es["corpus_peak"].numpy().astype(np.float64), "mlp_stats": None, "mlp_chance_acts": None,
+              "sfams": sfams, "slice": EU.load_sae_slice(es, device) if sfams else None}
+        if sfams and is_main:
+            print(f"[inline-eval] SAE-slice families {sfams}: n={[len(es[f + '_dirs']) for f in sfams]}, slice {len(ev['slice'].feats)} cols of "
+                  f"F={ev['slice'].d_sae}, gate {ev['slice'].threshold:.4f} ({es[EU.SLICE_KEY].get('ae')})", flush=True)
         # cross-neuron RANK metrics of the extra (mlp) families (eval_universal.score_mlp_rank): need the corpus stats of EVERY
         # layer-42 neuron (--mlp-stats; the trainer leaves it '' = off, eval_ckpt_daemon defaults it on when the file exists)
         mlp_stats = getattr(a, "mlp_stats", "") or ""
@@ -624,6 +636,22 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
                     EV["_mlp_chance_local"][key] = EU.mlp_chance_rows(fam, fi, es, stats, actor, tok, device, EV["mlp_chance_acts"],
                                                                       range(rank, len(du), world), bo, a.eval_min_new, a.eval_max_new)
                 local[key] = EV["_mlp_chance_local"][key]
+        # SAE-slice families (cache v3: held-out 2M-SAE features, enc + dec directions): best-of-bo target-feature act through the
+        # encoder slice (the sae-family scorer) + best-of-bo max-token cosine; NOT in mean_all
+        for fam in EV.get("sfams", []):
+            du = es[f"{fam}_dirs"]; feats_f = es[f"{fam}_feats"]
+            rows, texts = gen(du)
+            local[fam], local[f"{fam}_act"] = {}, {}
+            if rows:
+                rr = [i for i in rows for _ in range(bo)]
+                rd = F.normalize(torch.stack([du[i] for i in rr]).float(), dim=-1)
+                cos = EU.score_probe_cos(texts, rd, actor, tok, device).view(len(rows), bo).max(1).values
+                acts, _ = EU.score_sae_peaks(texts, [int(feats_f[i]) for i in rr], EV["slice"], actor, tok, device)
+                best, arg = acts.view(len(rows), bo).max(1)
+                local[fam] = {int(i): float(c) for i, c in zip(rows, cos.tolist())}
+                local[f"{fam}_act"] = {int(i): float(v) for i, v in zip(rows, best.tolist())}
+                if per_dir:
+                    local[f"{fam}_text"] = {int(i): texts[j * bo + int(arg[j])] for j, i in enumerate(rows)}
     except Exception as e:  # noqa
         local = {"error": f"rank{rank}: {type(e).__name__}: {str(e)[:300]}"}
     gathered = [None] * world
@@ -687,12 +715,26 @@ def inline_eval(llm, actor, submodule, tok, prompt_ids, marker, a, device, ckpt_
             if merged.get(f"{fam}_chance"):
                 cm, chance_pd[fam] = EU.mlp_chance_metrics(fam, merged[f"{fam}_chance"], k)
                 out.update(cm)
+    slice_pd = {}
+    for fam in EV.get("sfams", []):   # cache v3 SAE-slice families (after mean_all: never part of it)
+        idx = sorted(merged[fam])
+        out[f"eval/{fam}/cos"] = float(np.mean([merged[fam][i] for i in idx]))
+        best_f = np.array([merged[f"{fam}_act"][i] for i in idx], dtype=np.float64)
+        cp_f = es[f"{fam}_corpus_peak"].numpy().astype(np.float64)[idx]
+        out.update(EU.slice_metrics(fam, best_f, cp_f, EV["slice"].threshold))
+        out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
+        slice_pd[fam] = {"row": [int(i) for i in idx], "feature": [int(es[f"{fam}_feats"][i]) for i in idx], "best_act": best_f.tolist(),
+                         "corpus_peak": cp_f.tolist(), "norm_act": (best_f / np.maximum(cp_f, 1e-6)).tolist(),
+                         "fired": (best_f > EV["slice"].threshold).astype(int).tolist(), "cos": [merged[fam][i] for i in idx],
+                         **({"best_text": [merged[f"{fam}_text"].get(i, "") for i in idx]} if merged.get(f"{fam}_text") else {})}
     for fam in EV["fams"]:
         out[f"eval/all/{fam}_cos"] = out[f"eval/{fam}/cos"]
     out["eval/all/sae_norm_act"] = out["eval/sae/norm_act"]
     out["eval/all/sae_unverbalized"] = out["eval/sae/unverbalized_frac"]
     if per_dir:   # NOT a wandb scalar: the caller pops it (eval_ckpt_daemon -> perdir_ckpt_<step>.json)
         out["_perdir"] = per_dir_dump(EV, merged, ranks, chance_pd)
+        if slice_pd:
+            out["_perdir"]["slice"] = slice_pd
     out["time/inline_eval_s"] = time.time() - t0
     return out
 
