@@ -156,7 +156,9 @@ def main():
         ax2.plot(xx, yy, ls=V["ls"], marker="D", ms=3.8, lw=1.5, color=V["color"], label=V["label"], zorder=4)
     ax2.set_xlabel("RL step (16,384 rollouts per step for the 8x2048 arms, 4,096 for 8x512; step 0 = the SFT init)"); ax2.grid(color=GRID, lw=0.6)
     ax2.set_xlim(-8, max(320, (max(rx) if rx else 300) + 20))
-    ax2.set_title("RL repairs it and passes the midtrain-init arms at matched steps", fontsize=10, loc="left")
+    late = [(r["ckpt_step"], r["eval/mean_all"], next((x["eval/mean_all"] for x in refs["a"]["evals"] if x["ckpt_step"] == r["ckpt_step"]), None)) for r in rl if r["ckpt_step"] >= 150]
+    behind = [t for t in late if t[2] is not None and t[1] < t[2] - 0.003]
+    ax2.set_title("RL repairs it: ahead of the midtrain-init arms through step 100, level at 150" + (f", behind arm A from step {behind[0][0]} on" if behind else ""), fontsize=10, loc="left")
     ax2.legend(loc="lower right", fontsize=7.0, frameon=False)
     ax1.legend(loc="upper right", fontsize=7.6, frameon=False)
     ymin = min([min(ys)] + [min(r["eval/mean_all"] for r in R["evals"]) for R in refs.values() if R["evals"]] + [R["init_mean_all"] for R in refs.values() if R["init_mean_all"]]) - 0.02
@@ -191,7 +193,9 @@ def main():
         axes[1].plot(rx, ([sft_final.get(k, np.nan)] if sft_final else []) + [r.get(k, np.nan) for r in rl], "-o", ms=4, lw=1.8, color=fc[i], label=lab)
         for x, y in zip(rx[1:], [r.get(k, np.nan) for r in rl]): axes[1].annotate(f"{y:.2f}", (x, y), xytext=(0, 6), textcoords="offset points", ha="center", fontsize=7.5, color=fc[i])
     axes[0].set_xlabel("SFT rows seen (millions)"); axes[1].set_xlabel("RL step"); axes[0].set_ylabel("fraction of held-out features fired above the SAE's learned gate (MLP: norm_act)")
-    axes[0].set_title("SFT: held-out 2M-SAE features barely fire (<10%)", fontsize=10, loc="left"); axes[1].set_title("RL: they fire at 38-44% by step 100", fontsize=10, loc="left")
+    axes[0].set_title("SFT: held-out 2M-SAE features barely fire (<10%)", fontsize=10, loc="left")
+    pk = max(rl, key=lambda r: r.get("eval/sae2m_enc/fired", 0)) if rl else None
+    axes[1].set_title(f"RL: they fire at {pk['eval/sae2m_enc/fired']*100:.0f}% / {pk['eval/sae2m_dec/fired']*100:.0f}% (enc / dec) by step {pk['ckpt_step']}, then DECAY to {rl[-1]['eval/sae2m_enc/fired']*100:.0f}% / {rl[-1]['eval/sae2m_dec/fired']*100:.0f}% at step {rl[-1]['ckpt_step']}" if pk and rl[-1]["ckpt_step"] > pk["ckpt_step"] else f"RL: they fire at {pk['eval/sae2m_enc/fired']*100:.0f}% / {pk['eval/sae2m_dec/fired']*100:.0f}% by step {pk['ckpt_step']}", fontsize=10, loc="left")
     for ax in axes: ax.grid(color=GRID, lw=0.6); ax.set_ylim(0, 1)
     axes[1].legend(fontsize=7.8, frameon=False, loc="upper left")
     fig.suptitle(wrap("Feature-firing metrics through the chain — held-out 2M-SAE features (100k eval split, 512 scored; encoder columns and decoder rows injected, firing judged by the encoder "
@@ -212,7 +216,8 @@ def main():
             ax.set_title(lab, fontsize=9.5, loc="left"); ax.grid(color=GRID, lw=0.6); ax.set_xlabel("RL step")
             if k == "policy/sampler_abs_dlogp": ax.axhline(0.10, color="#c0392b", ls=":", lw=1); ax.annotate("watch level .10", (st[0], 0.10), xytext=(3, 3), textcoords="offset points", fontsize=7.5, color="#c0392b")
         fig.suptitle(wrap(f"RL training dynamics (run {RL_RUN}, thin = per step, thick = 10-step mean): reward climbs steadily; the one off-policy burst (|Δ log p| up to .26 at steps 30-33) "
-                          "coincided with rollouts lengthening to 90 tokens and the sampler lag reaching 2 steps, and decayed within 10 steps as the length penalty pulled rollouts back to ~55 tokens", 150),
+                          "coincided with rollouts lengthening to 90 tokens and the sampler lag reaching 2 steps, and decayed within 10 steps as the length penalty pulled rollouts back to ~55 tokens; "
+                          "a second, milder excursion (|Δ log p| .10-.12 at steps 270-290, clip fraction .15-.17) came with entropy falling .65 -> .55 and coincides with the held-out decline from step 250 to 300", 150),
                      fontsize=10.2, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.9)); savefig(fig, "rl_dynamics")
 
