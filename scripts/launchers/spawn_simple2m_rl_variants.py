@@ -2,6 +2,7 @@
 (/data/banks/mix_simple2m_rl), same 300-step ScaleRL/CISPO recipe and cache-v3 evaluator as rl_simple2m_8x2048_anywin, varying:
     v16x1024   --group-size 16 --groups-per-step 1024   lr 1e-6, whole-span reward   (same 16,384 rollouts/step, 2x groups... half as many prompts)
     v8x2048_last16_lr5e-7   --groups-per-step 2048 --reward-window-last 16, lr 5e-7 (AdamW eps 1e-8, wd 0 -- NOT the paper optimizer)
+    v8x2048_last16_lr1e-6   --groups-per-step 2048 --reward-window-last 16, lr 1e-6
 Idempotent by key; ids -> ~/shared/overnight/simple2m/ids.json["rl_variants"].
     source ~/modal_venv/bin/activate && MODAL_PROFILE=safety-sahan python3 scripts/launchers/spawn_simple2m_rl_variants.py [key ...]
 """
@@ -25,6 +26,8 @@ VARIANTS = {
                  "desc": "16 samples x 1,024 directions per step (16,384 rollouts/step), lr 1e-6, whole-span reward"},
     "v8x2048_last16_lr5e-7": {"run": "rl_simple2m_8x2048_last16_lr5e-7", "flags": "--group-size 8 --groups-per-step 2048 --reward-window-last 16 --lr 5e-7",
                               "desc": "8 x 2,048, lr 5e-7 (AdamW eps 1e-8, wd 0), reward = max cosine over the LAST 16 rollout tokens"},
+    "v8x2048_last16_lr1e-6": {"run": "rl_simple2m_8x2048_last16_lr1e-6", "flags": "--group-size 8 --groups-per-step 2048 --reward-window-last 16 --lr 1e-6",
+                              "desc": "8 x 2,048, lr 1e-6, reward = max cosine over the LAST 16 rollout tokens"},
 }
 keys = sys.argv[1:] or list(VARIANTS)
 d = json.load(open(IDS)); d.setdefault("rl_variants", {})
