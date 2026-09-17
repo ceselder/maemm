@@ -209,18 +209,21 @@ if not stage(d, "rl"):
             discord("SFT final has no SAVE_DONE — RL NOT launched"); log("SFT final missing"); raise SystemExit(1)
         d["sft"]["done"] = True; save(d)
     save_dir = f"/data/ckpts_{RL_RUN}"
+    # RL init = the SFT final by default; ids.json["rl_policy_base"] (e.g. "/data/sft_mix/simple2m_sft/step_244") overrides it (early stopping
+    # on the held-out eval: the SFT's held-out metrics declined monotonically after step 244 on 2026-09-17)
+    policy_base = d.get("rl_policy_base") or f"/data/sft_mix/{SFT_RUN}/final"
     if "rl" not in d:
         extra = f"{RL_RECIPE} --run-name {RL_RUN} --save-dir {save_dir}"
         t = modal.Function.from_name(APPS["rl"], "train").spawn(n_rollout=2, n_trainer=6, total_steps=RL_STEPS, extra_args=extra,
-                                                                 pool_dir=f"/data/banks/{RL_POOL}", policy_base=f"/data/sft_mix/{SFT_RUN}/final", full_param=True)
+                                                                 pool_dir=f"/data/banks/{RL_POOL}", policy_base=policy_base, full_param=True)
         e = modal.Function.from_name(APPS["eval"], "fullmodel_daemon").spawn(ckpt_dir=save_dir, tag=RL_RUN, wandb_name=f"{RL_RUN}_eval", final_step=RL_STEPS,
                                                                               extra_args=f"--eval-cache {V3} --no-extra-evals")
-        d["rl"] = {"train": t.object_id, "eval": e.object_id, "run": RL_RUN, "save": save_dir, "policy_base": f"/data/sft_mix/{SFT_RUN}/final",
+        d["rl"] = {"train": t.object_id, "eval": e.object_id, "run": RL_RUN, "save": save_dir, "policy_base": policy_base,
                    "pool": f"/data/banks/{RL_POOL}", "lr": "1e-6", "group_size": 8, "groups_per_step": 2048, "steps": RL_STEPS, "split": "2+6",
                    "reward": "max cosine over the WHOLE rollout span (--reward-window-last 0)", "extra": extra, "app": APPS["rl"], "eval_app": APPS["eval"],
                    "eval_cache": V3, "spawned": now()}; save(d)
         log(f"RL spawned: train {t.object_id} eval {e.object_id}")
-        discord(f"SFT DONE -> full-param RL launched: {RL_RUN} (lr 1e-6, 2+6, 8x2048, whole-span reward, 300 steps) on {RL_POOL}; train {t.object_id}")
+        discord(f"SFT DONE -> full-param RL launched from {policy_base}: {RL_RUN} (lr 1e-6, 2+6, 8x2048, whole-span reward, 300 steps) on {RL_POOL}; train {t.object_id}")
     wait_call(d["rl"]["train"], "RL train")
     d["rl"]["done"] = True; save(d)
     discord(f"RL DONE: {RL_RUN} 300 steps; evaluator {d['rl']['eval']} scores the last checkpoints (cache v3: mean_all + held-out 2M enc/dec)")
