@@ -235,7 +235,7 @@ def _manifest_done(shards: str, r: int) -> bool:
         return False
 
 
-@app.function(image=image, volumes={"/data": vol}, timeout=8 * 3600, cpu=16, memory=96 * 1024)
+@app.function(image=image, volumes={"/data": vol}, timeout=8 * 3600, cpu=16, memory=96 * 1024, ephemeral_disk=512 * 1024)
 def finalize_only(out_name: str, n_examples: int, seed: int):
     """Publish a bank whose workers all wrote DONE manifests but whose collect call died afterwards (a rank's interpreter teardown
     crashed with 'PyGILState_Release ... runtime state: finalizing'): shards -> vecs.f16 + records.jsonl + build_stats.json +
@@ -275,7 +275,9 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
     total = sum(m["kept"] for m in mans)
     assert total >= n_examples, f"collected {total} < target {n_examples}"
     t0 = time.time()
-    vecs = np.memmap(f"{out}/vecs.f16.tmp", np.float16, "w+", shape=(total, D_MODEL))
+    stage_dir = "/root/finalize_stage"; os.makedirs(stage_dir, exist_ok=True)
+    local_vecs = f"{stage_dir}/vecs.f16"                                  # LOCAL disk, then ONE sequential copy to the volume
+    vecs = np.memmap(local_vecs, np.float16, "w+", shape=(total, D_MODEL))
     recs, off = [], 0
     ctx_hist, w_hist = np.zeros(2049, np.int64), np.zeros(65, np.int64)
     for r, m in enumerate(mans):
@@ -294,7 +296,9 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
             off += n
     assert off == total and len(recs) == total, (off, total, len(recs))
     vecs.flush(); del vecs
-    os.replace(f"{out}/vecs.f16.tmp", f"{out}/vecs.f16")
+    print(f"[modal] shards assembled locally ({total} rows, {time.time() - t0:.0f}s); copying vecs.f16 to the volume", flush=True)
+    shutil.copyfile(local_vecs, f"{out}/vecs.f16.tmp"); os.replace(f"{out}/vecs.f16.tmp", f"{out}/vecs.f16"); os.remove(local_vecs)
+    print(f"[modal] vecs.f16 on the volume ({time.time() - t0:.0f}s)", flush=True)
     # spot-check unit norms
     mm = np.memmap(f"{out}/vecs.f16", np.float16, "r", shape=(total, D_MODEL))
     idx = np.random.default_rng(0).choice(total, size=min(4096, total), replace=False)
