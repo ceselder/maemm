@@ -118,8 +118,8 @@ def main():
     for k in ("a", "s"):
         if refs[k]["init_mean_all"] is not None:
             ax1.axhline(refs[k]["init_mean_all"], color=refs[k]["color"], ls=":", lw=1.1)
-            ax1.annotate(f"{refs[k]['init_mean_all']:.3f} = {'5M-mix midtrain init (arms A/D/.425)' if k == 'a' else '2M-SAE midtrain init (arm S)'}", (xs[0], refs[k]["init_mean_all"]),
-                         xytext=(2, 3), textcoords="offset points", fontsize=7.8, color=refs[k]["color"])
+            ax1.annotate(f"{refs[k]['init_mean_all']:.3f} = {'5M-mix midtrain init (arms A/D/.425)' if k == 'a' else '2M-SAE midtrain init (arm S)'}", (xs[-1] if xs else 8, refs[k]["init_mean_all"]),
+                         xytext=(-2, 4 if k == 'a' else -11), textcoords="offset points", fontsize=7.8, color=refs[k]["color"], ha="right")
     ax1.set_xlabel("SFT: training rows seen (millions; 4,096 per step, exact 50/50 activations : SAE rows)"); ax1.set_ylabel("held-out fidelity: mean cosine over 10 direction families (eval cache v3 == v2 families)")
     ax1.set_title("SFT alone: held-out fidelity FALLS while train loss falls", fontsize=10, loc="left"); ax1.grid(color=GRID, lw=0.6); ax1.set_xlim(0, xs[-1] * 1.08 if xs else 8.5)
     # RL panel
@@ -141,8 +141,8 @@ def main():
              f"fidelity from {ys[0]:.3f} ({xs[0]:.0f}M rows) to {ys[-1]:.3f} ({xs[-1]:.0f}M) while its train loss keeps falling; full-parameter RL from that final "
              + (f"reaches {best_rl['eval/mean_all']:.3f} at step {best_rl['ckpt_step']} (arm A {next((r['eval/mean_all'] for r in refs['a']['evals'] if r['ckpt_step'] == best_rl['ckpt_step']), float('nan')):.3f} at the same step from a {refs['a']['init_mean_all']:.3f} init)"
                 if best_rl else "is running") + f" — Qwen3.6-27B activation-to-text inverter, 512 held-out directions per family, best-of-4 at T=1" + (f" (RL at step {rl_last_step} of 300)" if rl_last_step and rl_last_step < 300 else ""))
-    fig.suptitle(wrap(claim, 150), fontsize=10.2, x=0.01, ha="left")
-    fig.tight_layout(rect=(0, 0, 1, 0.9)); savefig(fig, "fidelity_chain")
+    fig.suptitle(wrap(claim, 165), fontsize=10.2, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.87)); savefig(fig, "fidelity_chain")
 
     # ---------------- per-family cosine through the chain ----------------
     fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.8), sharey=True, gridspec_kw={"width_ratios": [1, 1.25]})
