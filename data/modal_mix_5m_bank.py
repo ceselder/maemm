@@ -174,7 +174,7 @@ def _trim_plan(tok, texts, peak_idx, n_tok, min_tok=TRIM_MIN_TOK, batch=4096):
 
 @app.function(image=image, gpu=SMALL_GPUS, cpu=16, memory=131072, ephemeral_disk=512 * 1024, volumes={"/data": vol}, timeout=8 * 3600)
 def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overwrite: bool = False, threads: int = 48, exclude_json: str = "",
-          trim_to_peak: str = "", trim_min_tok: int = TRIM_MIN_TOK, dense_frac: float = 0.5):
+          trim_to_peak: str = "", trim_min_tok: int = TRIM_MIN_TOK, dense_frac: float = 0.5, eval_cache: str = EVAL_CACHE_V2):
     """exclude_json: JSON dict {source bank: path of a rows file} — rows listed under families[*].fail_vec_idx of that file are removed from
     the selection pool of that bank. Used for (a) the SAE end-anchor filter (end_anchor_rows.json: rows whose feature does not peak within
     the last 2 tokens when the target is re-tokenized standalone) and (b) the MLP eval-pair exclusion (eval_cos_rows.json: rows whose
@@ -313,7 +313,7 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
 
     # ---- leak guard: every row vs every v2 eval direction family + every pool_heldout row ----
     t0 = time.time()
-    es = torch.load(EVAL_CACHE_V2, map_location="cpu", weights_only=False)
+    es = torch.load(eval_cache, map_location="cpu", weights_only=False)   # every `*_dirs` family (v3 adds the held-out 2M-SAE enc/dec dirs)
     ref_names = sorted(k[:-5] for k in es if k.endswith("_dirs") and torch.is_tensor(es[k]))
     refs = [F.normalize(es[f"{n}_dirs"].float().reshape(-1, D), dim=-1) for n in ref_names]
     ho_n = os.path.getsize(f"{POOL_HELDOUT}/vecs.f32") // (4 * D)
@@ -414,7 +414,7 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
              "n_examples": N_out, "n_vecs": N_out, "families": fam_counts, "seed": seed, "spec": spec, "sources": per_source,
              "source_banks": bank_info, "layout": "seeded shuffle of all rows (records.jsonl line i == vec_idx i; src_bank/src_vec_idx point back)",
              "leak_check": {"threshold": LEAK_COS, "reference_sets": ref_names, "n_reference_dirs": int(offs[-1]), "rows_dropped": n_bad,
-                            "rows_dropped_by_family": dropped, "max_cos_table": leak_tbl, "eval_cache": EVAL_CACHE_V2, "pool_heldout": POOL_HELDOUT},
+                            "rows_dropped_by_family": dropped, "max_cos_table": leak_tbl, "eval_cache": eval_cache, "pool_heldout": POOL_HELDOUT},
              "source_norm_range": norm_stats, "pretrain_corpus_parts_excluded": PRETRAIN_PARTS, "unused_parts_used": UNUSED_PARTS,
              "row_exclusions": excl_info,
              "trim_to_peak": trim_summary,
