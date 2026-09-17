@@ -112,7 +112,7 @@ def _exclusion_hashes():
 @app.function(image=image, gpu=COLLECT_GPU, cpu=32, memory=192 * 1024, volumes={"/data": vol},
               secrets=[modal.Secret.from_name("maemm-hf")], timeout=86400)
 def collect(n_seq: int = 80_000, out_name: str = OUT_DEFAULT, batch: int = 64, chunk_seqs: int = 512, max_wins: int = 4,
-            seed: int = 5000):
+            seed: int = 5000, hf_stream: str = ""):
     """8 single-GPU workers over DISJOINT fresh files -> shards under /data/<out_name>/shards (crash-resume: rerun = resume).
     Does NOT finalize (see `finalize`, CPU)."""
     import json
@@ -141,6 +141,19 @@ def collect(n_seq: int = 80_000, out_name: str = OUT_DEFAULT, batch: int = 64, c
         assign = json.load(open(assign_path))
         assert assign["world"] == world, "resume with a different world size is not supported"
         print(f"[fresh] RESUME with existing assignment ({assign['n_files']} files)", flush=True)
+    elif hf_stream:
+        # ordered document-RANGE streaming of an HF dataset: hf_stream = JSON {"dataset", "config", "split", "skip"}; every rank reads
+        # the same ordered stream from single-stream doc index `skip` and keeps docs with index % world == rank
+        # (collect_acts27b_worker.StreamReader) -> the store's documents are exactly [skip, skip + docs_seen), disjoint from any
+        # other range-mode collection and from the 2M SAE's Ultra-FineWeb span [100k, ~1.8M).
+        spec = json.loads(hf_stream)
+        assign = {"mode": "hfstream", "dataset": spec["dataset"], "config": spec.get("config"), "split": spec.get("split", "train"),
+                  "skip": int(spec.get("skip", 0)), "shuffle": bool(spec.get("shuffle", False)), "world": world, "seed": seed,
+                  "n_files": None, "n_domains": None, "n_repo_files": None, "n_excluded_files": 0, "excluded_files_by_source": {},
+                  "excluded_files": [], "note": "document-range mode (ordered stream from `skip`, modulo-`world` sharding by doc index)"}
+        json.dump(assign, open(assign_path, "w"))
+        print(f"[fresh] assignment: ORDERED STREAM {assign['dataset']} config={assign['config']} split={assign['split']} "
+              f"skip={assign['skip']} shuffle={assign['shuffle']} over {world} ranks", flush=True)
     else:
         files, used, per_src = _used_files()
         fresh_files = [f for f in files if f not in used]
@@ -251,6 +264,10 @@ def finalize(out_name: str = OUT_DEFAULT, keep_shards: bool = True):
     meta = {"n_seq": n_seq, "n_seq_target": sum(m["n_seq_target"] for m in mans), "seq_len": SEQ_LEN, "d": D_MODEL,
             "layer": READ_LAYER, "model": MODEL, "dataset": assign["dataset"], "seed": assign["seed"], "n_tokens": n_seq * SEQ_LEN,
             "world": world, "mode": assign["mode"], "n_domains": assign.get("n_domains"), "n_files": assign.get("n_files"),
+            "hf_stream": ({"config": assign.get("config"), "split": assign.get("split"), "skip": assign.get("skip"), "shuffle": assign.get("shuffle"),
+                           "docs_iterated_per_rank": [int((m.get("reader_state") or {}).get("docs_seen", 0)) for m in mans],
+                           "doc_range": [assign.get("skip", 0), assign.get("skip", 0) + max(int((m.get("reader_state") or {}).get("docs_seen", 0)) for m in mans)]}
+                          if assign.get("mode") == "hfstream" else None),
             "bos_id": mans[0]["bos_id"], "docs_seen": int(sum(m.get("docs", 0) for m in mans)),
             "docs_excluded_hash": int(sum(m.get("skipped_docs", 0) for m in mans)),
             "fresh": {"kind": "documents disjoint from every existing store / training bank",

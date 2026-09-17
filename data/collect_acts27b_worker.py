@@ -150,11 +150,20 @@ class StreamReader:
                 time.sleep(min(120, 5 * 2 ** att))
         if ds is None:
             raise RuntimeError("fallback load_dataset failed after 8 attempts")
-        ds = ds.shuffle(seed=seed, buffer_size=10_000)
+        # Document-RANGE mode (assign["skip"] > 0 and/or assign["shuffle"] false): consume the stream IN ORDER from single-stream
+        # document index `skip`, so the documents a collection touched are exactly [skip, skip + docs_seen) and collections with
+        # non-overlapping ranges are document-disjoint by construction (the 2M SAE consumed Ultra-FineWeb docs [100k, ~1.8M) the
+        # same way). Default (no skip, shuffle=True) keeps the old behaviour.
+        self.skip = int(assign.get("skip", 0) or 0)
+        self.shuffle = bool(assign.get("shuffle", True))
+        if self.shuffle:
+            ds = ds.shuffle(seed=seed, buffer_size=10_000)
         self.docs_seen = (state or {}).get("docs_seen", 0)
-        if self.docs_seen:
-            ds = ds.skip(self.docs_seen)
+        if self.skip + self.docs_seen:
+            ds = ds.skip(self.skip + self.docs_seen)
         self.ds = ds
+        log(rank, f"stream {assign['dataset']} config={assign.get('config')} split={assign.get('split', 'train')} "
+                  f"skip={self.skip} shuffle={self.shuffle} resume docs_seen={self.docs_seen}")
 
     def docs(self):
         for row in self.ds:
@@ -168,7 +177,7 @@ class StreamReader:
             yield text
 
     def state(self):
-        return {"docs_seen": self.docs_seen}
+        return {"docs_seen": self.docs_seen, "skip": self.skip, "doc_range": [self.skip, self.skip + self.docs_seen]}
 
 
 def main():

@@ -21,7 +21,7 @@ from pathlib import Path
 import modal
 
 REPO = Path(__file__).resolve().parent.parent
-APP_NAME = "maemm-collect-bank"
+APP_NAME = os.environ.get("COLLECT_APP", "maemm-collect-bank")   # COLLECT_APP=maemm-collect-bank-s2m = an independent deployment
 app = modal.App(APP_NAME)
 
 image = (
@@ -130,7 +130,7 @@ def _other_bank_files(bank_name: str):
 
 
 def _run(out_name: str, n_examples: int, world: int, batch: int, per_window: int, p_lo: int, p_hi: int, w_lo: int,
-         w_hi: int, max_wins: int, chunk_examples: int, seed: int, exclude_from: str = ""):
+         w_hi: int, max_wins: int, chunk_examples: int, seed: int, exclude_from: str = "", hf_stream: str = ""):
     import json
     import subprocess
     import sys
@@ -149,6 +149,18 @@ def _run(out_name: str, n_examples: int, world: int, batch: int, per_window: int
     if os.path.exists(assign_path):
         assign = json.load(open(assign_path))
         assert assign.get("world", world) == world, "resume with a different world size is not supported"
+    elif hf_stream:
+        # ordered document-RANGE streaming of an HF dataset (no file assignment): hf_stream = JSON {"dataset", "config", "split", "skip"};
+        # every rank reads the same ordered stream from single-stream doc index `skip` and keeps the docs with index % world == rank
+        # (collect_acts27b_worker.StreamReader), so the collection touches exactly docs [skip, skip + docs_seen): collections with
+        # non-overlapping ranges are document-disjoint, and disjoint from the 2M SAE's Ultra-FineWeb span [100k, ~1.8M).
+        spec = json.loads(hf_stream)
+        assign = {"mode": "hfstream", "dataset": spec["dataset"], "config": spec.get("config"), "split": spec.get("split", "train"),
+                  "skip": int(spec.get("skip", 0)), "shuffle": bool(spec.get("shuffle", False)), "world": world, "seed": seed,
+                  "note": "document-range mode (ordered stream from `skip`, modulo-`world` sharding by document index)"}
+        json.dump(assign, open(assign_path, "w"))
+        print(f"[modal] assignment: ORDERED STREAM {assign['dataset']} config={assign['config']} split={assign['split']} "
+              f"skip={assign['skip']} shuffle={assign['shuffle']} over {world} ranks", flush=True)
     else:
         excl_files = []
         for other in [x for x in exclude_from.split(",") if x.strip()]:
@@ -267,7 +279,11 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
         "model": MODEL, "layer": READ_LAYER, "d": D_MODEL, "n_examples": total, "families": {"realact": total},
         "ctx_range": mans[0]["ctx_range"], "w_range": mans[0]["w_range"], "seq_len": mans[0]["seq_len"],
         "per_window": mans[0]["per_window"], "world": world, "seed": seed, "dataset": assign.get("dataset"),
-        "n_files": assign.get("n_files"), "n_domains": assign.get("n_domains"),
+        "n_files": assign.get("n_files"), "n_domains": assign.get("n_domains"), "mode": assign.get("mode"),
+        "hf_stream": ({"config": assign.get("config"), "split": assign.get("split"), "skip": assign.get("skip"), "shuffle": assign.get("shuffle"),
+                       "doc_range": [assign.get("skip", 0), assign.get("skip", 0) + max(int((m.get("reader_state") or {}).get("docs_seen", 0)) for m in mans)],
+                       "docs_iterated_per_rank": [int((m.get("reader_state") or {}).get("docs_seen", 0)) for m in mans]}
+                      if assign.get("mode") == "hfstream" else None),
         "docs_seen": int(sum(m.get("docs", 0) for m in mans)), "docs_excluded_eval_hash": int(sum(m.get("skipped_docs", 0) for m in mans)),
         "positions_norm_dropped": int(sum(m.get("norm_drop", 0) for m in mans)),
         "norm_median_per_rank": [m.get("norm_median") for m in mans],
@@ -287,15 +303,17 @@ def _finalize(out: str, world: int, n_examples: int, seed: int, assign: dict, wa
               cpu=32, memory=192 * 1024)
 def collect(n_examples: int = 20_000_000, out_name: str = "realact_short_20m", batch: int = 64, per_window: int = 8,
             p_lo: int = 8, p_hi: int = 256, w_lo: int = 8, w_hi: int = 32, max_wins: int = 4, chunk_examples: int = 50_000,
-            seed: int = 7, exclude_from: str = ""):
-    _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from)
+            seed: int = 7, exclude_from: str = "", hf_stream: str = ""):
+    """hf_stream: JSON {"dataset": "openbmb/Ultra-FineWeb", "config": "default", "split": "en", "skip": 3000000} -> ordered
+    document-range streaming instead of the FineFineWeb file assignment (see _run)."""
+    _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from, hf_stream)
 
 
-def _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from):
+def _collect_body(n_examples, out_name, batch, per_window, p_lo, p_hi, w_lo, w_hi, max_wins, chunk_examples, seed, exclude_from, hf_stream=""):
     import subprocess
     n = len([ln for ln in subprocess.check_output(["nvidia-smi", "-L"], text=True).splitlines() if ln.strip()])
     _run(out_name, n_examples, world=n, batch=batch, per_window=per_window, p_lo=p_lo, p_hi=p_hi, w_lo=w_lo, w_hi=w_hi,
-         max_wins=max_wins, chunk_examples=chunk_examples, seed=seed, exclude_from=exclude_from)
+         max_wins=max_wins, chunk_examples=chunk_examples, seed=seed, exclude_from=exclude_from, hf_stream=hf_stream)
 
 
 @app.function(image=image, gpu="B200:8", volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=86400,
