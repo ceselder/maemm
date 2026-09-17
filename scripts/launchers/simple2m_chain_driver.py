@@ -157,7 +157,7 @@ if not stage(d, "compose_sft"):
     d["compose_sft"].update({"done": True, "n_examples": st["n_examples"], "families": st["families"]}); save(d)
     discord(f"SFT mix composed: {st['n_examples']} rows {st['families']} -> launching full-FT SFT from base")
 
-if not stage(d, "sft"):
+if "sft" not in d:
     n_rows = d["compose_sft"]["n_examples"]; steps = math.ceil(n_rows / EFF_BATCH)
     if "sft" not in d:
         t = modal.Function.from_name(APPS["sft"], "train").spawn(run_name=SFT_RUN, data_dir=f"/data/banks/{SFT_MIX}", n_ckpts=8, epochs=1,
@@ -170,15 +170,6 @@ if not stage(d, "sft"):
                     "extra": SFT_EXTRA, "app": APPS["sft"], "eval_app": APPS["eval"], "eval_cache": V3, "spawned": now()}; save(d)
         log(f"SFT spawned: train {t.object_id} eval {e.object_id} ({steps} steps expected)")
         discord(f"SFT launched from BASE on {SFT_MIX} ({n_rows} rows 50/50, {steps} steps ≈ {steps * 12 / 3600:.1f} h at 12 s/step); RL follows")
-    wait_call(d["sft"]["train"], "SFT train")
-    ok = False
-    for _ in range(40):
-        if vol_has(f"/sft_mix/{SFT_RUN}/final/SAVE_DONE"):
-            ok = True; break
-        time.sleep(60)
-    if not ok:
-        discord("SFT final has no SAVE_DONE — RL NOT launched"); log("SFT final missing"); raise SystemExit(1)
-    d["sft"]["done"] = True; save(d)
 
 # ---- C. RL pool (exact thirds) -------------------------------------------------------------------------------------------
 if not stage(d, "compose_rl"):
@@ -207,6 +198,16 @@ if not stage(d, "compose_rl"):
 
 # ---- D. full-parameter RL (all-token reward) + evaluator ---------------------------------------------------------------
 if not stage(d, "rl"):
+    if not d["sft"].get("done"):
+        wait_call(d["sft"]["train"], "SFT train")
+        ok = False
+        for _ in range(40):
+            if vol_has(f"/sft_mix/{SFT_RUN}/final/SAVE_DONE"):
+                ok = True; break
+            time.sleep(60)
+        if not ok:
+            discord("SFT final has no SAVE_DONE — RL NOT launched"); log("SFT final missing"); raise SystemExit(1)
+        d["sft"]["done"] = True; save(d)
     save_dir = f"/data/ckpts_{RL_RUN}"
     if "rl" not in d:
         extra = f"{RL_RECIPE} --run-name {RL_RUN} --save-dir {save_dir}"
