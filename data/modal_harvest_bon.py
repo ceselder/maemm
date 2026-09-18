@@ -302,7 +302,7 @@ def probe_report(out_name: str, tags_json: str):
 def finalize(out_name: str, tags_json: str, bank_out: str, k_keep: int = 1, select: str = "reward", min_cos: float = -1.0,
              require_beat_orig: bool = False, max_rep3: float = 0.5, overwrite: bool = False):
     """Distilled SFT bank /data/banks/<bank_out>: pool the top-k lists of every tag per target, drop degenerate texts (fraction of repeated
-    3-grams > max_rep3, empty), optional min_cos / beat-original filters, sort by `select` (reward|cos), keep k_keep rows per target (the
+    3-grams > max_rep3, empty), optional min_cos / beat-original filters, sort by `select` (reward|cos|cos_centered|reward_centered), keep k_keep rows per target (the
     vector row is duplicated per kept text). records line i == vec_idx i; target_text = the rollout; provenance kept."""
     import numpy as np
     vol.reload()
@@ -346,7 +346,11 @@ def finalize(out_name: str, tags_json: str, bank_out: str, k_keep: int = 1, sele
                     stats["dropped_cos"] += 1; continue
                 if require_beat_orig and c["cos"] <= orig_cos:
                     stats["dropped_orig"] += 1; continue
-                cands.append((c[select], tag, c))
+                if select == "reward_centered":      # centered cosine minus the RL length penalty (same shaping as `reward` on the raw cosine)
+                    key = c["cos_centered"] - 0.00025 * max(0, c["n_tok"] - 8)
+                else:
+                    key = c[select]
+                cands.append((key, tag, c))
         if not cands:
             stats["no_candidate"] += 1; continue
         cands.sort(key=lambda x: -x[0])
@@ -357,7 +361,8 @@ def finalize(out_name: str, tags_json: str, bank_out: str, k_keep: int = 1, sele
             seen.add(c["text"])
             recs.append({"vec_idx": len(recs), "target_text": c["text"], "family": tgt["family"], "src_bank": tgt["bank"], "src_vec_idx": tgt["vec_idx"],
                          "src_line": tgt["line"], "orig_text": tgt["target_text"][:300], "orig_cos": orig_cos, "cos": c["cos"], "reward": c["reward"],
-                         "n_tok": c["n_tok"], "sampler": tag, "rank_in_target": kept, "src": tgt.get("src", {}), "kind": "harvest_bon"})
+                         "n_tok": c["n_tok"], "cos_centered": c.get("cos_centered"), "orig_cos_centered": next(iter(per_tag.values())).get("orig_cos_centered"),
+                         "select": select, "sampler": tag, "rank_in_target": kept, "src": tgt.get("src", {}), "kind": "harvest_bon"})
             vecs.append(v); fam_counts[tgt["family"]] = fam_counts.get(tgt["family"], 0) + 1
             stats["by_tag"][tag] = stats["by_tag"].get(tag, 0) + 1
             if kept == 0:
