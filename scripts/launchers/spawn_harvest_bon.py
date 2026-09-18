@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=96)
     ap.add_argument("--quant", default="", help="sampler quantization (fp8) passed to the worker"); ap.add_argument("--queue-mult", type=int, default=1)
     ap.add_argument("--also-window", type=int, default=-1, help="second scoring window (-1 off; the probe used 16)")
+    ap.add_argument("--select", choices=["raw", "centered"], default="raw", help="selection cosine convention (both are stored)")
+    ap.add_argument("--spec", default="", help="JSON plan spec override (list of {bank, families:{fam:n}})")
     a = ap.parse_args()
     assert a.probe != a.full or a.report or a.finalize, "pick --probe or --full"
     out_name = a.out_name or ("harvest_probe_v1" if a.probe else "harvest_full_v1")
@@ -68,7 +70,7 @@ def main():
     n_samples = a.n_samples or (256 if a.probe else 32)
     top_k = a.top_k or (8 if a.probe else 4)
     n_shards = a.n_shards or (1 if a.probe else 8)
-    spec = PROBE_SPEC if a.probe else FULL_SPEC
+    spec = json.loads(a.spec) if a.spec else (PROBE_SPEC if a.probe else FULL_SPEC)
     ids = load_ids(); H = ids.setdefault("harvest", {}); rec = H.setdefault(out_name, {"out_name": out_name, "app": APP})
 
     if a.report:
@@ -113,9 +115,9 @@ def main():
                 continue
             fc = fn.spawn(out_name, sh, cfg, ck, n_samples=n_samples, temperature=temp, top_k=top_k, max_new_tokens=a.max_new_tokens,
                           reward_window_last=win, probe=a.probe, seed=a.seed + sh, limit=a.limit, also_window=(16 if a.probe and a.also_window < 0 else a.also_window),
-                          queue_mult=a.queue_mult, quant=a.quant)
+                          queue_mult=a.queue_mult, quant=a.quant, select=a.select)
             calls[key] = {"call": fc.object_id, "ckpt": ck, "temperature": temp, "window_last": win, "n_samples": n_samples, "top_k": top_k,
-                          "probe": a.probe, "quant": a.quant, "queue_mult": a.queue_mult, "spawned": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                          "probe": a.probe, "quant": a.quant, "queue_mult": a.queue_mult, "select": a.select, "spawned": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             print(f"spawned {key}: {fc.object_id}")
     rec.update({"n_samples": n_samples, "top_k": top_k, "configs": sorted(set(rec.get("configs", []) + configs))}); save_ids(ids)
     print(json.dumps({k: v for k, v in rec.items() if k != "calls"}, indent=1))

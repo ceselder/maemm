@@ -142,7 +142,7 @@ def plan(out_name: str, spec_json: str, seed: int = 2050, n_shards: int = 8, ove
 def harvest_shard(out_name: str, shard: int, tag: str, ckpt: str, n_samples: int = 32, temperature: float = 1.0, top_k: int = 4,
                   max_new_tokens: int = 96, min_new_tokens: int = 8, reward_window_last: int = 0, dirs_per_call: int = 0,
                   max_num_seqs: int = 512, vllm_gpu_mem: float = 0.5, cuda_graphs: bool = True, probe: bool = False, seed: int = 0,
-                  limit: int = 0, extra_args: str = "", partial_every_s: int = 600, also_window: int = -1, queue_mult: int = 1, quant: str = ""):
+                  limit: int = 0, extra_args: str = "", partial_every_s: int = 600, also_window: int = -1, queue_mult: int = 1, quant: str = "", select: str = "raw"):
     """Runs the worker on this container's GPU for shard `shard` of plan `out_name`; sampler config named `tag` (e.g. s250_t1.0).
     Partial output is copied to the volume every `partial_every_s` (shard_XX.partial.jsonl) and resumed from on restart."""
     vol.reload()
@@ -167,7 +167,7 @@ def harvest_shard(out_name: str, shard: int, tag: str, ckpt: str, n_samples: int
            "--out", out_local, "--manifest", man_local, "--n-samples", str(n_samples), "--temperature", str(temperature), "--top-k", str(top_k),
            "--max-new-tokens", str(max_new_tokens), "--min-new-tokens", str(min_new_tokens), "--reward-window-last", str(reward_window_last),
            "--dirs-per-call", str(dirs_per_call), "--max-num-seqs", str(max_num_seqs), "--vllm-gpu-mem", str(vllm_gpu_mem), "--seed", str(seed),
-           "--also-window", str(also_window), "--queue-mult", str(queue_mult)] + (["--quant", quant] if quant else [])
+           "--also-window", str(also_window), "--queue-mult", str(queue_mult), "--select", select] + (["--quant", quant] if quant else [])
     cmd += ["--cuda-graphs"] if cuda_graphs else []
     cmd += ["--probe"] if probe else []
     cmd += ["--resume"] if resume else []
@@ -385,3 +385,78 @@ def finalize(out_name: str, tags_json: str, bank_out: str, k_keep: int = 1, sele
           f"(beat {bs['stats']['beat_orig_frac']:.2f}) | dropped rep {stats['dropped_rep']} cos {stats['dropped_cos']} orig {stats['dropped_orig']} | "
           f"no-candidate targets {stats['no_candidate']}", flush=True)
     return bs
+
+
+# --------------------------------------------------------------------------------------------- raw vs mean-centered scoring check
+@app.function(image=image, gpu=GPU, cpu=8, memory=64 * 1024, volumes={"/data": vol}, secrets=[modal.Secret.from_name("maemm-hf")], timeout=3600)
+def score_compare(out_name: str, tag: str, n_targets: int = 256, n_random: int = 4, mu_path: str = "/data/acts27b/whiten_mu.npy"):
+    """For a --probe shard: re-score the ORIGINAL texts, the best-of-N rollouts and a few random rollouts under (a) the suite's scorer
+    (raw layer-42 activation, normalized) and (b) the same with the corpus mean subtracted first (h - mu, mu = the bank convention's
+    whiten_mu). Returns means per family + rank agreement. Answers 'why is the source text not 1 by construction'."""
+    import glob
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    import sys
+    sys.path[:0] = ["/pmx/helpers", "/pmx/eval", "/pmx/RL"]
+    os.environ.update({k: v for k, v in _env().items() if k in ("HF_HOME", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "TOKENIZERS_PARALLELISM")})
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import rl_hf as R
+    import rl_disagg as DG
+    from mxf.config import MODEL, READ_LAYER
+    from mxf.inject import read_resid
+    vol.reload()
+    files = sorted(glob.glob(f"{HROOT}/{out_name}/{tag}/shard_00*.jsonl"))
+    rows = [json.loads(l) for f in files[:1] for l in open(f)][:n_targets]
+    plan_tg = [json.loads(l) for l in open(f"{HROOT}/{out_name}/targets_00.jsonl")]
+    dv = np.load(f"{HROOT}/{out_name}/dirs_00.npy").astype(np.float32)
+    device = "cuda:0"
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
+    DG._truncate_scorer(base, READ_LAYER + 1)
+    actor = DG.BaseActor(base); actor.eval()
+    mu = torch.tensor(np.load(mu_path).astype(np.float32), device=device)
+    rng = np.random.default_rng(0)
+
+    @torch.no_grad()
+    def score_both(texts, dirs, window_last=0, bs=64):
+        """max over content tokens of cos(h, d) [raw] and cos(h - mu, d) [centered]; identical tokenization to rl.py score()."""
+        out_raw, out_cen = [], []
+        tok.padding_side = "right"; sink = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
+        for s in range(0, len(texts), bs):
+            tt = texts[s: s + bs]; dd = dirs[s: s + bs].to(device)
+            e = tok(tt, return_tensors="pt", padding=True, truncation=True, max_length=95, add_special_tokens=False)
+            ids = torch.cat([torch.full((len(tt), 1), sink), e["input_ids"]], 1).to(device)
+            am = torch.cat([torch.ones(len(tt), 1, dtype=e["attention_mask"].dtype), e["attention_mask"]], 1).to(device)
+            h, mask = read_resid(actor, READ_LAYER, {"input_ids": ids, "attention_mask": am}, pool="all")
+            keep = mask.clone(); keep[:, 0] = False
+            for hh, dst in ((F.normalize(h, dim=-1), out_raw), (F.normalize(h - mu, dim=-1), out_cen)):
+                proj = torch.einsum("btd,bd->bt", hh, dd).masked_fill(~keep, -2.0)
+                dst.append(proj.max(1).values.cpu())
+        return torch.cat(out_raw), torch.cat(out_cen)
+
+    res = {"out_name": out_name, "tag": tag, "n": len(rows), "mu_norm": float(mu.norm()), "families": {}}
+    fams = sorted({r["family"] for r in rows})
+    for fam in fams + ["all"]:
+        sel = [r for r in rows if fam == "all" or r["family"] == fam]
+        if not sel:
+            continue
+        d = torch.tensor(np.stack([dv[r["t"]] for r in sel])); d = F.normalize(d, dim=1)
+        orig = [plan_tg[r["t"]]["target_text"] for r in sel]
+        best = [r["best"]["text"] for r in sel]
+        o_raw, o_cen = score_both(orig, d); b_raw, b_cen = score_both(best, d)
+        # random rollouts (from topk lists, lowest-ranked entry as a 'typical' one)
+        typ = [r["topk"][-1]["text"] for r in sel]; t_raw, t_cen = score_both(typ, d)
+        ent = {"n": len(sel), "orig_raw": float(o_raw.mean()), "orig_centered": float(o_cen.mean()), "orig_centered_p10": float(o_cen.quantile(0.1)),
+               "best_raw": float(b_raw.mean()), "best_centered": float(b_cen.mean()), "typical_raw": float(t_raw.mean()), "typical_centered": float(t_cen.mean()),
+               "best_minus_orig_raw": float((b_raw - o_raw).mean()), "best_minus_orig_centered": float((b_cen - o_cen).mean()),
+               "beat_orig_raw": float((b_raw > o_raw).float().mean()), "beat_orig_centered": float((b_cen > o_cen).float().mean()),
+               "raw_vs_centered_corr_best": float(np.corrcoef(b_raw.numpy(), b_cen.numpy())[0, 1]),
+               "stored_best_cos_check": float(np.mean([r["best"]["cos"] for r in sel]))}
+        res["families"][fam] = ent
+        print(f"[cmp] {fam:<20} n={len(sel):>3} | orig raw {ent['orig_raw']:.3f} centered {ent['orig_centered']:.3f} (p10 {ent['orig_centered_p10']:.3f}) | best raw {ent['best_raw']:.3f} centered {ent['best_centered']:.3f} | typical raw {ent['typical_raw']:.3f} centered {ent['typical_centered']:.3f} | beat-orig raw {ent['beat_orig_raw']:.2f} centered {ent['beat_orig_centered']:.2f} | corr {ent['raw_vs_centered_corr_best']:.3f}", flush=True)
+    json.dump(res, open(f"{HROOT}/{out_name}/score_compare_{tag}.json", "w"), indent=1)
+    vol.commit()
+    return res

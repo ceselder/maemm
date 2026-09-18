@@ -89,7 +89,9 @@ def main():
     ap.add_argument("--max-num-batched-tokens", type=int, default=24576)
     ap.add_argument("--vllm-gpu-mem", type=float, default=0.5)
     ap.add_argument("--cuda-graphs", action="store_true")
-    ap.add_argument("--score-batch", type=int, default=512)
+    ap.add_argument("--score-batch", type=int, default=256)
+    ap.add_argument("--select", choices=["raw", "centered"], default="raw", help="selection cosine: raw = the suite's scorer (unit(h42) . d); centered = unit(h42 - mu) . d")
+    ap.add_argument("--mu", default="/data/acts27b/whiten_mu.npy", help="corpus mean of the layer-42 residual (the bank directions are unit(act - mu))")
     ap.add_argument("--scorer-layers", type=int, default=43, help="keep decoder layers [0, n) of the clean base (0 = all 64)")
     ap.add_argument("--probe", action="store_true", help="store every sample's cosine + length (best-of-n curves)")
     ap.add_argument("--seed", type=int, default=0)
@@ -173,20 +175,48 @@ def main():
     # ---- generate / score / select. Sequential on purpose: (1) queuing more than max_num_seqs per call makes vLLM backfill, and every
     #      mixed prefill+decode step runs EAGER in the hooked engine (the marker must be prefilled in a hooked pass) -> ~2x slower decode;
     #      (2) scoring in a thread next to LLM.generate() starves both on the GIL. So: exactly max_num_seqs sequences per call, then score.
+    from mxf.inject import read_resid
+    mu = torch.tensor(np.load(a.mu).astype(np.float32), device=device)
+    sink = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
+
+    @torch.inference_mode()
+    def _score_both(texts, dirs_dev, window_last):
+        """rl.py score() semantics (sink-prepended, max_length 95, max over content tokens in the window) computed for BOTH conventions in
+        one forward: raw = unit(h) . d (the suite's scorer), centered = unit(h - mu) . d. Length-bucketed batches (pure reorder)."""
+        order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+        raw = torch.zeros(len(texts)); cen = torch.zeros(len(texts))
+        tok.padding_side = "right"
+        for s0 in range(0, len(order), a.score_batch):
+            ids_ = order[s0: s0 + a.score_batch]
+            tt = [texts[i] if texts[i].strip() else " " for i in ids_]
+            e = tok(tt, return_tensors="pt", padding=True, truncation=True, max_length=95, add_special_tokens=False)
+            inp = {"input_ids": torch.cat([torch.full((len(tt), 1), sink), e["input_ids"]], 1).to(device),
+                   "attention_mask": torch.cat([torch.ones(len(tt), 1, dtype=e["attention_mask"].dtype), e["attention_mask"]], 1).to(device)}
+            h, mask = read_resid(scorer, READ_LAYER, inp, pool="all")
+            keep = mask.clone(); keep[:, 0] = False
+            sel = keep
+            if window_last > 0:
+                revcnt = keep.flip(1).cumsum(1).flip(1); sel = keep & (revcnt <= window_last)
+            dd = dirs_dev[ids_]
+            for hh, dst in ((F.normalize(h, dim=-1), raw), (F.normalize(h - mu, dim=-1), cen)):
+                proj = torch.einsum("btd,bd->bt", hh, dd).masked_fill(~sel, torch.finfo(hh.dtype).min)
+                best = torch.where(keep.any(1), proj.max(1).values, torch.zeros((), device=device, dtype=hh.dtype))
+                dst[torch.as_tensor(ids_)] = best.float().cpu()
+        return raw, cen
+
     def _score(idx, d, texts, lens):
         t1 = time.time()
-        with torch.inference_mode():
-            dirs_rep = d.repeat_interleave(N, 0).to(device)
-            cos = DG.score_bucketed(R, texts, dirs_rep, scorer, tok, device, ea, lens).float().cpu()
-            orig_texts = [targets[i]["target_text"] for i in idx]
-            ocos = R.score(orig_texts, d.to(device), scorer, tok, device, ea).float().cpu()
-            cos2 = ocos2 = None
-            if a.also_window >= 0 and a.also_window != a.reward_window_last:
-                ea.reward_window_last = a.also_window
-                cos2 = DG.score_bucketed(R, texts, dirs_rep, scorer, tok, device, ea, lens).float().cpu()
-                ocos2 = R.score(orig_texts, d.to(device), scorer, tok, device, ea).float().cpu()
-                ea.reward_window_last = a.reward_window_last
-        return cos, ocos, cos2, ocos2, time.time() - t1
+        dirs_rep = d.repeat_interleave(N, 0).to(device)
+        raw, cen = _score_both(texts, dirs_rep, a.reward_window_last)
+        orig_texts = [targets[i]["target_text"] for i in idx]
+        oraw, ocen = _score_both(orig_texts, d.to(device), a.reward_window_last)
+        cos2 = ocos2 = None
+        if a.also_window >= 0 and a.also_window != a.reward_window_last:
+            r2, c2 = _score_both(texts, dirs_rep, a.also_window); o2r, o2c = _score_both(orig_texts, d.to(device), a.also_window)
+            cos2, ocos2 = (r2 if a.select == "raw" else c2), (o2r if a.select == "raw" else o2c)
+        cos, ocos = (raw if a.select == "raw" else cen), (oraw if a.select == "raw" else ocen)
+        alt, oalt = (cen if a.select == "raw" else raw), (ocen if a.select == "raw" else oraw)
+        return cos, ocos, cos2, ocos2, time.time() - t1, alt, oalt
 
     fout = open(a.out, "a")
     agg = {"targets": 0, "rollouts": 0, "gen_s": 0.0, "score_s": 0.0, "cos_sum": 0.0, "best_sum": 0.0, "orig_sum": 0.0, "beat": 0, "len_sum": 0}
@@ -198,7 +228,8 @@ def main():
         gen_ids, gen_s = _generate_noprob(llm, ea, tok, prompt_ids, marker, d, hnorm, eos_ids, f"h{c0}")
         texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
         lens = [len(g) for g in gen_ids]
-        cos, ocos, cos2, ocos2, score_s = _score(idx, d, texts, lens)
+        cos, ocos, cos2, ocos2, score_s, alt, oalt = _score(idx, d, texts, lens)
+        alt_name = "cos_centered" if a.select == "raw" else "cos_raw"
         pen = torch.tensor([max(0, L - a.len_penalty_start) for L in lens], dtype=torch.float32) * a.len_penalty_per_tok
         rew = cos - pen
         for j, i in enumerate(idx):
@@ -206,10 +237,12 @@ def main():
             c, r = cos[sl], rew[sl]
             order = torch.argsort(r, descending=True).tolist()
             top = [{"text": texts[j * N + k], "cos": round(float(c[k]), 5), "reward": round(float(r[k]), 5), "n_tok": lens[j * N + k],
+                    alt_name: round(float(alt[j * N + k]), 5),
                     **({f"cos_w{a.also_window}": round(float(cos2[j * N + k]), 5)} if cos2 is not None else {})} for k in order[: a.top_k]]
             tg = targets[i]
-            row = {"t": i, "bank_id": tg["bank_id"], "vec_idx": tg["vec_idx"], "family": tg["family"],
-                   "orig_cos": round(float(ocos[j]), 5), "cos_mean": round(float(c.mean()), 5), "cos_std": round(float(c.std()), 5),
+            row = {"t": i, "bank_id": tg["bank_id"], "vec_idx": tg["vec_idx"], "family": tg["family"], "select": a.select,
+                   "orig_cos": round(float(ocos[j]), 5), "orig_" + alt_name: round(float(oalt[j]), 5), "cos_mean": round(float(c.mean()), 5), "cos_std": round(float(c.std()), 5),
+                   alt_name + "_max": round(float(alt[sl].max()), 5), alt_name + "_mean": round(float(alt[sl].mean()), 5),
                    "cos_max": round(float(c.max()), 5), "len_mean": round(float(np.mean(lens[sl])), 2),
                    "best": top[0], "topk": top, "n": N, "temperature": a.temperature, "window_last": a.reward_window_last, "ckpt": a.ckpt}
             if cos2 is not None:
@@ -217,6 +250,7 @@ def main():
                 row[f"cos_mean_w{a.also_window}"] = round(float(cos2[sl].mean()), 5)
             if a.probe:
                 row["cos_all"] = [round(float(x), 4) for x in c.tolist()]
+                row[alt_name + "_all"] = [round(float(x), 4) for x in alt[sl].tolist()]
                 row["len_all"] = lens[sl]
                 if cos2 is not None:
                     row[f"cos_all_w{a.also_window}"] = [round(float(x), 4) for x in cos2[sl].tolist()]
@@ -233,7 +267,7 @@ def main():
                 f"beat-orig {agg['beat'] / max(agg['targets'], 1):.2f} | len {agg['len_sum'] / max(agg['rollouts'], 1):.0f}")
     fout.close()
     man = {"ckpt": a.ckpt, "n_targets_total": len(targets), "n_done": len(done) + agg["targets"], "n_samples": N, "temperature": a.temperature,
-           "top_k": a.top_k, "max_new_tokens": a.max_new_tokens, "reward_window_last": a.reward_window_last, "also_window": a.also_window,
+           "top_k": a.top_k, "max_new_tokens": a.max_new_tokens, "reward_window_last": a.reward_window_last, "also_window": a.also_window, "select": a.select, "mu": a.mu,
            "len_penalty": [a.len_penalty_start, a.len_penalty_per_tok], "hnorm_served": hnorm, "injection_check": chk,
            "rollouts": agg["rollouts"], "wall_s": round(time.time() - t_start), "loop_s": round(time.time() - t_loop),
            "mean_cos": agg["cos_sum"] / max(agg["rollouts"], 1), "mean_best": agg["best_sum"] / max(agg["targets"], 1),
