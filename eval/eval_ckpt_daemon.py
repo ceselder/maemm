@@ -302,6 +302,7 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     import rl_hf as R
     import rl_disagg as DG
+    import eval_universal as EU      # sibling of this file (/pmx/eval); scorer centering protocol
     from mxf.config import INJECT_LAYER, MODEL
     from mxf.inject import get_layer
     from mxf.prompts import build_prompt_ids
@@ -522,6 +523,7 @@ def main():
         row = {**ev, **ex, **extras, "ckpt_step": s, "time/ckpt_eval_s": secs, "time/adapter_load_publish_s": t_load}
         if hnorm_on is not None:
             row["eval/marker_hnorm_adapter_on"] = hnorm_on
+        row["eval/scorer_centered"] = 1.0 if EU.scorer_centered() else 0.0   # 1 = cos(unit(h - mu), d) (fix 2026-09-18); 0 = legacy raw cosine
         if not a.no_wandb:
             wandb.log(row, commit=True)
         json.dump({"ckpt_step": s, "ckpt": ck, **extras, "metrics": row, "n_lora_tensors": n_t, "protocol": {
@@ -530,7 +532,7 @@ def main():
             "extra_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("xfams", [])}, "sae_slice_families": {f: len(EV["es"][f + "_dirs"]) for f in EV.get("sfams", [])}, "full_model": a.full_model,
             "policy_base": policy_base or MODEL, "hnorm_adapter_on": hnorm_on,
             "mlp_stats": a.mlp_stats if EV.get("mlp_stats") else None, "mlp_chance_acts": EV.get("mlp_chance_acts"),
-            "injection_check": chk}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
+            "injection_check": chk, "scorer": EU.scorer_protocol()}}, open(f"{a.out_dir}/ckpt_{s}.json", "w"), indent=1)
         if perdir is not None:
             json.dump({"ckpt_step": s, "ckpt": ck, "tag": a.tag, **extras, "protocol": {
                 "families": EV["fams"], "n_per_family": len(EV["es"][EV["fams"][0] + "_dirs"]), "bo": a.eval_bo, "temp": a.eval_temp,

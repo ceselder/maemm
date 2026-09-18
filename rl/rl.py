@@ -378,6 +378,19 @@ def _distinct_fraction(input_ids, attention_mask):
     return unique.float() / attention_mask.sum(1).clamp(min=1)
 
 
+
+def _center_mu(device):
+    """The layer-42 corpus mean for the cosine reward (eval_universal.center_mu: /data/acts27b/whiten_mu.npy, cached per device;
+    None when MAEMM_SCORER_CENTER=0). Imported lazily: eval_universal lives in /pmx/eval on Modal and in ../eval in the repo."""
+    try:
+        import eval_universal as EU
+    except ModuleNotFoundError:
+        for cand in ("/pmx/eval", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eval")):
+            if os.path.isdir(cand) and cand not in sys.path:
+                sys.path.insert(0, cand)
+        import eval_universal as EU
+    return EU.center_mu(device)
+
 @torch.no_grad()
 def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
     """Reward each generation through the CLEAN base model (adapter disabled, no injection).
@@ -423,7 +436,11 @@ def score(texts, dirs_rep, actor, tok, device, a, with_fluency=False):
                     h, mask = read_resid(actor, READ_LAYER, dict(enc), pool="all")
             keep = mask.clone()
             keep[:, 0] = False                                            # drop the sink position
-            hh = F.normalize(h, dim=-1) if a.reward_metric == "cosine" else h
+            if a.reward_metric == "cosine":                               # centered like every bank direction (fix 2026-09-18; see eval_universal.center_mu)
+                mu = _center_mu(device)
+                hh = F.normalize(h.float() - mu if mu is not None else h.float(), dim=-1)
+            else:
+                hh = h
             proj = torch.einsum("btd,bd->bt", hh, dirs_rep[idxs])
             sel = keep
             revcnt = sel.flip(1).cumsum(1).flip(1)                        # kept tokens from here to the end (last kept = 1)

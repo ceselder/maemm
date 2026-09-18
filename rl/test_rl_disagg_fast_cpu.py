@@ -6,6 +6,8 @@ list, and the flag defaults (both knobs off = legacy).
 """
 import importlib.util
 import os
+
+os.environ.setdefault("MAEMM_SCORER_CENTER", "0")   # fake d=6 model: no layer-42 corpus mean to subtract (see eval_universal.center_mu)
 import types
 
 import torch

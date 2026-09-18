@@ -230,13 +230,55 @@ def _reencode(gen_texts, actor, tok, device, sbatch=32):
         tok.padding_side = prev
 
 
+# ---------------------------------------------------------------------------------------------
+# scorer centering (fix 2026-09-18). Every target direction in the suite is MEAN-FREE: the training banks store
+# unit(act - mu) (data/collect_bank_worker.py, collect_fullctx_worker.py; mu = the layer-42 corpus mean, ||mu|| = 61,
+# one coordinate = 59.6) and every eval-cache family has cos(dir, mu) ~ 0. The model-side activation must be centered
+# the same way before the cosine. Until this fix the scorer normalised the RAW activation, so (d _|_ mu) every cosine
+# was the true centered cosine times ||h - mu|| / ||h||: the SOURCE TEXT itself scored ~.47 (short windows) / ~.55
+# (full-document tails) instead of 1, and every reported mean_all / RL reward was compressed by that token-dependent
+# factor. MAEMM_SCORER_CENTER=0 reproduces the legacy raw metric (only for re-deriving old numbers).
+# ---------------------------------------------------------------------------------------------
+CENTER_MU_PATH = os.environ.get("MAEMM_WHITEN_MU", "/data/acts27b/whiten_mu.npy")
+_CENTER_MU = {}
+
+
+def scorer_centered():
+    return os.environ.get("MAEMM_SCORER_CENTER", "1") != "0"
+
+
+def center_mu(device):
+    """[d] float32 corpus mean on `device` (cached per device), or None when centering is switched off. Hard-fails when the
+    mean file is missing: the scorer must never fall back to the legacy raw cosine silently."""
+    if not scorer_centered():
+        return None
+    key = str(device)
+    if key not in _CENTER_MU:
+        if not os.path.exists(CENTER_MU_PATH):
+            raise FileNotFoundError(f"scorer centering needs the layer-42 corpus mean at {CENTER_MU_PATH} (env MAEMM_WHITEN_MU); "
+                                    f"MAEMM_SCORER_CENTER=0 only to reproduce legacy raw-cosine numbers")
+        mu = torch.from_numpy(np.load(CENTER_MU_PATH).astype(np.float32))
+        assert mu.shape == (D_MODEL,), f"whiten_mu shape {tuple(mu.shape)} != ({D_MODEL},)"
+        _CENTER_MU[key] = mu.to(device)
+    return _CENTER_MU[key]
+
+
+def scorer_protocol():
+    """What the cosine scorer did, for every metrics json / transcript: centered or legacy-raw, and which mean."""
+    if not scorer_centered():
+        return {"centered": False, "mu_path": None, "mu_norm": None, "metric": "cos(unit(h), d)  [LEGACY: raw activation, compressed by ||h-mu||/||h||]"}
+    mu = center_mu("cpu")
+    return {"centered": True, "mu_path": CENTER_MU_PATH, "mu_norm": round(float(mu.norm()), 3), "metric": "cos(unit(h - mu), d)"}
+
+
 @torch.no_grad()
 def score_probe_cos(gen_texts, dirs, actor, tok, device):
     """max-over-content-token cosine(h_t, dir_i) for gen i; dirs [N,d] unit. == eval_dirs."""
     out = torch.zeros(len(gen_texts))
     for s, h, keep in _reencode(gen_texts, actor, tok, device):
-        d = dirs[s:s + h.shape[0]].to(device).float()                       # [b,d] unit
-        hn = F.normalize(h.float(), dim=-1)                                 # [b,T,d]
+        d = dirs[s:s + h.shape[0]].to(device).float()                       # [b,d] unit (mean-free)
+        mu = center_mu(device)
+        hn = F.normalize(h.float() - mu if mu is not None else h.float(), dim=-1)   # [b,T,d]  centered like every target
         cos = torch.einsum("btd,bd->bt", hn, d)                             # [b,T]
         out[s:s + h.shape[0]] = cos.masked_fill(~keep, -1.0).max(1).values.float().cpu()
     return out
