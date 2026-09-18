@@ -27,6 +27,17 @@ IDS = Path("~/shared/overnight/simple2m/ids.json").expanduser()
 REGISTRY = Path("~/shared/overnight/simple2m/doc_registry.json").expanduser()
 PROJ = "celestedeschamphelaere-personal/maxact-fast"
 SFT_RUN, RL_RUN = "simple2m_sft", "rl_simple2m_8x2048_anywin"
+# Scorer (fix 2026-09-18): every cosine in the suite used to be cos(unit(h), d) with a RAW layer-42 activation against mean-free targets,
+# compressing every number by ||h-mu||/||h|| (source text ~.5). The re-score with the centered scorer cos(unit(h-mu), d) lives under tags
+# <run>_c. MAEMM_SCORER=legacy rebuilds the old report from the old tags (kept for the record; data_legacy_scorer/ is a frozen copy).
+SCORER = os.environ.get("MAEMM_SCORER", "centered")
+SUF = "_c" if SCORER == "centered" else ""
+SCORER_NOTE = ("centered scorer cos(unit(h − μ), d), μ = layer-42 corpus mean" if SCORER == "centered"
+               else "LEGACY raw-activation scorer cos(unit(h), d): every value compressed by ‖h−μ‖/‖h‖ (source text ≈ .5)")
+
+
+def tagc(run):
+    return run + SUF
 SFT_WANDB, RL_WANDB = "e6w71sth", "5ud9qiuh"
 EFF_BATCH = 4096
 # reference arms (same evaluator families; v2 cache = the same 11 cosine families + 131k sae; they lack the v3 slice families)
@@ -101,12 +112,14 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--no-html", action="store_true"); ap.add_argument("--no-mirror", action="store_true"); a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True); (OUT / "data").mkdir(exist_ok=True)
     if not a.no_mirror:
-        mirror([f"sft_{SFT_RUN}", RL_RUN] + [V["run"] for V in VARIANTS.values()])
+        mirror([tagc(x) for x in [f"sft_{SFT_RUN}", RL_RUN] + [V["run"] for V in VARIANTS.values()] + [R["run"] for R in REFS.values()] + sorted({R["init_run"] for R in REFS.values()})])
     ids = json.load(open(IDS)); registry = json.load(open(REGISTRY)) if REGISTRY.exists() else None
-    sft = evals(f"sft_{SFT_RUN}"); rl = evals(RL_RUN)
+    sft = evals(tagc(f"sft_{SFT_RUN}")); rl = evals(tagc(RL_RUN))
+    if not sft or not rl:
+        raise SystemExit(f"[{SCORER}] no evals yet for {tagc(f'sft_{SFT_RUN}')} / {tagc(RL_RUN)} — nothing to plot")
     refs = {}
     for k, R in REFS.items():
-        ev = evals(R["run"]); init = [r for r in evals(R["init_run"]) if r["ckpt_step"] == R["init_step"]]
+        ev = evals(tagc(R["run"])); init = [r for r in evals(tagc(R["init_run"])) if r["ckpt_step"] == R["init_step"]]
         refs[k] = {**R, "evals": ev, "init_mean_all": init[0]["eval/mean_all"] if init else None}
     sft_final = sft[-1] if sft else None
     var_ids = ids.get("rl_variants", {})
@@ -122,7 +135,7 @@ def main():
                     dyn = wandb_series(rs[-1].id, ["reward/mean", "policy/entropy", "grad_norm", "policy/sampler_abs_dlogp", "ratio/clipfrac", "rollout/len_mean", "time/step_s"])
             except Exception as e:  # noqa
                 print(f"[variants] wandb lookup failed for {V['run']}: {e}")
-        variants[k] = {**V, "evals": evals(V["run"]), "dyn": dyn, "ids": var_ids.get(k, {}), "last_train_step": max(dyn["step"]) if dyn and dyn["step"] else None}
+        variants[k] = {**V, "evals": evals(tagc(V["run"])), "dyn": dyn, "ids": var_ids.get(k, {}), "last_train_step": max(dyn["step"]) if dyn and dyn["step"] else None}
     fetched = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     sft_dyn = wandb_series(SFT_WANDB, ["loss", "lr", "ex_per_s"])
     rl_dyn = wandb_series(RL_WANDB, ["reward/mean", "policy/entropy", "grad_norm", "policy/sampler_abs_dlogp", "ratio/clipfrac", "rollout/len_mean", "time/step_s",
@@ -140,7 +153,7 @@ def main():
             ax1.axhline(refs[k]["init_mean_all"], color=refs[k]["color"], ls=":", lw=1.1)
             ax1.annotate(f"{refs[k]['init_mean_all']:.3f} = {'5M-mix midtrain init (arms A/D/.425)' if k == 'a' else '2M-SAE midtrain init (arm S)'}", (xs[-1] if xs else 8, refs[k]["init_mean_all"]),
                          xytext=(-2, 4 if k == 'a' else -11), textcoords="offset points", fontsize=7.8, color=refs[k]["color"], ha="right")
-    ax1.set_xlabel("SFT: training rows seen (millions; 4,096 per step, exact 50/50 activations : SAE rows)"); ax1.set_ylabel("held-out fidelity: mean cosine over 10 direction families (eval cache v3 == v2 families)")
+    ax1.set_xlabel("SFT: training rows seen (millions; 4,096 per step, exact 50/50 activations : SAE rows)"); ax1.set_ylabel(f"held-out fidelity: mean cosine over 10 direction families\n({SCORER_NOTE})")
     ax1.set_title("SFT alone: held-out fidelity FALLS while train loss falls", fontsize=10, loc="left"); ax1.grid(color=GRID, lw=0.6); ax1.set_xlim(0, xs[-1] * 1.08 if xs else 8.5)
     # RL panel
     rx = [0] + [r["ckpt_step"] for r in rl]; ry = ([sft_final["eval/mean_all"]] if sft_final else []) + [r["eval/mean_all"] for r in rl]
@@ -165,8 +178,8 @@ def main():
     ax1.set_ylim(ymin, 0.45)
     claim = (f"A single 8M-row SFT from the base model (50/50 activations of 8-64 tokens of context with full-context targets + 2M-SAE encoder/decoder rows) DECLINES on held-out "
              f"fidelity from {ys[0]:.3f} ({xs[0]:.0f}M rows) to {ys[-1]:.3f} ({xs[-1]:.0f}M) while its train loss keeps falling; full-parameter RL from that final "
-             + (f"reaches {best_rl['eval/mean_all']:.3f} at step {best_rl['ckpt_step']} (arm A {next((r['eval/mean_all'] for r in refs['a']['evals'] if r['ckpt_step'] == best_rl['ckpt_step']), float('nan')):.3f} at the same step from a {refs['a']['init_mean_all']:.3f} init)"
-                if best_rl else "is running") + f" — Qwen3.6-27B activation-to-text inverter, 512 held-out directions per family, best-of-4 at T=1" + (f" (RL at step {rl_last_step} of 300)" if rl_last_step and rl_last_step < 300 and rl_dyn.get("state") == "running" else ""))
+             + (f"reaches {best_rl['eval/mean_all']:.3f} at step {best_rl['ckpt_step']} (arm A {next((r['eval/mean_all'] for r in refs['a']['evals'] if r['ckpt_step'] == best_rl['ckpt_step']), float('nan')):.3f} at the same step from a {(refs['a']['init_mean_all'] if refs['a']['init_mean_all'] is not None else float('nan')):.3f} init)"
+                if best_rl else "is running") + f" — Qwen3.6-27B activation-to-text inverter, 512 held-out directions per family, best-of-4 at T=1; {SCORER_NOTE}" + (f" (RL at step {rl_last_step} of 300)" if rl_last_step and rl_last_step < 300 and rl_dyn.get("state") == "running" else ""))
     fig.suptitle(wrap(claim, 165), fontsize=10.2, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.87)); savefig(fig, "fidelity_chain")
 
@@ -261,8 +274,8 @@ def main():
 
     # ---------------- data ----------------
     dd = OUT / "data"
-    json.dump({"generated_at": fetched, "run": SFT_RUN, "wandb": SFT_WANDB, "eff_batch": EFF_BATCH, "rows_per_ckpt": {r["ckpt_step"]: r["ckpt_step"] * EFF_BATCH for r in sft}, "evals": sft}, open(dd / "sft_evals.json", "w"), indent=1)
-    json.dump({"generated_at": fetched, "run": RL_RUN, "wandb": RL_WANDB, "init": sft_final, "evals": rl, "best": best_rl, "last_train_step": rl_last_step}, open(dd / "rl_evals.json", "w"), indent=1)
+    json.dump({"generated_at": fetched, "scorer": SCORER, "run": SFT_RUN, "wandb": SFT_WANDB, "eff_batch": EFF_BATCH, "rows_per_ckpt": {r["ckpt_step"]: r["ckpt_step"] * EFF_BATCH for r in sft}, "evals": sft}, open(dd / "sft_evals.json", "w"), indent=1)
+    json.dump({"generated_at": fetched, "scorer": SCORER, "run": RL_RUN, "wandb": RL_WANDB, "init": sft_final, "evals": rl, "best": best_rl, "last_train_step": rl_last_step}, open(dd / "rl_evals.json", "w"), indent=1)
     json.dump({"generated_at": fetched, "arms": {k: {kk: vv for kk, vv in R.items() if kk not in ("ls",)} for k, R in refs.items()}}, open(dd / "reference_arms.json", "w"), indent=1)
     json.dump({"generated_at": fetched, "shared_init": sft_final, "variants": {k: {kk: vv for kk, vv in V.items() if kk not in ("ls", "dyn")} for k, V in variants.items()},
                "dynamics": {k: V["dyn"] for k, V in variants.items() if V["dyn"]}}, open(dd / "rl_variants.json", "w"), indent=1, default=str)
@@ -276,7 +289,7 @@ def main():
     matched = {}
     for r in rl:
         s = r["ckpt_step"]; matched[s] = {"this": r["eval/mean_all"], **{k: next((x["eval/mean_all"] for x in R["evals"] if x["ckpt_step"] == s), None) for k, R in refs.items()}}
-    summ = {"generated_at": fetched, "sft_curve": [(r["ckpt_step"], round(r["eval/mean_all"], 4)) for r in sft], "sft_final_mean_all": sft_final["eval/mean_all"] if sft_final else None,
+    summ = {"generated_at": fetched, "scorer": SCORER, "scorer_note": SCORER_NOTE, "sft_curve": [(r["ckpt_step"], round(r["eval/mean_all"], 4)) for r in sft], "sft_final_mean_all": sft_final["eval/mean_all"] if sft_final else None,
             "sft_best": max(sft, key=lambda r: r["eval/mean_all"])["ckpt_step"] if sft else None, "rl_curve": [(r["ckpt_step"], round(r["eval/mean_all"], 4)) for r in rl],
             "rl_best": best_rl, "rl_last_train_step": rl_last_step, "rl_state": rl_dyn["state"] if rl_dyn else None, "matched_step_mean_all": matched,
             "ref_inits": {k: R["init_mean_all"] for k, R in refs.items()},
