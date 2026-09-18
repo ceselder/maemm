@@ -141,7 +141,7 @@ def plan(out_name: str, spec_json: str, seed: int = 2050, n_shards: int = 8, ove
               timeout=24 * 3600)
 def harvest_shard(out_name: str, shard: int, tag: str, ckpt: str, n_samples: int = 32, temperature: float = 1.0, top_k: int = 4,
                   max_new_tokens: int = 96, min_new_tokens: int = 8, reward_window_last: int = 0, dirs_per_call: int = 0,
-                  max_num_seqs: int = 2048, vllm_gpu_mem: float = 0.5, cuda_graphs: bool = True, probe: bool = False, seed: int = 0,
+                  max_num_seqs: int = 512, vllm_gpu_mem: float = 0.5, cuda_graphs: bool = True, probe: bool = False, seed: int = 0,
                   limit: int = 0, extra_args: str = "", partial_every_s: int = 600, also_window: int = 16):
     """Runs the worker on this container's GPU for shard `shard` of plan `out_name`; sampler config named `tag` (e.g. s250_t1.0).
     Partial output is copied to the volume every `partial_every_s` (shard_XX.partial.jsonl) and resumed from on restart."""

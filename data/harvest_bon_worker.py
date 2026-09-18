@@ -52,7 +52,7 @@ def main():
     ap.add_argument("--len-penalty-per-tok", type=float, default=0.00025)
     ap.add_argument("--len-penalty-start", type=int, default=8)
     ap.add_argument("--dirs-per-call", type=int, default=0, help="directions per generate() call; 0 = max_num_seqs // n_samples")
-    ap.add_argument("--max-num-seqs", type=int, default=2048)
+    ap.add_argument("--max-num-seqs", type=int, default=512, help="Qwen3.6 GDN recurrent state is allocated per sequence: 2048 OOMs next to the resident scorer")
     ap.add_argument("--max-num-batched-tokens", type=int, default=24576)
     ap.add_argument("--vllm-gpu-mem", type=float, default=0.5)
     ap.add_argument("--cuda-graphs", action="store_true")
