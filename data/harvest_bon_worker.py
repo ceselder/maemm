@@ -189,10 +189,14 @@ def main():
         for s0 in range(0, len(order), a.score_batch):
             ids_ = order[s0: s0 + a.score_batch]
             tt = [texts[i] if texts[i].strip() else " " for i in ids_]
-            e = tok(tt, return_tensors="pt", padding=True, truncation=True, max_length=95, add_special_tokens=False,
-                    pad_to_multiple_of=16)   # few distinct (B, T) shapes -> the GDN triton kernels autotune a handful of times, not ~90
-            inp = {"input_ids": torch.cat([torch.full((len(tt), 1), sink), e["input_ids"]], 1).to(device),
-                   "attention_mask": torch.cat([torch.ones(len(tt), 1, dtype=e["attention_mask"].dtype), e["attention_mask"]], 1).to(device)}
+            e = tok(tt, return_tensors="pt", padding=True, truncation=True, max_length=95, add_special_tokens=False)
+            ids_t, am_t = e["input_ids"], e["attention_mask"]
+            T = ids_t.shape[1]; Tp = ((T + 1 + 15) // 16) * 16 - 1      # sink + text padded to a multiple of 16 -> few distinct (B, T) shapes
+            if Tp > T:                                                     # (manual pad: HF refuses pad_to_multiple_of when max_length is not a multiple)
+                ids_t = torch.cat([ids_t, torch.full((len(tt), Tp - T), tok.pad_token_id, dtype=ids_t.dtype)], 1)
+                am_t = torch.cat([am_t, torch.zeros((len(tt), Tp - T), dtype=am_t.dtype)], 1)
+            inp = {"input_ids": torch.cat([torch.full((len(tt), 1), sink), ids_t], 1).to(device),
+                   "attention_mask": torch.cat([torch.ones(len(tt), 1, dtype=am_t.dtype), am_t], 1).to(device)}
             h, mask = read_resid(scorer, READ_LAYER, inp, pool="all")
             keep = mask.clone(); keep[:, 0] = False
             sel = keep
