@@ -172,7 +172,10 @@ def _trim_plan(tok, texts, peak_idx, n_tok, min_tok=TRIM_MIN_TOK, batch=4096):
     return keep, new_text, c, reason
 
 
-@app.function(image=image, gpu=SMALL_GPUS, cpu=16, memory=131072, ephemeral_disk=512 * 1024, volumes={"/data": vol}, timeout=8 * 3600)
+# MIX_MEMORY_MIB / MIX_DISK_MIB (deploy-time): the build stages a float32 [N, 5120] memmap on local disk = N x 20 KiB (8M rows -> 164 GB;
+# 20M rows -> 410 GB, which killed the 128 GB / 512 GiB default twice on 2026-09-18 with "Server has lost track of input").
+@app.function(image=image, gpu=SMALL_GPUS, cpu=16, memory=int(os.environ.get("MIX_MEMORY_MIB", 131072)), ephemeral_disk=int(os.environ.get("MIX_DISK_MIB", 512 * 1024)),
+              volumes={"/data": vol}, timeout=8 * 3600)
 def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overwrite: bool = False, threads: int = 48, exclude_json: str = "",
           trim_to_peak: str = "", trim_min_tok: int = TRIM_MIN_TOK, dense_frac: float = 0.5, eval_cache: str = EVAL_CACHE_V2):
     """exclude_json: JSON dict {source bank: path of a rows file} — rows listed under families[*].fail_vec_idx of that file are removed from
