@@ -36,7 +36,7 @@ SCORER_NOTE = ("centered scorer cos(unit(h − μ), d), μ = layer-42 corpus mea
                else "LEGACY raw-activation scorer cos(unit(h), d): every value compressed by ‖h−μ‖/‖h‖ (source text ≈ .5)")
 
 
-SFT20_RUN, RL20_RUN = "sft_simple2m20m_sft", "rl_simple2m20m_8x2048_anywin_centered"   # the SFT-scaling retest chain (2026-09-18): 20M rows, 80/20 acts/SAE
+SFT20_RUN, RL20_RUN = "sft_simple2m20m_sft", "rl_simple2m20m_8x2048_anywin"   # the SFT-scaling retest chain (2026-09-18): 20M rows, 80/20 acts/SAE
 NATIVE_CENTERED = {"rl_simple2m_8x2048_anywin_centered", SFT20_RUN, RL20_RUN}
 # distillation chain (2026-09-18): 2M fresh activations x best-of-16 rollouts of the step-250 policy (raw-reward selection) -> SFT from base -> RL (raw reward)
 DIST_SFT_RAW, DIST_SFT_CEN = "sft_distill_fresh2m_bo16_sft_raw", "sft_distill_fresh2m_bo16_sft"      # same checkpoints, two evaluators

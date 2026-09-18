@@ -1,7 +1,7 @@
 """SIMPLE2M-20M chain driver (2026-09-18): the SFT-SCALING retest. Same recipe as simple2m_chain_driver.py with ONE change in the SFT mix:
 the 2M-SAE rows stay at 2M encoder + 2M decoder but are only 20% of the corpus; short-context (8-64) full-context-target activations are
 scaled to 80% (16M = the existing 4M bank + a new 12M bank from Ultra-FineWeb docs [6.1M, ...)). 20M rows, one epoch, full FT from the base
-model, seeded global shuffle (compose layout) + --length-bucket i.i.d. steps, then RL on the SAME pool with the CENTERED reward (apps *-s2m-c, scorer fix f9b5095).
+model, seeded global shuffle (compose layout) + --length-bucket i.i.d. steps, then RL on the SAME pool with the SAME (legacy) reward as the 8M main arm (the centered-reward rerun lost at identical flags); evals centered.
 Question: does more activation SFT cap higher after RL than the 8M 50/50 chain (.60 centered)?
 
 --- original header follows ---
@@ -36,14 +36,14 @@ IDS = os.path.expanduser("~/shared/overnight/simple2m_20m/ids.json")
 LOG = os.path.expanduser("~/shared/overnight/simple2m_20m/driver.log")
 V3 = "/data/eval_universal_ho/eval_sets_heldout_v3.pt"
 APPS = {"bank": "maemm-sae2m-bank-s2m", "collect": "maemm-collect-bank-s2m", "store": "maemm-acts-ufw-s2m", "long": "maemm-ufw-long-bank-s2m",
-        "compose": "maemm-mix-5m-bank-s2m-big", "sft": "maemm-sft-fullft-s2m", "eval": "maemm-eval-ckpt-s2m-c", "rl": "maemm-rl-disagg-fullparam-s2m-c"}   # -big: 256 GiB RAM / 1.5 TiB disk for the 20M compose   # -c = centered scorer/reward (fix f9b5095)
+        "compose": "maemm-mix-5m-bank-s2m-big", "sft": "maemm-sft-fullft-s2m", "eval": "maemm-eval-ckpt-s2m-c", "rl": "maemm-rl-disagg-fullparam-s2m"}   # eval -c = centered scorer; rl = LEGACY reward app (pre-fix rl.py): the centered-reward rerun was worse at identical flags (2026-09-18), so the 20M chain's RL uses the same reward as the 8M main arm for comparability   # -c = centered scorer/reward (fix f9b5095)
 SFT_RUN, SFT_MIX = "simple2m20m_sft", "mix_simple2m20m_sft"
 # The 20M composed bank SEGFAULTED 3x in the 12M-vector scatter (Modal "Runner segmentation fault (SIGSEGV), exit code 139"; 128 GiB and
 # 256 GiB containers alike). The SFT trainer reads MULTI-PART banks natively (--data-dir a,b = virtual concatenation; sft/test_multibank.py),
 # and --length-bucket draws every optimizer step as an i.i.d. window over ALL rows, so the same 80/20 mix is fed WITHOUT composing:
 #   mix_simple2m_sft (4M acts + 2M enc + 2M dec, f32) + ufw_ctx8_64_sft_12m (12M acts, f16) = 20M rows, 16M acts / 4M SAE.
 DATA_DIR = "/data/banks/mix_simple2m_sft,/data/banks/ufw_ctx8_64_sft_12m"
-RL_RUN, RL_POOL = "rl_simple2m20m_8x2048_anywin_centered", "mix_simple2m_rl"   # same RL pool as simple2m
+RL_RUN, RL_POOL = "rl_simple2m20m_8x2048_anywin", "mix_simple2m_rl"   # same RL pool + same (legacy) reward as the 8M main arm
 EFF_BATCH = 4096                                   # micro 32 x grad-accum 16 x 8 GPUs
 SFT_EXTRA = ("--full-ft --prefix-cache --grad-ckpt 0 --autocast-bf16 --log-steps 1 --grad-accum 16 --pad-multiple 1 --prefix-share-step "
              "--fsdp-prefetch 2 --length-bucket")  # NO --init-adapter: the policy starts from the base model.
@@ -237,7 +237,7 @@ if not stage(d, "rl"):
                                                                               extra_args=f"--eval-cache {V3} --no-extra-evals")
         d["rl"] = {"train": t.object_id, "eval": e.object_id, "run": RL_RUN, "save": save_dir, "policy_base": policy_base,
                    "pool": f"/data/banks/{RL_POOL}", "lr": "1e-6", "group_size": 8, "groups_per_step": 2048, "steps": RL_STEPS, "split": "2+6",
-                   "reward": "CENTERED max cosine over the WHOLE rollout span, cos(unit(h - mu), d) (--reward-window-last 0; scorer fix f9b5095)", "extra": extra, "app": APPS["rl"], "eval_app": APPS["eval"],
+                   "reward": "LEGACY max cosine over the WHOLE rollout span (raw-activation cosine, same as the 8M main arm; --reward-window-last 0); EVAL is centered", "extra": extra, "app": APPS["rl"], "eval_app": APPS["eval"],
                    "eval_cache": V3, "spawned": now()}; save(d)
         log(f"RL spawned: train {t.object_id} eval {e.object_id}")
         discord(f"SFT DONE -> full-param RL launched from {policy_base}: {RL_RUN} (lr 1e-6, 2+6, 8x2048, whole-span reward, 300 steps) on {RL_POOL}; train {t.object_id}")
