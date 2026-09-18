@@ -36,6 +36,37 @@ def _vllm_marker_norm(llm, prompt_ids, marker, inject_layer):
     return act["residual_stream"][0].float()[marker].norm().item()
 
 
+def _generate_noprob(llm, a, tok, prompt_ids, marker, dirs, hnorm, eos_ids, key_prefix):
+    """rl_disagg._generate_block without per-token logprobs (RL needs them for the behaviour policy; the harvest does not, and the
+    151k-vocab log-softmax + D2H per decode step is pure overhead here). Same steering RPC protocol, same stop handling."""
+    import pickle
+    import time as _t
+    import rl_hf as R
+    from vllm import SamplingParams
+    G = a.group_size
+    keys = [f"{key_prefix}_{i}" for i in range(len(dirs))]
+    payload = {k: [R._steer_vec(v, hnorm, marker)] for k, v in zip(keys, dirs)}
+    llm.collective_rpc("set_steering_data_many", args=(pickle.dumps(payload),))
+    params = [SamplingParams(n=G, temperature=a.temperature, top_p=1.0, top_k=0, min_p=0.0, repetition_penalty=1.0, max_tokens=a.max_new_tokens,
+                             min_tokens=a.min_new_tokens, stop_token_ids=sorted(eos_ids), extra_args={"_steering_id": k}) for k in keys]
+    reqs = [{"prompt_token_ids": list(prompt_ids)} for _ in keys]
+    t1 = _t.time()
+    try:
+        outs = llm.generate(reqs, params, use_tqdm=False)
+    finally:
+        llm.collective_rpc("clear_steering_data_many", args=(keys,))
+    gen_s = _t.time() - t1
+    gen_ids = []
+    for out in outs:
+        assert len(out.outputs) == G, f"expected {G} samples, got {len(out.outputs)}"
+        for o in out.outputs:
+            g = list(o.token_ids)
+            if o.finish_reason == "stop" and (not g or g[-1] not in eos_ids):
+                g.append(int(o.stop_reason) if isinstance(o.stop_reason, int) else int(tok.eos_token_id))
+            gen_ids.append(R._trim_at_stop(g, eos_ids))
+    return gen_ids, gen_s
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True, help="full-model checkpoint dir (SAVE_DONE) served by vLLM, or the base MODEL id")
@@ -58,7 +89,7 @@ def main():
     ap.add_argument("--max-num-batched-tokens", type=int, default=24576)
     ap.add_argument("--vllm-gpu-mem", type=float, default=0.5)
     ap.add_argument("--cuda-graphs", action="store_true")
-    ap.add_argument("--score-batch", type=int, default=256)
+    ap.add_argument("--score-batch", type=int, default=512)
     ap.add_argument("--scorer-layers", type=int, default=43, help="keep decoder layers [0, n) of the clean base (0 = all 64)")
     ap.add_argument("--probe", action="store_true", help="store every sample's cosine + length (best-of-n curves)")
     ap.add_argument("--seed", type=int, default=0)
@@ -164,7 +195,7 @@ def main():
     for ci, c0 in enumerate(chunks):
         idx = todo[c0: c0 + dpc]
         d = dirs[idx]
-        gen_ids, _lps, _app, gen_s = DG._generate_block(llm, ea, tok, prompt_ids, marker, d, hnorm, None, eos_ids, f"h{c0}")
+        gen_ids, gen_s = _generate_noprob(llm, ea, tok, prompt_ids, marker, d, hnorm, eos_ids, f"h{c0}")
         texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
         lens = [len(g) for g in gen_ids]
         cos, ocos, cos2, ocos2, score_s = _score(idx, d, texts, lens)
