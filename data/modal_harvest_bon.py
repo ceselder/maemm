@@ -142,7 +142,7 @@ def plan(out_name: str, spec_json: str, seed: int = 2050, n_shards: int = 8, ove
 def harvest_shard(out_name: str, shard: int, tag: str, ckpt: str, n_samples: int = 32, temperature: float = 1.0, top_k: int = 4,
                   max_new_tokens: int = 96, min_new_tokens: int = 8, reward_window_last: int = 0, dirs_per_call: int = 0,
                   max_num_seqs: int = 512, vllm_gpu_mem: float = 0.5, cuda_graphs: bool = True, probe: bool = False, seed: int = 0,
-                  limit: int = 0, extra_args: str = "", partial_every_s: int = 600, also_window: int = 16):
+                  limit: int = 0, extra_args: str = "", partial_every_s: int = 600, also_window: int = 16, queue_mult: int = 4, quant: str = ""):
     """Runs the worker on this container's GPU for shard `shard` of plan `out_name`; sampler config named `tag` (e.g. s250_t1.0).
     Partial output is copied to the volume every `partial_every_s` (shard_XX.partial.jsonl) and resumed from on restart."""
     vol.reload()
@@ -167,7 +167,7 @@ def harvest_shard(out_name: str, shard: int, tag: str, ckpt: str, n_samples: int
            "--out", out_local, "--manifest", man_local, "--n-samples", str(n_samples), "--temperature", str(temperature), "--top-k", str(top_k),
            "--max-new-tokens", str(max_new_tokens), "--min-new-tokens", str(min_new_tokens), "--reward-window-last", str(reward_window_last),
            "--dirs-per-call", str(dirs_per_call), "--max-num-seqs", str(max_num_seqs), "--vllm-gpu-mem", str(vllm_gpu_mem), "--seed", str(seed),
-           "--also-window", str(also_window)]
+           "--also-window", str(also_window), "--queue-mult", str(queue_mult)] + (["--quant", quant] if quant else [])
     cmd += ["--cuda-graphs"] if cuda_graphs else []
     cmd += ["--probe"] if probe else []
     cmd += ["--resume"] if resume else []
@@ -186,23 +186,30 @@ def harvest_shard(out_name: str, shard: int, tag: str, ckpt: str, n_samples: int
                 print(f"[modal] partial copy failed: {e}", flush=True)
     threading.Thread(target=_partial_loop, daemon=True).start()
     saw_done = False
+    rc = None
     try:
         for line in p.stdout:
             print(line, end="", flush=True)
             if "HARVEST_DONE" in line:
                 saw_done = True
-        rc = p.wait()
+                break          # the worker os._exit()s right after this line, but its vLLM engine-core child keeps the pipe open -> do not wait on EOF
+        if saw_done:
+            try:
+                rc = p.wait(timeout=30)
+            except Exception:  # noqa
+                rc = 0
+        else:
+            rc = p.wait()
     finally:
         stop.set()
-        if p.poll() is None:
-            try:
-                os.killpg(p.pid, signal.SIGTERM); p.wait(timeout=20)
-            except Exception:  # noqa
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except Exception:  # noqa
-                    pass
-    if not (saw_done and os.path.exists(man_local)):
+        # reap the whole process group (worker + engine core) whether we broke out or it died
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+            time.sleep(3)
+            os.killpg(p.pid, signal.SIGKILL)
+        except Exception:  # noqa
+            pass
+    if not (saw_done and os.path.exists(man_local)):   # (HARVEST_DONE is printed AFTER the manifest is written)
         if os.path.exists(out_local):
             shutil.copy(out_local, partial); vol.commit()
         raise RuntimeError(f"harvest worker exited rc={rc} without HARVEST_DONE (partial saved: {os.path.exists(partial)})")
@@ -217,18 +224,24 @@ def harvest_shard(out_name: str, shard: int, tag: str, ckpt: str, n_samples: int
 
 
 # ------------------------------------------------------------------------------------------------------------------ helpers
-def _load_shards(out_name, tags):
-    """{(bank_id, vec_idx): {tag: row}} over every finished shard of the given tags (partial files ignored)."""
+def _load_shards(out_name, tags, allow_partial=True):
+    """{(bank_id, vec_idx): {tag: row}} over every shard file of the given tags; a shard's .partial.jsonl is used only when no final
+    file exists (torn last line skipped)."""
     import glob
     rows = {}
     files = []
     for tag in tags:
-        for f in sorted(glob.glob(f"{HROOT}/{out_name}/{tag}/shard_*.jsonl")):
-            if f.endswith(".partial.jsonl"):
-                continue
+        finals = sorted(glob.glob(f"{HROOT}/{out_name}/{tag}/shard_[0-9][0-9].jsonl"))
+        partials = sorted(glob.glob(f"{HROOT}/{out_name}/{tag}/shard_[0-9][0-9].partial.jsonl")) if allow_partial else []
+        have = {os.path.basename(f)[:8] for f in finals}
+        use = finals + [f for f in partials if os.path.basename(f)[:8] not in have]
+        for f in use:
             files.append(f)
             for line in open(f):
-                r = json.loads(line)
+                try:
+                    r = json.loads(line)
+                except Exception:  # noqa - torn tail of a partial file
+                    continue
                 rows.setdefault((r["bank_id"], r["vec_idx"]), {})[tag] = r
     return rows, files
 
