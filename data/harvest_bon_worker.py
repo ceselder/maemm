@@ -121,10 +121,16 @@ def main():
                          max_num_batched_tokens=a.max_num_batched_tokens, group_size=N, temperature=a.temperature,
                          score_batch=a.score_batch, reward_metric="cosine", reward_window_last=a.reward_window_last,
                          reward_pos_penalty=0.0, reward_topk=1, log_reward=False)
-    if a.quant:   # _build_engine does `from vllm import LLM` at call time -> inject the quantization kwarg through the module attribute
-        import vllm as _vllm
+    if a.quant:   # _build_engine does `from vllm import LLM` at call time -> inject the quantization kwarg through the module attribute.
+        import vllm as _vllm   # must stay a CLASS: vllm_lens patches LLM.generate at class level (a lambda broke with "'function' has no attribute 'generate'")
         _LLM = _vllm.LLM
-        _vllm.LLM = lambda **kw: _LLM(quantization=a.quant, **kw)
+        _q = a.quant
+
+        class _QuantLLM(_LLM):
+            def __init__(self, *args, **kw):
+                kw.setdefault("quantization", _q)
+                super().__init__(*args, **kw)
+        _vllm.LLM = _QuantLLM
         log(f"sampler weights served with quantization={a.quant}")
     llm = DG._build_engine(ea, 0, p_len, a.max_num_seqs, a.cuda_graphs, "harvest")
     hnorm = _vllm_marker_norm(llm, prompt_ids, marker, INJECT_LAYER)
