@@ -179,7 +179,9 @@ def main():
     ax2.legend(loc="lower right", fontsize=7.0, frameon=False)
     ax1.legend(loc="upper right", fontsize=7.6, frameon=False)
     ymin = min([min(ys)] + [min(r["eval/mean_all"] for r in R["evals"]) for R in refs.values() if R["evals"]] + [R["init_mean_all"] for R in refs.values() if R["init_mean_all"]]) - 0.02
-    ax1.set_ylim(ymin, 0.45)
+    ymax = max([max(ys)] + [max(r["eval/mean_all"] for r in rl)] + [max((r["eval/mean_all"] for r in R["evals"]), default=0) for R in refs.values()]
+               + [max((r["eval/mean_all"] for r in V["evals"]), default=0) for V in variants.values()]) + 0.02
+    ax1.set_ylim(ymin, ymax)
     claim = (f"A single 8M-row SFT from the base model (50/50 activations of 8-64 tokens of context with full-context targets + 2M-SAE encoder/decoder rows) DECLINES on held-out "
              f"fidelity from {ys[0]:.3f} ({xs[0]:.0f}M rows) to {ys[-1]:.3f} ({xs[-1]:.0f}M) while its train loss keeps falling; full-parameter RL from that final "
              + (f"reaches {best_rl['eval/mean_all']:.3f} at step {best_rl['ckpt_step']} (arm A {next((r['eval/mean_all'] for r in refs['a']['evals'] if r['ckpt_step'] == best_rl['ckpt_step']), float('nan')):.3f} at the same step from a {(refs['a']['init_mean_all'] if refs['a']['init_mean_all'] is not None else float('nan')):.3f} init)"
