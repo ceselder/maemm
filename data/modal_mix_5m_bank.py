@@ -310,6 +310,12 @@ def build(out_name: str = "mix_5m", spec_json: str = "", seed: int = 2030, overw
             assert 0.98 < nn.min() and nn.max() < 1.02, (bank, nn.min(), nn.max())
             x /= nn[:, None]                                     # re-normalize (f16 sources carry ~1e-4 norm error)
             vecs[outs] = x
+            if (c0 // CH) % 16 == 15:                            # every 512k rows (10 GB of f32 scatter): msync so dirty page-cache stays bounded --
+                vecs.flush()                                     # the 20M-row build (410 GB staging) was OOM-killed twice by dirty pages at 128 and 256 GiB
+                try:
+                    _fdv = os.open(f"{stage}/vecs.f32", os.O_RDONLY); os.posix_fadvise(_fdv, 0, 0, os.POSIX_FADV_DONTNEED); os.close(_fdv)
+                except Exception:  # noqa
+                    pass
         os.close(fd)
         _log(f"vectors <- {bank}: {len(src_rows)} rows ({'dense' if dense else 'random'} reads, {time.time() - t0:.0f}s)")
     vecs.flush()
