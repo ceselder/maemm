@@ -258,7 +258,7 @@ def main():
         for k, V in arms:
             if not V["evals"]: continue
             xx = [0] + [r["ckpt_step"] for r in V["evals"]]
-            axes[0].plot(xx, [sft_final["eval/mean_all"]] + [r["eval/mean_all"] for r in V["evals"]], ls=V["ls"], marker="o", ms=4.5, lw=2 if k == "main" else 1.6, color=V["color"], label=V["label"])
+            axes[0].plot(xx, [sft_final["eval/mean_all"]] + [r["eval/mean_all"] for r in V["evals"]], ls=V["ls"], marker="o", ms=4.5, lw=2 if k == "main" else 1.6, color=V["color"], label=V["short"])
             if k == "main":
                 for x, y in zip(xx[1:], [r["eval/mean_all"] for r in V["evals"]]): axes[0].annotate(f"{y:.3f}", (x, y), xytext=(0, 6), textcoords="offset points", ha="center", fontsize=7, color=V["color"])
             axes[1].plot(xx, [sft_final.get("eval/sae2m_enc/fired", np.nan)] + [r.get("eval/sae2m_enc/fired", np.nan) for r in V["evals"]], ls=V["ls"], marker="o", ms=4, lw=1.6, color=V["color"], label=f"{V['short']}: encoder")
@@ -267,8 +267,8 @@ def main():
                 st = np.array(V["dyn"]["step"]); ev = np.array([np.nan if x is None else x for x in V["dyn"]["policy/entropy"]], float)
                 if len(ev) >= 10: ker = np.ones(10) / 10; axes[2].plot(st[9:], np.convolve(np.nan_to_num(ev, nan=np.nanmean(ev)), ker, mode="valid"), ls=V["ls"], lw=1.7, color=V["color"], label=V["short"])
         a_ev = refs["a"]["evals"]
-        if a_ev: axes[0].plot([r["ckpt_step"] for r in a_ev], [r["eval/mean_all"] for r in a_ev], ls="-", marker="s", ms=3, lw=1.1, color=refs["a"]["color"], alpha=0.8, label="reference: arm A (midtrain init, last-5 reward)")
-        axes[0].set_title("held-out fidelity (mean_all) per checkpoint", fontsize=10, loc="left"); axes[0].set_ylabel("mean cosine over 10 held-out direction families"); axes[0].legend(fontsize=7, frameon=False, loc="lower right")
+        if a_ev: axes[0].plot([r["ckpt_step"] for r in a_ev], [r["eval/mean_all"] for r in a_ev], ls="-", marker="s", ms=3, lw=1.1, color=refs["a"]["color"], alpha=0.8, label="arm A (midtrain init, last-5)")
+        axes[0].set_title("held-out fidelity (mean_all) per checkpoint", fontsize=10, loc="left"); axes[0].set_ylabel("mean cosine over 10 held-out direction families"); axes[0].legend(fontsize=6.8, frameon=False, loc="lower right"); axes[0].set_ylim(bottom=sft_final["eval/mean_all"] - 0.06)
         axes[1].set_title("held-out 2M-SAE features fired (encoder = circles, decoder = squares)", fontsize=10, loc="left"); axes[1].set_ylabel("fraction of 512 held-out features above the gate"); axes[1].legend(fontsize=6.8, frameon=False, loc="upper left", ncol=2); axes[1].set_ylim(0, 0.62)
         axes[2].set_title("policy entropy (10-step mean)", fontsize=10, loc="left"); axes[2].set_ylabel("entropy (nats / token)"); axes[2].legend(fontsize=7, frameon=False)
         for ax in axes: ax.grid(color=GRID, lw=0.6); ax.set_xlabel("RL step (16,384 rollouts per step in every arm; step 0 = the shared SFT init)")
