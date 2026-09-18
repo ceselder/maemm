@@ -36,8 +36,11 @@ SCORER_NOTE = ("centered scorer cos(unit(h − μ), d), μ = layer-42 corpus mea
                else "LEGACY raw-activation scorer cos(unit(h), d): every value compressed by ‖h−μ‖/‖h‖ (source text ≈ .5)")
 
 
+NATIVE_CENTERED = {"rl_simple2m_8x2048_anywin_centered"}   # runs evaluated with the centered scorer from the start (no _c re-score tag)
+
+
 def tagc(run):
-    return run + SUF
+    return run if run in NATIVE_CENTERED else run + SUF
 SFT_WANDB, RL_WANDB = "e6w71sth", "5ud9qiuh"
 EFF_BATCH = 4096
 # reference arms (same evaluator families; v2 cache = the same 11 cosine families + 131k sae; they lack the v3 slice families)
@@ -52,6 +55,7 @@ THIS_C, SFT_C = "#c0392b", "#c0392b"
 VARIANTS = {
     "v16x1024":              {"run": "rl_simple2m_16x1024_anywin",         "short": "16x1024 whole-span", "label": "variant: 16 prompts x 1,024 rollouts, lr 1e-6, WHOLE-span reward",          "color": "#d98a2b", "ls": (0, (4, 2)), "reward_note": "whole-span reward (comparable to the main arm)"},
     "v8x2048_last16_lr5e-7": {"run": "rl_simple2m_8x2048_last16_lr5e-7",   "short": "last-16 reward, lr 5e-7", "label": "variant: 8x2048, lr 5e-7, reward on the LAST 16 tokens only",              "color": "#5c8fd6", "ls": (0, (1, 1.5)), "reward_note": "reward = max activation over the last 16 tokens (NOT comparable to whole-span reward)"},
+    "centered_reward":       {"run": "rl_simple2m_8x2048_anywin_centered",    "short": "CENTERED reward (8x2048)", "label": "main recipe again with the FIXED reward cos(unit(h − μ), d); every other flag identical", "color": "#111111", "ls": "-", "reward_note": "centered whole-span reward (the fix); comparable to the main arm's centered re-score"},
     "v8x2048_last16_lr1e-6": {"run": "rl_simple2m_8x2048_last16_lr1e-6",   "short": "last-16 reward, lr 1e-6", "label": "variant: 8x2048, lr 1e-6, reward on the LAST 16 tokens only",              "color": "#3f9a4e", "ls": (0, (4, 1.5, 1, 1.5)), "reward_note": "reward = max activation over the last 16 tokens (NOT comparable to whole-span reward)"},
 }
 INK, INK2, GRID = "#2b2b2b", "#6b6b6b", "#e6e2dc"
