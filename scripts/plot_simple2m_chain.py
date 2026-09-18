@@ -273,8 +273,9 @@ def main():
         axes[2].set_title("policy entropy (10-step mean)", fontsize=10, loc="left"); axes[2].set_ylabel("entropy (nats / token)"); axes[2].legend(fontsize=7, frameon=False)
         for ax in axes: ax.grid(color=GRID, lw=0.6); ax.set_xlabel("RL step (16,384 rollouts per step in every arm; step 0 = the shared SFT init)")
         prog = ", ".join(f"{V['short']} at step {V['last_train_step']}" for k, V in variants.items() if V["last_train_step"])
-        fig.suptitle(wrap("Four RL runs from the SAME SFT init: the main arm (8 prompts x 2,048 rollouts, whole-span reward, lr 1e-6) vs 16x1,024 prompts/rollouts, and vs rewarding only the last 16 generated tokens at lr 5e-7 / 1e-6 "
-                          "— the three lr 1e-6 arms are indistinguishable on mean_all and share one entropy trajectory, and in EVERY one of them held-out 2M-SAE firing peaks at step 100-150 and decays afterwards while mean_all stays flat: neither the batch shape nor the reward window prevents the decay; last-16 at lr 5e-7 lags on fidelity and fires far fewer held-out features"
+        n_arms = 1 + sum(1 for V in variants.values() if V["evals"])
+        fig.suptitle(wrap(f"{n_arms} RL runs from the SAME SFT init: the main arm (8 prompts x 2,048 rollouts, whole-span reward, lr 1e-6) vs 16x1,024 prompts/rollouts, and vs rewarding only the last 16 generated tokens at lr 5e-7 / 1e-6 "
+                          "— the three legacy lr 1e-6 arms are indistinguishable on mean_all and share one entropy trajectory, and in EVERY one of them held-out 2M-SAE firing peaks at step 100-150 and decays afterwards while mean_all stays flat: neither the batch shape nor the reward window prevents the decay; last-16 at lr 5e-7 lags on fidelity and fires far fewer held-out features"
                           + (f" (in progress: {prog})" if prog else ""), 165), fontsize=10.2, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.88)); savefig(fig, "rl_variants")
 
