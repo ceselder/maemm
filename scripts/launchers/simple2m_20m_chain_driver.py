@@ -38,6 +38,11 @@ V3 = "/data/eval_universal_ho/eval_sets_heldout_v3.pt"
 APPS = {"bank": "maemm-sae2m-bank-s2m", "collect": "maemm-collect-bank-s2m", "store": "maemm-acts-ufw-s2m", "long": "maemm-ufw-long-bank-s2m",
         "compose": "maemm-mix-5m-bank-s2m-big", "sft": "maemm-sft-fullft-s2m", "eval": "maemm-eval-ckpt-s2m-c", "rl": "maemm-rl-disagg-fullparam-s2m-c"}   # -big: 256 GiB RAM / 1.5 TiB disk for the 20M compose   # -c = centered scorer/reward (fix f9b5095)
 SFT_RUN, SFT_MIX = "simple2m20m_sft", "mix_simple2m20m_sft"
+# The 20M composed bank SEGFAULTED 3x in the 12M-vector scatter (Modal "Runner segmentation fault (SIGSEGV), exit code 139"; 128 GiB and
+# 256 GiB containers alike). The SFT trainer reads MULTI-PART banks natively (--data-dir a,b = virtual concatenation; sft/test_multibank.py),
+# and --length-bucket draws every optimizer step as an i.i.d. window over ALL rows, so the same 80/20 mix is fed WITHOUT composing:
+#   mix_simple2m_sft (4M acts + 2M enc + 2M dec, f32) + ufw_ctx8_64_sft_12m (12M acts, f16) = 20M rows, 16M acts / 4M SAE.
+DATA_DIR = "/data/banks/mix_simple2m_sft,/data/banks/ufw_ctx8_64_sft_12m"
 RL_RUN, RL_POOL = "rl_simple2m20m_8x2048_anywin_centered", "mix_simple2m_rl"   # same RL pool as simple2m
 EFF_BATCH = 4096                                   # micro 32 x grad-accum 16 x 8 GPUs
 SFT_EXTRA = ("--full-ft --prefix-cache --grad-ckpt 0 --autocast-bf16 --log-steps 1 --grad-accum 16 --pad-multiple 1 --prefix-share-step "
@@ -172,12 +177,12 @@ if not stage(d, "compose_sft"):
 if "sft" not in d:
     n_rows = d["compose_sft"]["n_examples"]; steps = math.ceil(n_rows / EFF_BATCH)
     if "sft" not in d:
-        t = modal.Function.from_name(APPS["sft"], "train").spawn(run_name=SFT_RUN, data_dir=f"/data/banks/{SFT_MIX}", n_ckpts=10, epochs=1,
+        t = modal.Function.from_name(APPS["sft"], "train").spawn(run_name=SFT_RUN, data_dir=DATA_DIR, n_ckpts=10, epochs=1,
                                                                   batch_size=32, lr=1e-5, max_seq=192, backend="nccl", extra_args=SFT_EXTRA)
         e = modal.Function.from_name(APPS["eval"], "fullmodel_daemon").spawn(ckpt_dir=f"/data/sft_mix/{SFT_RUN}", tag=f"sft_{SFT_RUN}",
                                                                               wandb_name=f"{SFT_RUN}_eval", final_step=steps,
                                                                               extra_args=f"--eval-cache {V3} --no-extra-evals")
-        d["sft"] = {"train": t.object_id, "eval": e.object_id, "run": SFT_RUN, "save": f"/data/sft_mix/{SFT_RUN}", "data": f"/data/banks/{SFT_MIX}",
+        d["sft"] = {"train": t.object_id, "eval": e.object_id, "run": SFT_RUN, "save": f"/data/sft_mix/{SFT_RUN}", "data": DATA_DIR,
                     "eff_batch": EFF_BATCH, "micro_batch": 32, "grad_accum": 16, "lr": 1e-5, "max_seq": 192, "steps_expected": steps, "init": "base model",
                     "extra": SFT_EXTRA, "app": APPS["sft"], "eval_app": APPS["eval"], "eval_cache": V3, "spawned": now()}; save(d)
         log(f"SFT spawned: train {t.object_id} eval {e.object_id} ({steps} steps expected)")
