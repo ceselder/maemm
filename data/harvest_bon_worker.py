@@ -126,28 +126,46 @@ def main():
         f"{'OK' if chk['ok'] else 'FAIL'}")
     assert chk["ok"], f"injection proof failed: {chk}"
 
-    # ---- generate / score / select ----
+    # ---- generate / score / select (scoring of chunk k overlaps the generation of chunk k+1: the vLLM engine core is a separate
+    #      process, so the HF scorer forward and the decode steps share the GPU instead of alternating) ----
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=1)
+
+    def _score(idx, d, texts, lens):
+        t1 = time.time()
+        with torch.inference_mode():
+            dirs_rep = d.repeat_interleave(N, 0).to(device)
+            cos = DG.score_bucketed(R, texts, dirs_rep, scorer, tok, device, ea, lens).float().cpu()
+            orig_texts = [targets[i]["target_text"] for i in idx]
+            ocos = R.score(orig_texts, d.to(device), scorer, tok, device, ea).float().cpu()
+            cos2 = ocos2 = None
+            if a.also_window >= 0 and a.also_window != a.reward_window_last:
+                ea.reward_window_last = a.also_window
+                cos2 = DG.score_bucketed(R, texts, dirs_rep, scorer, tok, device, ea, lens).float().cpu()
+                ocos2 = R.score(orig_texts, d.to(device), scorer, tok, device, ea).float().cpu()
+                ea.reward_window_last = a.reward_window_last
+        return cos, ocos, cos2, ocos2, time.time() - t1
+
     fout = open(a.out, "a")
     agg = {"targets": 0, "rollouts": 0, "gen_s": 0.0, "score_s": 0.0, "cos_sum": 0.0, "best_sum": 0.0, "orig_sum": 0.0, "beat": 0, "len_sum": 0}
     t_loop = time.time()
-    for c0 in range(0, len(todo), dpc):
-        idx = todo[c0: c0 + dpc]
-        d = dirs[idx]
-        gen_ids, _lps, _app, gen_s = DG._generate_block(llm, ea, tok, prompt_ids, marker, d, hnorm, None, eos_ids, f"h{c0}")
-        texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
-        lens = [len(g) for g in gen_ids]
-        t1 = time.time()
-        dirs_rep = d.repeat_interleave(N, 0).to(device)
-        cos = DG.score_bucketed(R, texts, dirs_rep, scorer, tok, device, ea, lens).float().cpu()
-        orig_texts = [targets[i]["target_text"] for i in idx]
-        ocos = R.score(orig_texts, d.to(device), scorer, tok, device, ea).float().cpu()
-        cos2 = ocos2 = None
-        if a.also_window >= 0 and a.also_window != a.reward_window_last:
-            ea.reward_window_last = a.also_window
-            cos2 = DG.score_bucketed(R, texts, dirs_rep, scorer, tok, device, ea, lens).float().cpu()
-            ocos2 = R.score(orig_texts, d.to(device), scorer, tok, device, ea).float().cpu()
-            ea.reward_window_last = a.reward_window_last
-        score_s = time.time() - t1
+    pending = None   # (idx, texts, lens, gen_s, future)
+    chunks = list(range(0, len(todo), dpc))
+    for ci, c0 in enumerate(chunks + [None]):
+        if c0 is not None:
+            idx = todo[c0: c0 + dpc]
+            d = dirs[idx]
+            gen_ids, _lps, _app, gen_s = DG._generate_block(llm, ea, tok, prompt_ids, marker, d, hnorm, None, eos_ids, f"h{c0}")
+            texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
+            lens = [len(g) for g in gen_ids]
+            nxt = (idx, texts, lens, gen_s, pool.submit(_score, idx, d, texts, lens))
+        else:
+            nxt = None
+        if pending is None:
+            pending = nxt; continue
+        idx, texts, lens, gen_s, fut = pending
+        cos, ocos, cos2, ocos2, score_s = fut.result()
+        pending = nxt
         pen = torch.tensor([max(0, L - a.len_penalty_start) for L in lens], dtype=torch.float32) * a.len_penalty_per_tok
         rew = cos - pen
         for j, i in enumerate(idx):
@@ -174,7 +192,7 @@ def main():
         fout.flush()
         agg["rollouts"] += len(texts); agg["gen_s"] += gen_s; agg["score_s"] += score_s
         agg["cos_sum"] += float(cos.sum()); agg["len_sum"] += sum(lens)
-        if (c0 // dpc) % 5 == 0 or c0 + dpc >= len(todo):
+        if ci % 5 == 0 or ci == len(chunks):
             el = time.time() - t_loop
             log(f"{agg['targets']}/{len(todo)} targets | {agg['rollouts']} rollouts in {el:.0f}s ({agg['rollouts'] / max(el, 1e-6):.0f}/s; "
                 f"gen {agg['gen_s']:.0f}s score {agg['score_s']:.0f}s) | cos mean {agg['cos_sum'] / max(agg['rollouts'], 1):.3f} "
