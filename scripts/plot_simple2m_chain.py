@@ -37,7 +37,10 @@ SCORER_NOTE = ("centered scorer cos(unit(h − μ), d), μ = layer-42 corpus mea
 
 
 SFT20_RUN, RL20_RUN = "sft_simple2m20m_sft", "rl_simple2m20m_8x2048_anywin_centered"   # the SFT-scaling retest chain (2026-09-18): 20M rows, 80/20 acts/SAE
-NATIVE_CENTERED = {"rl_simple2m_8x2048_anywin_centered", SFT20_RUN, RL20_RUN}   # runs evaluated with the centered scorer from the start (no _c re-score tag)
+NATIVE_CENTERED = {"rl_simple2m_8x2048_anywin_centered", SFT20_RUN, RL20_RUN}
+# distillation chain (2026-09-18): 2M fresh activations x best-of-16 rollouts of the step-250 policy (raw-reward selection) -> SFT from base -> RL (raw reward)
+DIST_SFT_RAW, DIST_SFT_CEN = "sft_distill_fresh2m_bo16_sft_raw", "sft_distill_fresh2m_bo16_sft"      # same checkpoints, two evaluators
+DIST_RL = "rl_distill_fresh2m_bo16_8x2048_anywin"                                                   # raw-reward RL from the distilled SFT final (raw evaluator)   # runs evaluated with the centered scorer from the start (no _c re-score tag)
 
 
 def tagc(run):
@@ -118,6 +121,7 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True); (OUT / "data").mkdir(exist_ok=True)
     if not a.no_mirror:
         mirror([tagc(x) for x in [f"sft_{SFT_RUN}", RL_RUN, SFT20_RUN, RL20_RUN] + [V["run"] for V in VARIANTS.values()] + [R["run"] for R in REFS.values()] + sorted({R["init_run"] for R in REFS.values()})])
+        mirror([DIST_SFT_RAW, DIST_SFT_CEN, DIST_RL, f"sft_{SFT_RUN}", f"sft_{SFT_RUN}_c", RL_RUN])   # distillation chain + raw/centered source-text baselines
     ids = json.load(open(IDS)); registry = json.load(open(REGISTRY)) if REGISTRY.exists() else None
     sft = evals(tagc(f"sft_{SFT_RUN}")); rl = evals(tagc(RL_RUN))
     if not sft or not rl:
@@ -301,6 +305,54 @@ def main():
                           f"both curves on the centered scorer; the 20M run is at step {sft20[-1]['ckpt_step']} of 4,883" + (f"; its RL has {len(rl20)} evals" if rl20 else ""), 165), fontsize=10.2, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.9)); savefig(fig, "sft_scaling")
 
+    # ---------------- distillation: SFT on best-of-16 rollouts of the policy vs SFT on the source text ----------------
+    d_sft_raw, d_sft_cen, d_rl = evals(DIST_SFT_RAW), evals(DIST_SFT_CEN), evals(DIST_RL)
+    o_sft_raw, o_sft_cen = evals(f"sft_{SFT_RUN}"), evals(f"sft_{SFT_RUN}_c")
+    o_rl_raw = evals(RL_RUN)
+    if d_sft_raw or d_sft_cen:
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5.4), gridspec_kw={"width_ratios": [1.15, 1.25, 1]})
+        DC, OC = "#c0392b", "#6b6b6b"
+        ax = axes[0]
+        for ev, col, ls, lab in ((o_sft_raw, OC, "-", "source-text SFT (8M rows), RAW scorer"), (d_sft_raw, DC, "-", "distilled SFT (best-of-16 rollouts, 2M rows), RAW scorer"),
+                                 (o_sft_cen, OC, "--", "source-text SFT, centered scorer"), (d_sft_cen, DC, "--", "distilled SFT, centered scorer")):
+            if ev:
+                ax.plot([r["ckpt_step"] * EFF_BATCH / 1e6 for r in ev], [r["eval/mean_all"] for r in ev], ls=ls, marker="o", ms=4.5, lw=2 if col == DC else 1.4, color=col, label=lab)
+        if o_rl_raw:
+            b = max(o_rl_raw, key=lambda r: r["eval/mean_all"]); ax.axhline(b["eval/mean_all"], color="#2b6cb0", ls=":", lw=1.1)
+            ax.annotate(f"{b['eval/mean_all']:.3f} = source-text chain AFTER RL (best ckpt, raw)", (0.05, b["eval/mean_all"]), xytext=(0, 4), textcoords="offset points", fontsize=7.5, color="#2b6cb0")
+        ax.set_xlabel("SFT rows seen (millions; both runs: full FT from base, batch 4,096, lr 1e-5)"); ax.set_ylabel("held-out fidelity: mean cosine over 10 direction families")
+        ax.set_title("Distilled targets: fidelity RISES with data; source-text targets: it falls", fontsize=10, loc="left"); ax.grid(color=GRID, lw=0.6); ax.legend(fontsize=7.2, frameon=False, loc="center right")
+        ax = axes[1]
+        if d_sft_raw and o_sft_raw:
+            dl = d_sft_raw[-1]; ob = max(o_sft_raw, key=lambda r: r["eval/mean_all"])
+            fams = [("realact", "eval/realact/cos"), ("early", "eval/realact_early/cos"), ("long", "eval/realact_long/cos"), ("bsf", "eval/bsf/cos"), ("cluster", "eval/cluster/cos"), ("jlens", "eval/jlens/cos"),
+                    ("131k SAE\nnorm_act", "eval/sae/norm_act"), ("2M enc\nfired", "eval/sae2m_enc/fired"), ("2M dec\nfired", "eval/sae2m_dec/fired"), ("MLP\nnorm_act", "eval/mlp/norm_act")]
+            x = np.arange(len(fams)); w = 0.38
+            ax.bar(x - w / 2, [ob.get(k, np.nan) for _, k in fams], w, color=OC, label=f"source-text SFT, best ckpt (step {ob['ckpt_step']}, {ob['ckpt_step'] * EFF_BATCH / 1e6:.0f}M rows)")
+            ax.bar(x + w / 2, [dl.get(k, np.nan) for _, k in fams], w, color=DC, label=f"distilled SFT, step {dl['ckpt_step']} ({dl['ckpt_step'] * EFF_BATCH / 1e6:.2f}M rows)")
+            for xi, (_, k) in zip(x, fams):
+                ax.annotate(f"{dl.get(k, np.nan):.2f}", (xi + w / 2, dl.get(k, np.nan)), xytext=(0, 3), textcoords="offset points", ha="center", fontsize=7, color=DC)
+            ax.set_xticks(x); ax.set_xticklabels([n for n, _ in fams], fontsize=7.5); ax.set_ylabel("held-out score (raw scorer)"); ax.grid(color=GRID, lw=0.6, axis="y")
+            ax.set_title("Every family up, including families NOT in the distilled bank (SAE, BSF, cluster, MLP)", fontsize=10, loc="left"); ax.legend(fontsize=7.2, frameon=False, loc="upper right")
+        ax = axes[2]
+        if o_rl_raw:
+            ax.plot([0] + [r["ckpt_step"] for r in o_rl_raw], [o_sft_raw[-1]["eval/mean_all"] if o_sft_raw else np.nan] + [r["eval/mean_all"] for r in o_rl_raw], "-s", ms=3.5, lw=1.4, color=OC, label="RL from the source-text SFT final (main arm, raw reward)")
+        if d_rl:
+            ax.plot([0] + [r["ckpt_step"] for r in d_rl], [d_sft_raw[-1]["eval/mean_all"] if d_sft_raw else np.nan] + [r["eval/mean_all"] for r in d_rl], "-o", ms=5, lw=2.2, color=DC, label="RL from the distilled SFT final (raw reward)")
+            for r in d_rl: ax.annotate(f"{r['eval/mean_all']:.3f}", (r["ckpt_step"], r["eval/mean_all"]), xytext=(0, 6), textcoords="offset points", ha="center", fontsize=7.5, color=DC)
+        elif d_sft_raw:
+            ax.plot([0], [d_sft_raw[-1]["eval/mean_all"]], "o", ms=6, color=DC, label="distilled SFT final (RL pending)")
+        ax.set_xlabel("RL step (8x2048, lr 1e-6, whole-span RAW reward; step 0 = the SFT init)"); ax.set_title("RL on top: does the higher init raise the cap?", fontsize=10, loc="left"); ax.grid(color=GRID, lw=0.6); ax.legend(fontsize=7.2, frameon=False, loc="lower right")
+        ax.set_xlim(-8, 320)
+        peak = max(d_sft_raw, key=lambda r: r["eval/mean_all"]) if d_sft_raw else None
+        tail = (f", vs {max(r['eval/mean_all'] for r in o_sft_raw):.3f} for the best source-text SFT checkpoint and {max(r['eval/mean_all'] for r in o_rl_raw):.3f} for that chain after RL" if o_sft_raw and o_rl_raw else "")
+        fig.suptitle(wrap("Rejection-sampling distillation: 2,000,000 FRESH Ultra-FineWeb activations (1M with 8-64-token contexts, 1M full-document 64-2048), 16 rollouts each from the RL'd inverter (step 250), "
+                          "the best-cosine rollout kept as the SFT target -> a fresh full fine-tune of the base model" + (f" reaches {peak['eval/mean_all']:.3f} held-out (raw scorer) at {peak['ckpt_step'] * EFF_BATCH / 1e6:.2f}M rows" if peak else "") + tail, 170), fontsize=10.2, x=0.01, ha="left")
+        fig.tight_layout(rect=(0, 0, 1, 0.9)); savefig(fig, "distill_chain")
+        json.dump({"generated_at": fetched, "distilled_sft_raw": d_sft_raw, "distilled_sft_centered": d_sft_cen, "distilled_rl_raw": d_rl, "source_text_sft_raw": o_sft_raw,
+                   "source_text_sft_centered": o_sft_cen, "source_text_rl_raw": o_rl_raw, "eff_batch": EFF_BATCH,
+                   "harvest": {k: v for k, v in ids.get("harvest", {}).get("harvest_full_v1", {}).items() if k in ("plan", "spec", "n_samples", "top_k", "configs", "banks")},
+                   "distill": ids.get("distill")}, open(OUT / "data" / "distill.json", "w"), indent=1, default=str)
     dd = OUT / "data"
     json.dump({"generated_at": fetched, "scorer": SCORER, "run": SFT_RUN, "wandb": SFT_WANDB, "eff_batch": EFF_BATCH, "rows_per_ckpt": {r["ckpt_step"]: r["ckpt_step"] * EFF_BATCH for r in sft}, "evals": sft}, open(dd / "sft_evals.json", "w"), indent=1)
     json.dump({"generated_at": fetched, "scorer": SCORER, "sft20": {"run": SFT20_RUN, "rows_per_step": EFF_BATCH, "steps_total": 4883, "mix": "16M acts (ctx 8-64, full-context targets; docs [5.5M,5.625M) + [6.1M,~6.48M)) + 2M enc + 2M dec", "evals": sft20},
