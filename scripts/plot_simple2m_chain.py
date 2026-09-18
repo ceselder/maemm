@@ -255,7 +255,7 @@ def main():
         for ax in axes: ax.grid(color=GRID, lw=0.6); ax.set_xlabel("RL step (16,384 rollouts per step in every arm; step 0 = the shared SFT init)")
         prog = ", ".join(f"{V['short']} at step {V['last_train_step']}" for k, V in variants.items() if V["last_train_step"])
         fig.suptitle(wrap("Four RL runs from the SAME SFT init: the main arm (8 prompts x 2,048 rollouts, whole-span reward, lr 1e-6) vs 16x1,024 prompts/rollouts, and vs rewarding only the last 16 generated tokens at lr 5e-7 / 1e-6 "
-                          "— at matched steps 16x1024 tracks the main arm exactly, last-16 at lr 1e-6 matches on mean_all but fires fewer held-out 2M features, last-16 at lr 5e-7 lags; entropy falls fastest in the last-16 lr 1e-6 arm"
+                          "— at matched steps 16x1024 tracks the main arm exactly (and fires MORE held-out decoder features), last-16 at lr 1e-6 matches on mean_all but fires fewer held-out encoder features, last-16 at lr 5e-7 lags; the three lr 1e-6 arms share one entropy trajectory, lr 5e-7 stays higher"
                           + (f" (in progress: {prog})" if prog else ""), 165), fontsize=10.2, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.88)); savefig(fig, "rl_variants")
 
