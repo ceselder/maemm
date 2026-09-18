@@ -319,9 +319,9 @@ def main():
                 ax.plot([r["ckpt_step"] * EFF_BATCH / 1e6 for r in ev], [r["eval/mean_all"] for r in ev], ls=ls, marker="o", ms=4.5, lw=2 if col == DC else 1.4, color=col, label=lab)
         if o_rl_raw:
             b = max(o_rl_raw, key=lambda r: r["eval/mean_all"]); ax.axhline(b["eval/mean_all"], color="#2b6cb0", ls=":", lw=1.1)
-            ax.annotate(f"{b['eval/mean_all']:.3f} = source-text chain AFTER RL (best ckpt, raw)", (0.05, b["eval/mean_all"]), xytext=(0, 4), textcoords="offset points", fontsize=7.5, color="#2b6cb0")
+            ax.annotate(f"{b['eval/mean_all']:.3f} = source-text chain AFTER RL (best ckpt, raw)", (8.3, b["eval/mean_all"]), xytext=(0, -10), textcoords="offset points", fontsize=7.5, color="#2b6cb0", ha="right")
         ax.set_xlabel("SFT rows seen (millions; both runs: full FT from base, batch 4,096, lr 1e-5)"); ax.set_ylabel("held-out fidelity: mean cosine over 10 direction families")
-        ax.set_title("Distilled targets: fidelity RISES with data; source-text targets: it falls", fontsize=10, loc="left"); ax.grid(color=GRID, lw=0.6); ax.legend(fontsize=7.2, frameon=False, loc="center right")
+        ax.set_title("Distilled targets vs source-text targets, held-out fidelity vs rows seen", fontsize=10, loc="left"); ax.grid(color=GRID, lw=0.6); ax.legend(fontsize=7.2, frameon=False, loc="upper right"); ax.set_xlim(0, 8.6)
         ax = axes[1]
         if d_sft_raw and o_sft_raw:
             dl = d_sft_raw[-1]; ob = max(o_sft_raw, key=lambda r: r["eval/mean_all"])
@@ -333,7 +333,7 @@ def main():
             for xi, (_, k) in zip(x, fams):
                 ax.annotate(f"{dl.get(k, np.nan):.2f}", (xi + w / 2, dl.get(k, np.nan)), xytext=(0, 3), textcoords="offset points", ha="center", fontsize=7, color=DC)
             ax.set_xticks(x); ax.set_xticklabels([n for n, _ in fams], fontsize=7.5); ax.set_ylabel("held-out score (raw scorer)"); ax.grid(color=GRID, lw=0.6, axis="y")
-            ax.set_title("Every family up, including families NOT in the distilled bank (SAE, BSF, cluster, MLP)", fontsize=10, loc="left"); ax.legend(fontsize=7.2, frameon=False, loc="upper right")
+            ax.set_title("Every family up, incl. families NOT in the bank (SAE, BSF, cluster, MLP)", fontsize=9.5, loc="left"); ax.legend(fontsize=7.2, frameon=False, loc="upper left")
         ax = axes[2]
         if o_rl_raw:
             ax.plot([0] + [r["ckpt_step"] for r in o_rl_raw], [o_sft_raw[-1]["eval/mean_all"] if o_sft_raw else np.nan] + [r["eval/mean_all"] for r in o_rl_raw], "-s", ms=3.5, lw=1.4, color=OC, label="RL from the source-text SFT final (main arm, raw reward)")
@@ -342,7 +342,7 @@ def main():
             for r in d_rl: ax.annotate(f"{r['eval/mean_all']:.3f}", (r["ckpt_step"], r["eval/mean_all"]), xytext=(0, 6), textcoords="offset points", ha="center", fontsize=7.5, color=DC)
         elif d_sft_raw:
             ax.plot([0], [d_sft_raw[-1]["eval/mean_all"]], "o", ms=6, color=DC, label="distilled SFT final (RL pending)")
-        ax.set_xlabel("RL step (8x2048, lr 1e-6, whole-span RAW reward; step 0 = the SFT init)"); ax.set_title("RL on top: does the higher init raise the cap?", fontsize=10, loc="left"); ax.grid(color=GRID, lw=0.6); ax.legend(fontsize=7.2, frameon=False, loc="lower right")
+        ax.set_xlabel("RL step (8x2048, lr 1e-6, whole-span RAW reward; step 0 = the SFT init)"); ax.set_title("RL on top of each SFT final", fontsize=9.5, loc="left"); ax.grid(color=GRID, lw=0.6); ax.legend(fontsize=7.2, frameon=False, loc="lower right")
         ax.set_xlim(-8, 320)
         peak = max(d_sft_raw, key=lambda r: r["eval/mean_all"]) if d_sft_raw else None
         tail = (f", vs {max(r['eval/mean_all'] for r in o_sft_raw):.3f} for the best source-text SFT checkpoint and {max(r['eval/mean_all'] for r in o_rl_raw):.3f} for that chain after RL" if o_sft_raw and o_rl_raw else "")
