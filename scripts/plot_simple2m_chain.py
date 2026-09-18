@@ -36,7 +36,8 @@ SCORER_NOTE = ("centered scorer cos(unit(h − μ), d), μ = layer-42 corpus mea
                else "LEGACY raw-activation scorer cos(unit(h), d): every value compressed by ‖h−μ‖/‖h‖ (source text ≈ .5)")
 
 
-NATIVE_CENTERED = {"rl_simple2m_8x2048_anywin_centered"}   # runs evaluated with the centered scorer from the start (no _c re-score tag)
+SFT20_RUN, RL20_RUN = "sft_simple2m20m_sft", "rl_simple2m20m_8x2048_anywin_centered"   # the SFT-scaling retest chain (2026-09-18): 20M rows, 80/20 acts/SAE
+NATIVE_CENTERED = {"rl_simple2m_8x2048_anywin_centered", SFT20_RUN, RL20_RUN}   # runs evaluated with the centered scorer from the start (no _c re-score tag)
 
 
 def tagc(run):
@@ -116,7 +117,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--no-html", action="store_true"); ap.add_argument("--no-mirror", action="store_true"); a = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True); (OUT / "data").mkdir(exist_ok=True)
     if not a.no_mirror:
-        mirror([tagc(x) for x in [f"sft_{SFT_RUN}", RL_RUN] + [V["run"] for V in VARIANTS.values()] + [R["run"] for R in REFS.values()] + sorted({R["init_run"] for R in REFS.values()})])
+        mirror([tagc(x) for x in [f"sft_{SFT_RUN}", RL_RUN, SFT20_RUN, RL20_RUN] + [V["run"] for V in VARIANTS.values()] + [R["run"] for R in REFS.values()] + sorted({R["init_run"] for R in REFS.values()})])
     ids = json.load(open(IDS)); registry = json.load(open(REGISTRY)) if REGISTRY.exists() else None
     sft = evals(tagc(f"sft_{SFT_RUN}")); rl = evals(tagc(RL_RUN))
     if not sft or not rl:
@@ -146,6 +147,8 @@ def main():
                                     "reward/peak_last_frac", "reward/peak_dist_mean", "policy/offpolicy_lag_steps"])
     rl_last_step = max(rl_dyn["step"]) if rl_dyn and rl_dyn["step"] else None
     best_rl = max(rl, key=lambda r: r["eval/mean_all"]) if rl else None
+
+    sft20 = evals(tagc(SFT20_RUN)); rl20 = evals(tagc(RL20_RUN))
 
     # ---------------- headline: held-out fidelity through the chain ----------------
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14.5, 5.6), sharey=True, gridspec_kw={"width_ratios": [1, 1.25]})
@@ -279,9 +282,29 @@ def main():
                           + (f" (in progress: {prog})" if prog else ""), 165), fontsize=10.2, x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0, 1, 0.88)); savefig(fig, "rl_variants")
 
-    # ---------------- data ----------------
+    # ---------------- SFT-scaling retest: 20M rows at 80/20 acts/SAE vs the 8M 50/50 chain, vs rows seen ----------------
+    if sft20:
+        fams20 = [("eval/mean_all", "mean_all (10 held-out families)"), ("eval/realact/cos", "real activations (cos)"), ("eval/realact_long/cos", "long-context activations (cos)"),
+                  ("eval/mlp/norm_act", "L42 MLP neurons (norm_act)"), ("eval/sae/norm_act", "131k-SAE features (norm_act)"), ("eval/sae2m_enc/fired", "held-out 2M-SAE encoder dirs fired")]
+        fig, axes = plt.subplots(2, 3, figsize=(15, 7.6)); axes = axes.ravel()
+        x8 = [r["ckpt_step"] * EFF_BATCH / 1e6 for r in sft]; x20 = [r["ckpt_step"] * EFF_BATCH / 1e6 for r in sft20]
+        for ax, (k, lab) in zip(axes, fams20):
+            ax.plot(x8, [r.get(k, np.nan) for r in sft], "-o", color=SFT_C, ms=4.5, lw=1.8, label="8M-row SFT: 50/50 activations : 2M-SAE rows (4M + 2M enc + 2M dec)")
+            ax.plot(x20, [r.get(k, np.nan) for r in sft20], "-s", color="#111111", ms=4.5, lw=1.8, label="20M-row SFT: 80/20 (16M activations + 2M enc + 2M dec), i.i.d. step windows")
+            for xx, r in zip(x20, sft20): ax.annotate(f"{r.get(k, np.nan):.3f}", (xx, r.get(k, np.nan)), xytext=(0, 6), textcoords="offset points", ha="center", fontsize=7, color="#111111")
+            ax.set_title(lab, fontsize=9.5, loc="left"); ax.grid(color=GRID, lw=0.6); ax.set_xlabel("SFT rows seen (millions; 4,096 per step)"); ax.set_xlim(0, 21)
+        axes[0].legend(fontsize=7.2, frameon=False, loc="upper right")
+        last20 = sft20[-1]; at8 = next((r for r in sft if r["ckpt_step"] == last20["ckpt_step"]), None)
+        cmp = (f"at {x20[-1]:.0f}M rows the 80/20 run scores {last20['eval/mean_all']:.3f} vs the 50/50 run's {at8['eval/mean_all']:.3f} at the same step" if at8 else f"latest 80/20 point {last20['eval/mean_all']:.3f} at {x20[-1]:.0f}M rows")
+        fig.suptitle(wrap(f"SFT-scaling retest: does more activation data cap higher? Held-out fidelity vs rows seen for the 8M 50/50 chain (declined .491 -> .420) and the 20M 80/20 chain "
+                          f"(2M+2M SAE rows held fixed, short-context full-target activations scaled 4M -> 16M; same lr 1e-5 one-cycle, batch 4,096, full FT from base) — {cmp}; "
+                          f"both curves on the centered scorer; the 20M run is at step {sft20[-1]['ckpt_step']} of 4,883" + (f"; its RL has {len(rl20)} evals" if rl20 else ""), 165), fontsize=10.2, x=0.01, ha="left")
+        fig.tight_layout(rect=(0, 0, 1, 0.9)); savefig(fig, "sft_scaling")
+
     dd = OUT / "data"
     json.dump({"generated_at": fetched, "scorer": SCORER, "run": SFT_RUN, "wandb": SFT_WANDB, "eff_batch": EFF_BATCH, "rows_per_ckpt": {r["ckpt_step"]: r["ckpt_step"] * EFF_BATCH for r in sft}, "evals": sft}, open(dd / "sft_evals.json", "w"), indent=1)
+    json.dump({"generated_at": fetched, "scorer": SCORER, "sft20": {"run": SFT20_RUN, "rows_per_step": EFF_BATCH, "steps_total": 4883, "mix": "16M acts (ctx 8-64, full-context targets; docs [5.5M,5.625M) + [6.1M,~6.48M)) + 2M enc + 2M dec", "evals": sft20},
+               "rl20": {"run": RL20_RUN, "evals": rl20}, "sft8_evals": sft}, open(dd / "sft_scaling.json", "w"), indent=1, default=str)
     json.dump({"generated_at": fetched, "scorer": SCORER, "run": RL_RUN, "wandb": RL_WANDB, "init": sft_final, "evals": rl, "best": best_rl, "last_train_step": rl_last_step}, open(dd / "rl_evals.json", "w"), indent=1)
     json.dump({"generated_at": fetched, "arms": {k: {kk: vv for kk, vv in R.items() if kk not in ("ls",)} for k, R in refs.items()}}, open(dd / "reference_arms.json", "w"), indent=1)
     json.dump({"generated_at": fetched, "shared_init": sft_final, "variants": {k: {kk: vv for kk, vv in V.items() if kk not in ("ls", "dyn")} for k, V in variants.items()},
