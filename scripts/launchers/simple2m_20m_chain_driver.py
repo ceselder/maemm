@@ -216,7 +216,18 @@ if not stage(d, "compose_rl"):
 # ---- D. full-parameter RL (all-token reward) + evaluator ---------------------------------------------------------------
 if not stage(d, "rl"):
     if not d["sft"].get("done"):
-        wait_call(d["sft"]["train"], "SFT train")
+        # the SFT call can be cancelled/recycled and resumed as a new leg (2026-09-18 21:20Z: external cancel at step 1835, resumed from
+        # step_1464 by hand): wait on whatever call id ids.json holds NOW, and if that call fails, fall back to polling the volume for the
+        # final SAVE_DONE (the supervisor / a manual respawn may finish the run under a different call id) instead of pausing the chain.
+        try:
+            wait_call(json.load(open(IDS))["sft"]["train"], "SFT train")
+        except SystemExit:
+            log("SFT call failed -> polling /sft_mix/<run>/final/SAVE_DONE instead (resume leg may finish it)")
+            t0 = time.time()
+            while not vol_has(f"/sft_mix/{SFT_RUN}/final/SAVE_DONE"):
+                if time.time() - t0 > 30 * 3600:
+                    discord("SFT final never appeared (30 h) — chain paused"); raise SystemExit(1)
+                time.sleep(300)
         ok = False
         for _ in range(40):
             if vol_has(f"/sft_mix/{SFT_RUN}/final/SAVE_DONE"):

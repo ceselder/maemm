@@ -14,7 +14,7 @@ import os
 
 import modal
 
-app = modal.App("maemm-hf-upload-full")
+app = modal.App(os.environ.get("HF_UPLOAD_APP", "maemm-hf-upload-full"))
 vol = modal.Volume.from_name("maemm-data", create_if_missing=False)
 image = (modal.Image.debian_slim(python_version="3.11")
          .pip_install("huggingface_hub[hf_transfer]==0.34.4")
