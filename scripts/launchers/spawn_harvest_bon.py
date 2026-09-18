@@ -4,7 +4,7 @@
     cd ~/maemm-pub-simple2m && MODAL_PROFILE=safety-sahan modal deploy data/modal_harvest_bon.py
     python scripts/launchers/spawn_harvest_bon.py --probe                 # 256 targets x N=256, 5 sampler configs (1 GPU each)
     python scripts/launchers/spawn_harvest_bon.py --probe --report        # best-of-n curves once the shards are done
-    python scripts/launchers/spawn_harvest_bon.py --full --n-samples 32 --n-shards 8 --configs s250_t1.0,s250_t1.3   # the real harvest
+    python scripts/launchers/spawn_harvest_bon.py --full --quant fp8 --max-new-tokens 64 [--select centered]   # 2M fresh targets x best-of-16, 32 shards
 
 Sampler config name = s<step>_t<temperature>[_w<window>] over the main simple2m arm's checkpoints (CKPTS below)."""
 import argparse
@@ -28,8 +28,8 @@ CKPTS = {"s25": "/data/ckpts_rl_simple2m_8x2048_anywin/step_25", "s50": "/data/c
          "l16s300": "/data/ckpts_rl_simple2m_8x2048_last16_lr1e-6/final"}
 SFT_MIX, RL_POOL = "/data/banks/mix_simple2m_sft", "/data/banks/mix_simple2m_rl"
 PROBE_SPEC = [{"bank": SFT_MIX, "families": {"realact": 64}}, {"bank": RL_POOL, "families": {"realact_ctx64_2048": 64, "sae2m": 64, "sae2m_dec": 64}}]
-FULL_SPEC = [{"bank": SFT_MIX, "families": {"realact": 400000, "sae2m": 100000, "sae2m_dec": 100000}},
-             {"bank": RL_POOL, "families": {"realact_ctx64_2048": 300000, "sae2m": 50000, "sae2m_dec": 50000}}]
+FRESH_SHORT, FRESH_LONG = "/data/banks/mix_fresh_short_2p5m", "/data/banks/mix_fresh_long_2p5m"   # fresh Ultra-FineWeb docs [10.0M,...) / [12.0M,...)
+FULL_SPEC = [{"bank": FRESH_SHORT, "families": {"realact": 1_000_000}}, {"bank": FRESH_LONG, "families": {"realact_ctx64_2048": 1_000_000}}]   # 2M targets (user 2026-09-18)
 PROBE_CONFIGS = ["s250_t1.0", "s250_t1.3", "s100_t1.0", "s50_t1.0", "l16s150_t1.0_w16", "l16s150_t1.3_w16"]   # every rollout is ALSO scored under the other window
 
 
@@ -67,9 +67,9 @@ def main():
     assert a.probe != a.full or a.report or a.finalize, "pick --probe or --full"
     out_name = a.out_name or ("harvest_probe_v1" if a.probe else "harvest_full_v1")
     configs = a.configs.split(",") if a.configs else (PROBE_CONFIGS if a.probe else ["s250_t1.0"])
-    n_samples = a.n_samples or (256 if a.probe else 32)
+    n_samples = a.n_samples or (256 if a.probe else 16)
     top_k = a.top_k or (8 if a.probe else 4)
-    n_shards = a.n_shards or (1 if a.probe else 8)
+    n_shards = a.n_shards or (1 if a.probe else 32)
     spec = json.loads(a.spec) if a.spec else (PROBE_SPEC if a.probe else FULL_SPEC)
     ids = load_ids(); H = ids.setdefault("harvest", {}); rec = H.setdefault(out_name, {"out_name": out_name, "app": APP})
 
