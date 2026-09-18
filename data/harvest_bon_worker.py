@@ -189,7 +189,8 @@ def main():
         for s0 in range(0, len(order), a.score_batch):
             ids_ = order[s0: s0 + a.score_batch]
             tt = [texts[i] if texts[i].strip() else " " for i in ids_]
-            e = tok(tt, return_tensors="pt", padding=True, truncation=True, max_length=95, add_special_tokens=False)
+            e = tok(tt, return_tensors="pt", padding=True, truncation=True, max_length=95, add_special_tokens=False,
+                    pad_to_multiple_of=16)   # few distinct (B, T) shapes -> the GDN triton kernels autotune a handful of times, not ~90
             inp = {"input_ids": torch.cat([torch.full((len(tt), 1), sink), e["input_ids"]], 1).to(device),
                    "attention_mask": torch.cat([torch.ones(len(tt), 1, dtype=e["attention_mask"].dtype), e["attention_mask"]], 1).to(device)}
             h, mask = read_resid(scorer, READ_LAYER, inp, pool="all")
