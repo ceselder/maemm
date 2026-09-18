@@ -59,6 +59,8 @@ def main():
     ap.add_argument("--k-keep", type=int, default=1); ap.add_argument("--require-beat-orig", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="worker --limit (smoke test)")
     ap.add_argument("--max-new-tokens", type=int, default=96)
+    ap.add_argument("--quant", default="", help="sampler quantization (fp8) passed to the worker"); ap.add_argument("--queue-mult", type=int, default=1)
+    ap.add_argument("--also-window", type=int, default=-1, help="second scoring window (-1 off; the probe used 16)")
     a = ap.parse_args()
     assert a.probe != a.full or a.report or a.finalize, "pick --probe or --full"
     out_name = a.out_name or ("harvest_probe_v1" if a.probe else "harvest_full_v1")
@@ -110,9 +112,10 @@ def main():
             if key in calls and not calls[key].get("failed"):
                 continue
             fc = fn.spawn(out_name, sh, cfg, ck, n_samples=n_samples, temperature=temp, top_k=top_k, max_new_tokens=a.max_new_tokens,
-                          reward_window_last=win, probe=a.probe, seed=a.seed + sh, limit=a.limit)
+                          reward_window_last=win, probe=a.probe, seed=a.seed + sh, limit=a.limit, also_window=(16 if a.probe and a.also_window < 0 else a.also_window),
+                          queue_mult=a.queue_mult, quant=a.quant)
             calls[key] = {"call": fc.object_id, "ckpt": ck, "temperature": temp, "window_last": win, "n_samples": n_samples, "top_k": top_k,
-                          "probe": a.probe, "spawned": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                          "probe": a.probe, "quant": a.quant, "queue_mult": a.queue_mult, "spawned": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             print(f"spawned {key}: {fc.object_id}")
     rec.update({"n_samples": n_samples, "top_k": top_k, "configs": sorted(set(rec.get("configs", []) + configs))}); save_ids(ids)
     print(json.dumps({k: v for k, v in rec.items() if k != "calls"}, indent=1))

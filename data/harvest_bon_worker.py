@@ -48,15 +48,17 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=96, help="rl.py score() re-tokenizes at most 95 tokens anyway")
     ap.add_argument("--min-new-tokens", type=int, default=8)
     ap.add_argument("--reward-window-last", type=int, default=0, help="selection window: 0 = whole span (the anywin recipe), 16 = last-16 recipe")
-    ap.add_argument("--also-window", type=int, default=16, help="also score every rollout under this window (stored as cos_w<k>; -1 = off)")
+    ap.add_argument("--also-window", type=int, default=-1, help="also score every rollout under this window (stored as cos_w<k>; -1 = off; the probe used 16)")
     ap.add_argument("--len-penalty-per-tok", type=float, default=0.00025)
     ap.add_argument("--len-penalty-start", type=int, default=8)
-    ap.add_argument("--dirs-per-call", type=int, default=0, help="directions per generate() call; 0 = max_num_seqs // n_samples")
+    ap.add_argument("--dirs-per-call", type=int, default=0, help="directions per generate() call; 0 = queue_mult * max_num_seqs // n_samples")
+    ap.add_argument("--queue-mult", type=int, default=1, help="sequences queued per generate() call = queue_mult x max_num_seqs (>1 backfills but forces eager mixed steps: slower)")
+    ap.add_argument("--quant", default="", help="vLLM quantization for the SAMPLER weights (e.g. fp8 = online per-tensor fp8); scorer stays bf16")
     ap.add_argument("--max-num-seqs", type=int, default=512, help="Qwen3.6 GDN recurrent state is allocated per sequence: 2048 OOMs next to the resident scorer")
     ap.add_argument("--max-num-batched-tokens", type=int, default=24576)
     ap.add_argument("--vllm-gpu-mem", type=float, default=0.5)
     ap.add_argument("--cuda-graphs", action="store_true")
-    ap.add_argument("--score-batch", type=int, default=128)
+    ap.add_argument("--score-batch", type=int, default=256)
     ap.add_argument("--scorer-layers", type=int, default=43, help="keep decoder layers [0, n) of the clean base (0 = all 64)")
     ap.add_argument("--probe", action="store_true", help="store every sample's cosine + length (best-of-n curves)")
     ap.add_argument("--seed", type=int, default=0)
@@ -98,9 +100,9 @@ def main():
     if a.limit:
         todo = todo[: a.limit]
     N = a.n_samples
-    dpc = a.dirs_per_call or max(1, a.max_num_seqs // N)
+    dpc = a.dirs_per_call or max(1, a.queue_mult * a.max_num_seqs // N)
     log(f"{len(targets)} targets ({len(done)} already done, {len(todo)} to do) | N={N} T={a.temperature} top-k={a.top_k} "
-        f"dirs/call={dpc} max_new={a.max_new_tokens} window_last={a.reward_window_last} | ckpt {a.ckpt}")
+        f"dirs/call={dpc} ({dpc * N} seqs queued per call, {a.max_num_seqs} concurrent) max_new={a.max_new_tokens} window_last={a.reward_window_last} | ckpt {a.ckpt}")
 
     # ---- HF clean scorer FIRST (vllm's import clobbers transformers' AutoConfig for this model) ----
     base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map={"": device})
@@ -119,6 +121,11 @@ def main():
                          max_num_batched_tokens=a.max_num_batched_tokens, group_size=N, temperature=a.temperature,
                          score_batch=a.score_batch, reward_metric="cosine", reward_window_last=a.reward_window_last,
                          reward_pos_penalty=0.0, reward_topk=1, log_reward=False)
+    if a.quant:   # _build_engine does `from vllm import LLM` at call time -> inject the quantization kwarg through the module attribute
+        import vllm as _vllm
+        _LLM = _vllm.LLM
+        _vllm.LLM = lambda **kw: _LLM(quantization=a.quant, **kw)
+        log(f"sampler weights served with quantization={a.quant}")
     llm = DG._build_engine(ea, 0, p_len, a.max_num_seqs, a.cuda_graphs, "harvest")
     hnorm = _vllm_marker_norm(llm, prompt_ids, marker, INJECT_LAYER)
     chk = DG._verify_injection(llm, prompt_ids, marker, hnorm, "harvest", seed=a.seed)
@@ -126,11 +133,9 @@ def main():
         f"{'OK' if chk['ok'] else 'FAIL'}")
     assert chk["ok"], f"injection proof failed: {chk}"
 
-    # ---- generate / score / select (scoring of chunk k overlaps the generation of chunk k+1: the vLLM engine core is a separate
-    #      process, so the HF scorer forward and the decode steps share the GPU instead of alternating) ----
-    from concurrent.futures import ThreadPoolExecutor
-    pool = ThreadPoolExecutor(max_workers=1)
-
+    # ---- generate / score / select. Sequential on purpose: (1) queuing more than max_num_seqs per call makes vLLM backfill, and every
+    #      mixed prefill+decode step runs EAGER in the hooked engine (the marker must be prefilled in a hooked pass) -> ~2x slower decode;
+    #      (2) scoring in a thread next to LLM.generate() starves both on the GIL. So: exactly max_num_seqs sequences per call, then score.
     def _score(idx, d, texts, lens):
         t1 = time.time()
         with torch.inference_mode():
@@ -149,23 +154,14 @@ def main():
     fout = open(a.out, "a")
     agg = {"targets": 0, "rollouts": 0, "gen_s": 0.0, "score_s": 0.0, "cos_sum": 0.0, "best_sum": 0.0, "orig_sum": 0.0, "beat": 0, "len_sum": 0}
     t_loop = time.time()
-    pending = None   # (idx, texts, lens, gen_s, future)
     chunks = list(range(0, len(todo), dpc))
-    for ci, c0 in enumerate(chunks + [None]):
-        if c0 is not None:
-            idx = todo[c0: c0 + dpc]
-            d = dirs[idx]
-            gen_ids, _lps, _app, gen_s = DG._generate_block(llm, ea, tok, prompt_ids, marker, d, hnorm, None, eos_ids, f"h{c0}")
-            texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
-            lens = [len(g) for g in gen_ids]
-            nxt = (idx, texts, lens, gen_s, pool.submit(_score, idx, d, texts, lens))
-        else:
-            nxt = None
-        if pending is None:
-            pending = nxt; continue
-        idx, texts, lens, gen_s, fut = pending
-        cos, ocos, cos2, ocos2, score_s = fut.result()
-        pending = nxt
+    for ci, c0 in enumerate(chunks):
+        idx = todo[c0: c0 + dpc]
+        d = dirs[idx]
+        gen_ids, _lps, _app, gen_s = DG._generate_block(llm, ea, tok, prompt_ids, marker, d, hnorm, None, eos_ids, f"h{c0}")
+        texts = [tok.decode(g, skip_special_tokens=True) for g in gen_ids]
+        lens = [len(g) for g in gen_ids]
+        cos, ocos, cos2, ocos2, score_s = _score(idx, d, texts, lens)
         pen = torch.tensor([max(0, L - a.len_penalty_start) for L in lens], dtype=torch.float32) * a.len_penalty_per_tok
         rew = cos - pen
         for j, i in enumerate(idx):
@@ -192,7 +188,7 @@ def main():
         fout.flush()
         agg["rollouts"] += len(texts); agg["gen_s"] += gen_s; agg["score_s"] += score_s
         agg["cos_sum"] += float(cos.sum()); agg["len_sum"] += sum(lens)
-        if ci % 5 == 0 or ci == len(chunks):
+        if ci % 5 == 0 or ci + 1 == len(chunks):
             el = time.time() - t_loop
             log(f"{agg['targets']}/{len(todo)} targets | {agg['rollouts']} rollouts in {el:.0f}s ({agg['rollouts'] / max(el, 1e-6):.0f}/s; "
                 f"gen {agg['gen_s']:.0f}s score {agg['score_s']:.0f}s) | cos mean {agg['cos_sum'] / max(agg['rollouts'], 1):.3f} "
